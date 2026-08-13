@@ -37,6 +37,13 @@
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "openlook-workspaces-unstable-v1-protocol.h"
+
+// Fixed linear workspace count for this scaffold. A real implementation
+// would make this configurable; olcore's only job is to track "how many"
+// and "which is active", per the openlook-workspaces protocol.
+#define OLC_WORKSPACE_COUNT 4
+
 enum olc_cursor_mode {
 	OLC_CURSOR_PASSTHROUGH,
 	OLC_CURSOR_MOVE,
@@ -72,6 +79,11 @@ struct olc_server {
 	struct wlr_layer_shell_v1 *layer_shell;
 	struct wl_listener new_layer_surface;
 	struct wl_list layer_surfaces; // olc_layer_surface::link
+
+	struct wl_global *workspaces_manager_global;
+	struct wl_list workspace_resources; // olc_workspaces_resource::link
+	uint32_t workspace_count;
+	uint32_t active_workspace;
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
@@ -137,6 +149,15 @@ struct olc_layer_surface {
 	struct wl_listener map;
 	struct wl_listener commit;
 	struct wl_listener destroy;
+};
+
+// One per client binding of zopenlook_workspaces_manager_v1. wl_resource
+// has no public link field of its own, so we wrap it to keep a list we can
+// broadcast active_changed to.
+struct olc_workspaces_resource {
+	struct wl_resource *resource;
+	struct olc_server *server;
+	struct wl_list link;
 };
 
 struct olc_keyboard {
@@ -801,6 +822,63 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
+static void workspaces_manager_handle_switch_to(
+		struct wl_client *client, struct wl_resource *resource, uint32_t index) {
+	struct olc_workspaces_resource *r = wl_resource_get_user_data(resource);
+	struct olc_server *server = r->server;
+
+	if (index >= server->workspace_count || index == server->active_workspace) {
+		return;
+	}
+	server->active_workspace = index;
+
+	struct olc_workspaces_resource *other;
+	wl_list_for_each(other, &server->workspace_resources, link) {
+		zopenlook_workspaces_manager_v1_send_active_changed(other->resource, server->active_workspace);
+	}
+}
+
+static void workspaces_manager_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
+	wl_resource_destroy(resource);
+}
+
+static const struct zopenlook_workspaces_manager_v1_interface workspaces_manager_impl = {
+	.switch_to = workspaces_manager_handle_switch_to,
+	.destroy = workspaces_manager_handle_destroy,
+};
+
+static void workspaces_manager_resource_destroy(struct wl_resource *resource) {
+	struct olc_workspaces_resource *r = wl_resource_get_user_data(resource);
+	wl_list_remove(&r->link);
+	free(r);
+}
+
+static void workspaces_manager_bind(
+		struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+	struct olc_server *server = data;
+
+	struct wl_resource *resource =
+		wl_resource_create(client, &zopenlook_workspaces_manager_v1_interface, (int)version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	struct olc_workspaces_resource *r = calloc(1, sizeof(*r));
+	if (r == NULL) {
+		wl_resource_destroy(resource);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	r->resource = resource;
+	r->server = server;
+	wl_list_insert(&server->workspace_resources, &r->link);
+	wl_resource_set_implementation(resource, &workspaces_manager_impl, r, workspaces_manager_resource_destroy);
+
+	zopenlook_workspaces_manager_v1_send_workspace_count(resource, server->workspace_count);
+	zopenlook_workspaces_manager_v1_send_active_changed(resource, server->active_workspace);
+}
+
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
 	char *startup_cmd = NULL;
@@ -870,6 +948,12 @@ int main(int argc, char *argv[]) {
 	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
 	server.new_layer_surface.notify = server_new_layer_surface;
 	wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
+
+	wl_list_init(&server.workspace_resources);
+	server.workspace_count = OLC_WORKSPACE_COUNT;
+	server.active_workspace = 0;
+	server.workspaces_manager_global = wl_global_create(server.wl_display,
+		&zopenlook_workspaces_manager_v1_interface, 1, &server, workspaces_manager_bind);
 
 	server.cursor = wlr_cursor_create();
 	wlr_cursor_attach_output_layout(server.cursor, server.output_layout);
