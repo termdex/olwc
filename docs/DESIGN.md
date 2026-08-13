@@ -1,0 +1,116 @@
+# OpenLook-for-Wayland — Design Doc (v0.1)
+
+## Goal
+
+Recreate the *spirit* of OpenLook (olwm/olvwm) — the OPEN LOOK window
+manager from SunOS/OpenWindows — as a modern Wayland compositor. Not a
+pixel-perfect clone, not a port of the original codebase: a
+recognizable homage built on current architecture, with long-term
+maintainability and cross-platform (Linux + FreeBSD) support as
+first-class goals.
+
+## Non-goals
+
+- Bit-for-bit visual or behavioral fidelity to olwm/olvwm.
+- Reimplementing the pannable Virtual Desktop Manager (VDM). Replaced
+  with discrete, linear, swipeable workspaces.
+- Source compatibility with the original XView/olwm codebase. The
+  original is a behavioral/visual reference only (clean-room
+  reimplementation).
+
+## High-level architecture
+
+Two separate processes, split along a privilege boundary:
+
+```
+┌─────────────────────────┐        ┌──────────────────────────┐
+│   olcore (compositor)    │        │   olshell (shell)         │
+│   — C, wlroots            │◄──────►│   — Rust, Wayland client   │
+│   — privileged             │  IPC   │   — unprivileged            │
+│   — DRM/KMS, libinput,      │ proto  │   — panels, menus,           │
+│     seat mgmt, protocol     │        │     workspace switcher,       │
+│     compositing              │        │     theming/decoration UI      │
+└─────────────────────────┘        └──────────────────────────┘
+```
+
+**olcore** is the compositor proper: talks to the kernel/hardware
+(DRM/KMS, libinput), owns the seat, implements core Wayland protocol
+and compositing, and arbitrates window placement/focus. Built on
+wlroots for a proven, portable backend (including FreeBSD, via
+precedent like hikari).
+
+**olshell** is an ordinary Wayland client (privileged only in the UI
+sense, not the kernel sense) that renders everything
+OpenLook-specific: the pushpin-style menus, window gadgets/decoration
+chrome, workspace switcher strip, and root-window background/menu.
+It talks to olcore purely over standard and custom Wayland protocol
+extensions — no shared memory, no special IPC channel, no elevated
+privileges.
+
+### Why this split
+
+- **Security/robustness containment.** The highest-risk code
+  (buffer lifetimes, input handling, client teardown) stays in a
+  small, auditable core. A shell crash doesn't take down the whole
+  session.
+- **Language fit.** C+wlroots gets proven FreeBSD support for the
+  privileged core. Rust in the shell gets memory safety where the
+  most actively-changing, contribution-heavy code lives, without
+  inheriting Smithay's unproven BSD backend story (moot here, since
+  the shell is just a protocol client, not a backend).
+- **Decouples OpenLook-specific work from compositor plumbing.**
+  Most contributors will touch olshell. Few need to touch olcore at
+  all.
+
+## Shell ↔ Core protocol boundary
+
+olshell talks to olcore *only* via Wayland protocol — no custom RPC,
+no shared files, no special sockets beyond what any Wayland client
+already uses. Two categories of protocol:
+
+1. **Existing extensions**, reused as-is:
+   - `wlr-layer-shell` — for panels, the root menu surface, and the
+     workspace switcher strip (anchored, layered surfaces above/below
+     normal windows).
+   - `xdg-decoration` / custom decoration protocol — so olshell can
+     draw OpenLook-style window gadgets (title bar, pushpin, resize
+     corners) instead of clients or olcore drawing generic ones.
+   - `wlr-foreign-toplevel-management` — lets olshell enumerate and
+     manipulate other clients' windows (for the workspace
+     switcher, alt-tab equivalent, etc.) without olcore needing
+     OpenLook-specific logic baked in.
+
+2. **One small custom protocol extension** (`openlook-workspaces`,
+   working name) for the one thing not covered by existing
+   extensions: linear workspace switching. Minimal surface —
+   something like: `get_workspace_count`, `switch_to(index)`,
+   `workspace_changed` event. Kept intentionally tiny so olcore
+   doesn't accumulate OpenLook-specific policy — it just tracks
+   "which workspace is active" and reports window-to-workspace
+   assignment.
+
+**Principle:** olcore should know nothing about OpenLook's *look*.
+It's a generic, well-behaved wlroots compositor with one small
+workspace extension. All theming, menu behavior, and visual identity
+lives in olshell. This keeps the core reviewable by anyone familiar
+with wlroots compositors generally, not just this project.
+
+## Repo layout (proposed)
+
+```
+/core/     — olcore, C, wlroots-based compositor
+/shell/    — olshell, Rust, Wayland client
+/protocol/ — shared .xml protocol definitions (openlook-workspaces, etc.)
+/docs/     — design docs, contributor guides
+```
+
+## Open questions for v0.2
+
+- Exact scope of window gadget chrome (title bar buttons, resize
+  handles) — needs a short visual reference pass against OpenLook
+  screenshots before implementation.
+- Root menu behavior/config format (olwm used a plain-text
+  `.openwin-menu` file — worth deciding whether to echo that format
+  or use something more modern like TOML/YAML).
+- Multi-monitor behavior for the workspace strip (per-monitor
+  workspaces vs. shared).

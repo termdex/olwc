@@ -1,0 +1,19 @@
+[package]
+name = "olshell"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "olshell - the unprivileged OpenLook UI shell for olwc"
+
+[[bin]]
+name = "olshell"
+path = "src/main.rs"
+
+[dependencies]
+smithay-client-toolkit = "0.19"
+wayland-client = "0.31"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 2
