@@ -20,12 +20,53 @@ use smithay_client_toolkit::{
     shm::{slot::SlotPool, Shm, ShmHandler},
 };
 use wayland_client::{
+    backend::ObjectId,
     globals::registry_queue_init,
     protocol::{wl_output, wl_shm, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, Proxy, QueueHandle,
+};
+use wayland_protocols_wlr::foreign_toplevel::v1::client::{
+    zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
+    zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
+};
+
+// openlook-workspaces isn't published anywhere -- it's olwc's own protocol,
+// generated straight from the XML in the repo the same way wlr-protocols
+// generates its own bindings (see wayland-scanner's docs). Cross-references
+// to zwlr_foreign_toplevel_handle_v1 resolve via the wlr crate's interfaces.
+mod openlook_workspaces {
+    pub mod v1 {
+        pub mod client {
+            use wayland_client;
+            use wayland_protocols_wlr::foreign_toplevel::v1::client::*;
+
+            pub mod __interfaces {
+                use wayland_protocols_wlr::foreign_toplevel::v1::client::__interfaces::*;
+                wayland_scanner::generate_interfaces!(
+                    "../protocol/openlook-workspaces-unstable-v1.xml"
+                );
+            }
+            use self::__interfaces::*;
+
+            wayland_scanner::generate_client_code!(
+                "../protocol/openlook-workspaces-unstable-v1.xml"
+            );
+        }
+    }
+}
+
+use openlook_workspaces::v1::client::zopenlook_workspaces_manager_v1::{
+    self, ZopenlookWorkspacesManagerV1,
 };
 
 const PANEL_HEIGHT: u32 = 28;
+
+#[derive(Default, Debug)]
+struct ToplevelInfo {
+    title: String,
+    app_id: String,
+    states: Vec<u32>,
+}
 
 fn main() {
     env_logger::init();
@@ -55,6 +96,19 @@ fn main() {
     let pool = SlotPool::new(4 * (PANEL_HEIGHT as usize) * 1920, &shm)
         .expect("failed to create shm pool");
 
+    // Both optional: olshell should degrade gracefully against a compositor
+    // that doesn't (yet) implement one or either of them.
+    let foreign_toplevel_manager = globals
+        .bind::<ZwlrForeignToplevelManagerV1, _, _>(&qh, 1..=3, ())
+        .ok();
+    log::info!("wlr-foreign-toplevel-management: {}",
+        if foreign_toplevel_manager.is_some() { "bound" } else { "not available" });
+    let workspaces_manager = globals
+        .bind::<ZopenlookWorkspacesManagerV1, _, _>(&qh, 1..=1, ())
+        .ok();
+    log::info!("openlook-workspaces: {}",
+        if workspaces_manager.is_some() { "bound" } else { "not available" });
+
     let mut state = Olshell {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -64,6 +118,11 @@ fn main() {
         width: 0,
         height: PANEL_HEIGHT,
         exit: false,
+        foreign_toplevel_manager,
+        workspaces_manager,
+        toplevels: std::collections::HashMap::new(),
+        workspace_count: 0,
+        active_workspace: 0,
     };
 
     while !state.exit {
@@ -80,6 +139,15 @@ struct Olshell {
     width: u32,
     height: u32,
     exit: bool,
+    // Kept only to hold the binding alive; requests aren't sent yet, so
+    // nothing reads these beyond the Option check at startup.
+    #[allow(dead_code)]
+    foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
+    #[allow(dead_code)]
+    workspaces_manager: Option<ZopenlookWorkspacesManagerV1>,
+    toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
+    workspace_count: u32,
+    active_workspace: u32,
 }
 
 impl Olshell {
@@ -206,3 +274,99 @@ delegate_output!(Olshell);
 delegate_shm!(Olshell);
 delegate_layer!(Olshell);
 delegate_registry!(Olshell);
+
+// Neither wlr-foreign-toplevel-management nor openlook-workspaces are
+// sctk-integrated protocols, so these are plain wayland-client Dispatch
+// impls rather than sctk delegate macros. This is read-only: it enumerates
+// and tracks toplevels/workspaces, but doesn't yet send any of the control
+// requests (activate/close/maximize/switch_to) -- that's real taskbar UI
+// work, not wiring.
+impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Olshell {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZwlrForeignToplevelManagerV1,
+        event: zwlr_foreign_toplevel_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
+            state.toplevels.insert(toplevel.id(), ToplevelInfo::default());
+        }
+    }
+
+    wayland_client::event_created_child!(Olshell, ZwlrForeignToplevelManagerV1, [
+        0 => (ZwlrForeignToplevelHandleV1, ()),
+    ]);
+}
+
+impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
+    fn event(
+        state: &mut Self,
+        proxy: &ZwlrForeignToplevelHandleV1,
+        event: zwlr_foreign_toplevel_handle_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use zwlr_foreign_toplevel_handle_v1::Event;
+
+        match event {
+            Event::Title { title } => {
+                state.toplevels.entry(proxy.id()).or_default().title = title;
+            }
+            Event::AppId { app_id } => {
+                state.toplevels.entry(proxy.id()).or_default().app_id = app_id;
+            }
+            Event::State { state: state_bytes } => {
+                let states = state_bytes
+                    .chunks_exact(4)
+                    .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
+                    .collect();
+                state.toplevels.entry(proxy.id()).or_default().states = states;
+            }
+            Event::Done => {
+                if let Some(info) = state.toplevels.get(&proxy.id()) {
+                    log::info!(
+                        "toplevel: title={:?} app_id={:?} states={:?}",
+                        info.title, info.app_id, info.states
+                    );
+                }
+            }
+            Event::Closed => {
+                state.toplevels.remove(&proxy.id());
+                proxy.destroy();
+            }
+            Event::OutputEnter { .. } | Event::OutputLeave { .. } | Event::Parent { .. } => {}
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZopenlookWorkspacesManagerV1, ()> for Olshell {
+    fn event(
+        state: &mut Self,
+        _proxy: &ZopenlookWorkspacesManagerV1,
+        event: zopenlook_workspaces_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use zopenlook_workspaces_manager_v1::Event;
+
+        match event {
+            Event::WorkspaceCount { count } => {
+                state.workspace_count = count;
+                log::info!("workspaces: {count} available");
+            }
+            Event::ActiveChanged { index } => {
+                state.active_workspace = index;
+                log::info!("workspaces: active = {index}");
+            }
+            Event::ToplevelWorkspace { toplevel, index } => {
+                let title = state.toplevels.get(&toplevel.id()).map(|i| i.title.clone());
+                log::info!("workspaces: toplevel {title:?} -> workspace {index}");
+            }
+        }
+    }
+}

@@ -341,7 +341,10 @@ dependencies = [
  "env_logger",
  "log",
  "smithay-client-toolkit",
+ "wayland-backend",
  "wayland-client",
+ "wayland-protocols-wlr",
+ "wayland-scanner",
 ]
 
 [[package]]

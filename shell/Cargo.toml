@@ -12,6 +12,9 @@ path = "src/main.rs"
 [dependencies]
 smithay-client-toolkit = "0.19"
 wayland-client = "0.31"
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
 log = "0.4"
 env_logger = "0.11"
 
