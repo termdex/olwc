@@ -60,6 +60,12 @@ use openlook_workspaces::v1::client::zopenlook_workspaces_manager_v1::{
 };
 
 const PANEL_HEIGHT: u32 = 28;
+const PANEL_FONT_SIZE: f32 = 20.0;
+const PANEL_ENTRY_GAP: i32 = 20;
+const PANEL_TEXT_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
+
+// SIL Open Font License 1.1, see assets/fonts/OFL.txt.
+static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
 
 #[derive(Default, Debug)]
 struct ToplevelInfo {
@@ -109,6 +115,9 @@ fn main() {
     log::info!("openlook-workspaces: {}",
         if workspaces_manager.is_some() { "bound" } else { "not available" });
 
+    let font = fontdue::Font::from_bytes(PANEL_FONT_BYTES, fontdue::FontSettings::default())
+        .expect("failed to parse embedded panel font");
+
     let mut state = Olshell {
         registry_state: RegistryState::new(&globals),
         output_state: OutputState::new(&globals, &qh),
@@ -123,6 +132,7 @@ fn main() {
         toplevels: std::collections::HashMap::new(),
         workspace_count: 0,
         active_workspace: 0,
+        font,
     };
 
     while !state.exit {
@@ -148,11 +158,18 @@ struct Olshell {
     toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
     workspace_count: u32,
     active_workspace: u32,
+    font: fontdue::Font,
 }
 
 impl Olshell {
     fn draw(&mut self) {
-        let width = self.width.max(1) as i32;
+        // Nothing to paint into yet -- the compositor hasn't sent our first
+        // configure. A toplevel update arriving before then would otherwise
+        // draw into a degenerate 1px-wide buffer for no reason.
+        if self.width == 0 {
+            return;
+        }
+        let width = self.width as i32;
         let height = self.height.max(1) as i32;
         let stride = width * 4;
 
@@ -169,11 +186,77 @@ impl Olshell {
             pixel[3] = 0xFF; // A
         }
 
+        // Flat list of every mapped toplevel's title, left to right. No
+        // workspace filtering, wrapping, or scrolling yet -- entries past
+        // the panel's width are simply clipped.
+        let mut x = 8;
+        let mut titles: Vec<&str> = self
+            .toplevels
+            .values()
+            .map(|info| info.title.as_str())
+            .filter(|title| !title.is_empty())
+            .collect();
+        titles.sort_unstable();
+        for title in titles {
+            if x >= width {
+                break;
+            }
+            x = draw_text(canvas, width, height, x, title, &self.font, PANEL_FONT_SIZE, PANEL_TEXT_COLOR);
+            x += PANEL_ENTRY_GAP;
+        }
+
         let wl_surface = self.layer.wl_surface();
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
         self.layer.commit();
     }
+}
+
+/// Rasterizes `text` starting at `start_x`, vertically centered in a canvas
+/// of the given height, alpha-blended over whatever's already there.
+/// Returns the x position just past the last glyph drawn.
+fn draw_text(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    start_x: i32,
+    text: &str,
+    font: &fontdue::Font,
+    size: f32,
+    color: (u8, u8, u8),
+) -> i32 {
+    let (r, g, b) = color;
+    let baseline_y = canvas_height / 2 + (size as i32) / 3;
+    let mut x = start_x;
+
+    for ch in text.chars() {
+        let (metrics, bitmap) = font.rasterize(ch, size);
+        let glyph_x0 = x + metrics.xmin;
+        let glyph_y0 = baseline_y - metrics.height as i32 - metrics.ymin;
+
+        for row in 0..metrics.height {
+            for col in 0..metrics.width {
+                let coverage = bitmap[row * metrics.width + col] as u32;
+                if coverage == 0 {
+                    continue;
+                }
+                let px = glyph_x0 + col as i32;
+                let py = glyph_y0 + row as i32;
+                if px < 0 || py < 0 || px >= canvas_width || py >= canvas_height {
+                    continue;
+                }
+                let idx = ((py * canvas_width + px) * 4) as usize;
+                for (i, fg) in [b, g, r].into_iter().enumerate() {
+                    let bg = canvas[idx + i] as u32;
+                    canvas[idx + i] = ((fg as u32 * coverage + bg * (255 - coverage)) / 255) as u8;
+                }
+            }
+        }
+
+        x += metrics.advance_width.round() as i32;
+    }
+
+    x
 }
 
 impl CompositorHandler for Olshell {
@@ -332,10 +415,12 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                         info.title, info.app_id, info.states
                     );
                 }
+                state.draw();
             }
             Event::Closed => {
                 state.toplevels.remove(&proxy.id());
                 proxy.destroy();
+                state.draw();
             }
             Event::OutputEnter { .. } | Event::OutputLeave { .. } | Event::Parent { .. } => {}
             _ => {}
