@@ -87,6 +87,10 @@ const MENU_HOVER_COLOR: (u8, u8, u8) = (0x8A, 0x9E, 0xB0);
 const MENU_TITLE_COLOR: (u8, u8, u8) = (0x40, 0x40, 0x38);
 const MENU_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
 
+const PUSHPIN_SIZE: i32 = 10;
+const PUSHPIN_UNPINNED_COLOR: (u8, u8, u8) = MENU_TITLE_COLOR;
+const PUSHPIN_PINNED_COLOR: (u8, u8, u8) = (0xA8, 0x30, 0x28);
+
 // SIL Open Font License 1.1, see assets/fonts/OFL.txt.
 static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
 
@@ -109,28 +113,48 @@ struct MenuPopup {
     width: u32,
     height: u32,
     hovered: Option<usize>,
+    // Pin-to-persist (OPEN LOOK's pushpin gesture): clicking the pushpin
+    // in the header converts a transient popup into a persistent one that
+    // survives a release and can be used repeatedly, until the pushpin is
+    // clicked again or Escape is pressed. No drag-to-move yet -- it's not
+    // truly a "floating palette" you can reposition, just one that stays
+    // put and stays open.
+    pinned: bool,
 }
 
 impl MenuPopup {
-    fn title_rows(&self) -> i32 {
-        if self.title.is_some() {
-            1
-        } else {
-            0
-        }
+    /// The header row (pushpin + optional title text) is always present,
+    /// regardless of whether this menu has a title -- the pushpin needs
+    /// somewhere to live either way.
+    fn header_rows(&self) -> i32 {
+        1
+    }
+
+    /// Bounding box of the pushpin hit/paint target, within the header row.
+    fn pushpin_rect(&self) -> (i32, i32, i32, i32) {
+        let x1 = self.width as i32 - MENU_H_PADDING;
+        let x0 = x1 - PUSHPIN_SIZE;
+        let y0 = (MENU_ROW_HEIGHT - PUSHPIN_SIZE) / 2;
+        (x0, y0, x1, y0 + PUSHPIN_SIZE)
+    }
+
+    fn is_on_pushpin(&self, x: f64, y: f64) -> bool {
+        let (x0, y0, x1, y1) = self.pushpin_rect();
+        let (x, y) = (x as i32, y as i32);
+        x >= x0 && x < x1 && y >= y0 && y < y1
     }
 
     /// Item index under `y` (surface-local), if any.
     fn item_at(&self, y: f64) -> Option<usize> {
         // Do the boundary check and division in f64 throughout -- mixing in
         // i32 here is a trap: integer division truncates toward zero, not
-        // toward -inf, so a title-row y (which makes the numerator
+        // toward -inf, so a header-row y (which makes the numerator
         // negative) doesn't reliably come out negative after dividing.
-        let title_h = (self.title_rows() * MENU_ROW_HEIGHT) as f64;
-        if y < title_h {
+        let header_h = (self.header_rows() * MENU_ROW_HEIGHT) as f64;
+        if y < header_h {
             return None;
         }
-        let row = ((y - title_h) / MENU_ROW_HEIGHT as f64) as usize;
+        let row = ((y - header_h) / MENU_ROW_HEIGHT as f64) as usize;
         (row < self.items.len()).then_some(row)
     }
 }
@@ -347,16 +371,21 @@ impl Olshell {
         let items = self.menu.items.clone();
         let title = self.menu.title.clone();
 
-        let mut max_width = 0i32;
-        for label in title.iter().map(String::as_str).chain(items.iter().map(MenuNode::label)) {
-            let w: i32 = label
+        let label_width = |label: &str| -> i32 {
+            label
                 .chars()
                 .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
-                .sum();
-            max_width = max_width.max(w);
+                .sum()
+        };
+        // The header row needs to fit the title text *and* the pushpin
+        // without them colliding, so it gets extra reserved width.
+        let mut max_width = title.as_deref().map_or(0, label_width) + PUSHPIN_SIZE + MENU_H_PADDING;
+        for item in &items {
+            max_width = max_width.max(label_width(item.label()));
         }
         let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
-        let rows = items.len() as i32 + if title.is_some() { 1 } else { 0 };
+        // Header row (pushpin, always present) + one row per item.
+        let rows = items.len() as i32 + 1;
         let height = (rows * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
 
         let surface = self.compositor.create_surface(qh);
@@ -375,7 +404,7 @@ impl Olshell {
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
 
-        self.popup = Some(MenuPopup { layer, items, title, width, height, hovered: None });
+        self.popup = Some(MenuPopup { layer, items, title, width, height, hovered: None, pinned: false });
     }
 
     fn close_menu(&mut self) {
@@ -420,7 +449,8 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
         pixel[3] = 0xFF;
     }
 
-    let mut row = 0;
+    // Header row: always present (the pushpin needs somewhere to live even
+    // for a title-less menu), title text drawn only if there is one.
     if let Some(title) = &popup.title {
         // draw_text centers in the *whole* canvas height, not just this
         // row -- for a multi-row popup that puts the title text down in
@@ -430,8 +460,11 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
             canvas, width, 0, MENU_ROW_HEIGHT, MENU_H_PADDING,
             title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
         );
-        row += 1;
     }
+    let (px0, py0, px1, py1) = popup.pushpin_rect();
+    let pushpin_color = if popup.pinned { PUSHPIN_PINNED_COLOR } else { PUSHPIN_UNPINNED_COLOR };
+    draw_pushpin(canvas, width, height, px0, py0, px1, py1, popup.pinned, pushpin_color);
+    let row = popup.header_rows();
 
     for (i, item) in popup.items.iter().enumerate() {
         let row_y0 = (row + i as i32) * MENU_ROW_HEIGHT;
@@ -491,6 +524,46 @@ fn draw_text_row_centered(
 ) -> i32 {
     let baseline_y = row_y0 + row_height / 2 + (size as i32) / 3;
     draw_text_at(canvas, canvas_width, row_y0 + row_height, start_x, baseline_y, text, font, size, color)
+}
+
+/// Draws the pushpin glyph within box (x0,y0)-(x1,y1): a filled circle when
+/// pinned (the pin pushed in/engaged), or just its outline when not.
+#[allow(clippy::too_many_arguments)]
+fn draw_pushpin(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    pinned: bool,
+    color: (u8, u8, u8),
+) {
+    let (r, g, b) = color;
+    let radius = (x1 - x0).min(y1 - y0) / 2;
+    let cx = (x0 + x1) / 2;
+    let cy = (y0 + y1) / 2;
+    for dy in -radius..=radius {
+        for dx in -radius..=radius {
+            let dist2 = dx * dx + dy * dy;
+            let inside = dist2 <= radius * radius;
+            let on_ring = inside && (pinned || dist2 >= (radius - 2) * (radius - 2));
+            if !on_ring {
+                continue;
+            }
+            let px = cx + dx;
+            let py = cy + dy;
+            if px < 0 || py < 0 || px >= canvas_width || py >= canvas_height {
+                continue;
+            }
+            let idx = ((py * canvas_width + px) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -718,17 +791,50 @@ impl PointerHandler for Olshell {
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
-                    if on_popup {
-                        let popup = self.popup.as_ref().unwrap();
-                        if let Some(index) = popup.item_at(event.position.1) {
-                            if let MenuNode::Item { command, .. } = &popup.items[index] {
-                                Self::run_command(command);
+                    let mut command_to_run = None;
+                    let mut should_close = false;
+
+                    if let Some(popup) = self.popup.as_mut() {
+                        if on_popup && popup.is_on_pushpin(event.position.0, event.position.1) {
+                            // Pinning a transient popup makes it persistent;
+                            // clicking the pushpin again on an already-
+                            // pinned popup is how you dismiss it, since
+                            // there's no button-hold to release into once
+                            // it's just sitting there open.
+                            if popup.pinned {
+                                should_close = true;
                             } else {
-                                log::info!("root menu: submenus aren't interactive yet");
+                                popup.pinned = true;
+                                draw_popup(&mut self.pool, &self.font, popup);
                             }
+                        } else if on_popup {
+                            if let Some(index) = popup.item_at(event.position.1) {
+                                match &popup.items[index] {
+                                    MenuNode::Item { command, .. } => {
+                                        command_to_run = Some(command.clone());
+                                    }
+                                    MenuNode::Submenu { .. } => {
+                                        log::info!("root menu: submenus aren't interactive yet");
+                                    }
+                                }
+                                should_close = !popup.pinned;
+                            } else if !popup.pinned {
+                                // Released on the popup's own padding, not
+                                // an item or the pushpin.
+                                should_close = true;
+                            }
+                        } else if !popup.pinned {
+                            // Released off the popup entirely -- a pinned
+                            // popup stays up through this, same as a real
+                            // persistent palette would.
+                            should_close = true;
                         }
                     }
-                    if self.popup.is_some() {
+
+                    if let Some(command) = command_to_run {
+                        Self::run_command(&command);
+                    }
+                    if should_close {
                         self.close_menu();
                     }
                 }
