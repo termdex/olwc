@@ -815,9 +815,9 @@ fn draw_chevron(
         if bottom == top {
             break;
         }
-        // Widens linearly from a point at `top` to the full inset width at
-        // `bottom`, forming a downward-pointing "v".
-        let t = (y - top) as f64 / (bottom - top) as f64;
+        // Narrows linearly from the full inset width at `top` down to a
+        // point at `bottom`, forming a downward-pointing "v".
+        let t = 1.0 - (y - top) as f64 / (bottom - top) as f64;
         let half = ((mid_x - x0 - inset) as f64 * t) as i32;
         for x in (mid_x - half)..=(mid_x + half) {
             if x < 0 || y < 0 || x >= canvas_width || y >= canvas_height {
@@ -1087,6 +1087,12 @@ impl PointerHandler for Olshell {
                         // interactive yet -- follow-up work, same as the
                         // root menu's submenus.
                         log::info!("window menu: not yet interactive");
+                    } else if let Some(dec) =
+                        self.toplevels.get(&id).and_then(|info| info.decoration.as_ref())
+                    {
+                        // A press anywhere else on the header drags the
+                        // window, same as a real title bar.
+                        dec.object._move();
                     }
                 }
                 PointerEventKind::Motion { .. } if on_popup => {

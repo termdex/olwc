@@ -121,6 +121,13 @@ with wlroots compositors generally, not just this project.
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
   workspaces vs. shared).
+- The desktop-wide panel's toplevel-title list (`shell/src/main.rs`'s
+  `draw_panel`) predates the OPEN LOOK reference research and is now both
+  redundant (window decorations show titles per-window) and itself the
+  kind of taskbar convention `docs/OPENLOOK-REFERENCE.md` flags as *not*
+  authentic OPEN LOOK. Decided: leave it as-is for now and revisit
+  together with building the workspace switcher strip the panel was
+  originally meant to host, rather than changing it twice.
 - Theming flexibility: later on, users may want to choose between a
   "pure" original-OPEN-LOOK visual style and the more Sun-ified look
   seen in later desktops built on it (see the taskbar/icon convention

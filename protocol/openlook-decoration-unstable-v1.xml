@@ -97,6 +97,17 @@
       <arg name="serial" type="uint" summary="serial from the configure event"/>
     </request>
 
+    <request name="move">
+      <description summary="begin an interactive move of the decorated toplevel">
+        Tells olcore to start moving the decorated toplevel, following the
+        pointer until release -- the same interactive move a client can
+        normally only trigger on its own xdg_toplevel, exposed here so
+        dragging the header (which belongs to olshell, not the toplevel's
+        own client) can trigger it too. Expected to be sent right after a
+        pointer press on the header outside the window-menu button.
+      </description>
+    </request>
+
     <request name="destroy" type="destructor">
       <description summary="destroy this decoration">
         The header disappears immediately. The underlying wl_surface is

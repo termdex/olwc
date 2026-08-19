@@ -982,6 +982,21 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	free(toplevel);
 }
 
+// Sets up an interactive move grab for toplevel, unconditionally -- no
+// pointer-focus check, since callers are expected to have already
+// established that starting a move on behalf of this toplevel right now is
+// legitimate (see begin_interactive's guard for the normal client-initiated
+// case, and decoration_handle_move for the header-drag case, which can't
+// use that guard since the pointer is focused on the header's own surface,
+// not the toplevel's).
+static void start_move_grab(struct olc_toplevel *toplevel) {
+	struct olc_server *server = toplevel->server;
+	server->grabbed_toplevel = toplevel;
+	server->cursor_mode = OLC_CURSOR_MOVE;
+	server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
+	server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
+}
+
 static void begin_interactive(struct olc_toplevel *toplevel,
 		enum olc_cursor_mode mode, uint32_t edges) {
 	struct olc_server *server = toplevel->server;
@@ -990,13 +1005,12 @@ static void begin_interactive(struct olc_toplevel *toplevel,
 			wlr_surface_get_root_surface(focused_surface)) {
 		return;
 	}
-	server->grabbed_toplevel = toplevel;
-	server->cursor_mode = mode;
 
 	if (mode == OLC_CURSOR_MOVE) {
-		server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
-		server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
+		start_move_grab(toplevel);
 	} else {
+		server->grabbed_toplevel = toplevel;
+		server->cursor_mode = mode;
 		struct wlr_box geo_box = toplevel->xdg_toplevel->base->geometry;
 
 		double border_x = (toplevel->scene_tree->node.x + geo_box.x) +
@@ -1251,9 +1265,19 @@ static void decoration_handle_destroy(struct wl_client *client, struct wl_resour
 	wl_resource_destroy(resource);
 }
 
+static void decoration_handle_move(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
+	if (decoration == NULL || decoration->toplevel == NULL) {
+		return;
+	}
+	start_move_grab(decoration->toplevel);
+}
+
 static const struct zopenlook_decoration_v1_interface decoration_impl = {
 	.ack_configure = decoration_handle_ack_configure,
 	.destroy = decoration_handle_destroy,
+	.move = decoration_handle_move,
 };
 
 static void decoration_teardown(struct olc_decoration *decoration) {
