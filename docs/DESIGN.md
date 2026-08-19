@@ -107,10 +107,20 @@ with wlroots compositors generally, not just this project.
 ## Open questions for v0.2
 
 - Exact scope of window gadget chrome (title bar buttons, resize
-  handles) — needs a short visual reference pass against OpenLook
-  screenshots before implementation.
-- Root menu behavior/config format (olwm used a plain-text
-  `.openwin-menu` file — worth deciding whether to echo that format
-  or use something more modern like TOML/YAML).
+  handles) — the visual reference pass against OpenLook screenshots
+  is done (see `docs/OPENLOOK-REFERENCE.md`), implementation not yet
+  started.
+- ~~Root menu behavior/config format~~ resolved: olwm-compatible
+  `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
   workspaces vs. shared).
+- Theming flexibility: later on, users may want to choose between a
+  "pure" original-OPEN-LOOK visual style and the more Sun-ified look
+  seen in later desktops built on it (see the taskbar/icon convention
+  called out as out-of-scope in `docs/OPENLOOK-REFERENCE.md`'s window
+  menu section, for one example of the kind of divergence a theme
+  might span). Nothing to build now, but worth keeping olshell's
+  decoration/panel/menu rendering code factored so style constants
+  (colors, spacing, shapes) stay centralized and swappable rather than
+  scattered through drawing logic, so a future theme layer doesn't
+  need a rewrite to slot in.
