@@ -6,10 +6,15 @@
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_registry, delegate_shm,
+    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
+    seat::{
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
+        Capability, SeatHandler, SeatState,
+    },
     shell::{
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
@@ -22,9 +27,13 @@ use smithay_client_toolkit::{
 use wayland_client::{
     backend::ObjectId,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_shm, wl_surface},
+    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, Dispatch, Proxy, QueueHandle,
 };
+
+// Linux input event codes (linux/input-event-codes.h), as reported in
+// wl_pointer button events. OPEN LOOK's MENU button is the right button.
+const BTN_RIGHT: u32 = 0x111;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
@@ -59,10 +68,23 @@ use openlook_workspaces::v1::client::zopenlook_workspaces_manager_v1::{
     self, ZopenlookWorkspacesManagerV1,
 };
 
+mod menu;
+use menu::{Menu, MenuNode};
+
 const PANEL_HEIGHT: u32 = 28;
 const PANEL_FONT_SIZE: f32 = 20.0;
 const PANEL_ENTRY_GAP: i32 = 20;
 const PANEL_TEXT_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
+
+const BACKGROUND_COLOR: (u8, u8, u8) = (0x5A, 0x76, 0x8C);
+
+const MENU_FONT_SIZE: f32 = 18.0;
+const MENU_ROW_HEIGHT: i32 = 26;
+const MENU_H_PADDING: i32 = 12;
+const MENU_BG_COLOR: (u8, u8, u8) = (0xD8, 0xD8, 0xD0);
+const MENU_HOVER_COLOR: (u8, u8, u8) = (0x8A, 0x9E, 0xB0);
+const MENU_TITLE_COLOR: (u8, u8, u8) = (0x40, 0x40, 0x38);
+const MENU_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
 
 // SIL Open Font License 1.1, see assets/fonts/OFL.txt.
 static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
@@ -72,6 +94,40 @@ struct ToplevelInfo {
     title: String,
     app_id: String,
     states: Vec<u32>,
+}
+
+/// A transient root-menu popup: press MENU on the background to open one,
+/// drag to highlight an item, release over it to run the item's command
+/// and dismiss (release elsewhere just dismisses). Submenu entries are
+/// rendered but not yet interactive -- opening a nested popup on hover is
+/// follow-up work. No pushpin/persist gesture yet either.
+struct MenuPopup {
+    layer: LayerSurface,
+    items: Vec<MenuNode>,
+    title: Option<String>,
+    width: u32,
+    height: u32,
+    hovered: Option<usize>,
+}
+
+impl MenuPopup {
+    fn title_rows(&self) -> i32 {
+        if self.title.is_some() {
+            1
+        } else {
+            0
+        }
+    }
+
+    /// Item index under `y` (surface-local), if any.
+    fn item_at(&self, y: f64) -> Option<usize> {
+        let row = (y as i32 - self.title_rows() * MENU_ROW_HEIGHT) / MENU_ROW_HEIGHT;
+        if row < 0 {
+            return None;
+        }
+        let row = row as usize;
+        (row < self.items.len()).then_some(row)
+    }
 }
 
 fn main() {
@@ -99,8 +155,26 @@ fn main() {
     layer.set_keyboard_interactivity(KeyboardInteractivity::None);
     layer.commit();
 
+    // The desktop background doubles as the OPEN LOOK "root window": MENU
+    // (right-button) clicks on it open the root menu. Non-exclusive so it
+    // doesn't compete with the panel for space.
+    let bg_surface = compositor.create_surface(&qh);
+    let background = layer_shell.create_layer_surface(
+        &qh,
+        bg_surface,
+        Layer::Background,
+        Some("olshell-background"),
+        None,
+    );
+    background.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+    background.set_size(0, 0);
+    background.set_keyboard_interactivity(KeyboardInteractivity::None);
+    background.commit();
+
     let pool = SlotPool::new(4 * (PANEL_HEIGHT as usize) * 1920, &shm)
         .expect("failed to create shm pool");
+
+    let menu = Menu::load_default();
 
     // Both optional: olshell should degrade gracefully against a compositor
     // that doesn't (yet) implement one or either of them.
@@ -120,12 +194,18 @@ fn main() {
 
     let mut state = Olshell {
         registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
         output_state: OutputState::new(&globals, &qh),
+        compositor,
+        layer_shell,
         shm,
         pool,
         layer,
         width: 0,
         height: PANEL_HEIGHT,
+        background,
+        bg_width: 0,
+        bg_height: 0,
         exit: false,
         foreign_toplevel_manager,
         workspaces_manager,
@@ -133,6 +213,9 @@ fn main() {
         workspace_count: 0,
         active_workspace: 0,
         font,
+        menu,
+        pointer: None,
+        popup: None,
     };
 
     while !state.exit {
@@ -142,12 +225,18 @@ fn main() {
 
 struct Olshell {
     registry_state: RegistryState,
+    seat_state: SeatState,
     output_state: OutputState,
+    compositor: CompositorState,
+    layer_shell: LayerShell,
     shm: Shm,
     pool: SlotPool,
     layer: LayerSurface,
     width: u32,
     height: u32,
+    background: LayerSurface,
+    bg_width: u32,
+    bg_height: u32,
     exit: bool,
     // Kept only to hold the binding alive; requests aren't sent yet, so
     // nothing reads these beyond the Option check at startup.
@@ -159,10 +248,13 @@ struct Olshell {
     workspace_count: u32,
     active_workspace: u32,
     font: fontdue::Font,
+    menu: Menu,
+    pointer: Option<wl_pointer::WlPointer>,
+    popup: Option<MenuPopup>,
 }
 
 impl Olshell {
-    fn draw(&mut self) {
+    fn draw_panel(&mut self) {
         // Nothing to paint into yet -- the compositor hasn't sent our first
         // configure. A toplevel update arriving before then would otherwise
         // draw into a degenerate 1px-wide buffer for no reason.
@@ -210,6 +302,142 @@ impl Olshell {
         wl_surface.damage_buffer(0, 0, width, height);
         self.layer.commit();
     }
+
+    fn draw_background(&mut self) {
+        if self.bg_width == 0 {
+            return;
+        }
+        let width = self.bg_width as i32;
+        let height = self.bg_height.max(1) as i32;
+        let stride = width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+
+        let (r, g, b) = BACKGROUND_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+
+        let wl_surface = self.background.wl_surface();
+        buffer.attach_to(wl_surface).expect("failed to attach buffer");
+        wl_surface.damage_buffer(0, 0, width, height);
+        self.background.commit();
+    }
+
+    /// Opens the root menu at `(x, y)` (surface-local coordinates on the
+    /// background, which is fullscreen so those are effectively screen
+    /// coordinates). Anchoring a layer surface to top-left with margins is
+    /// the standard wlr-layer-shell trick for pixel-precise popup placement.
+    fn open_menu(&mut self, qh: &QueueHandle<Self>, x: f64, y: f64) {
+        self.close_menu();
+
+        let items = self.menu.items.clone();
+        let title = self.menu.title.clone();
+
+        let mut max_width = 0i32;
+        for label in title.iter().map(String::as_str).chain(items.iter().map(MenuNode::label)) {
+            let w: i32 = label
+                .chars()
+                .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
+                .sum();
+            max_width = max_width.max(w);
+        }
+        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        let rows = items.len() as i32 + if title.is_some() { 1 } else { 0 };
+        let height = (rows * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
+
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Overlay,
+            Some("olshell-menu"),
+            None,
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_margin(y as i32, 0, 0, x as i32);
+        layer.set_size(width, height);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.commit();
+
+        self.popup = Some(MenuPopup { layer, items, title, width, height, hovered: None });
+    }
+
+    fn close_menu(&mut self) {
+        if let Some(popup) = self.popup.take() {
+            popup.layer.wl_surface().destroy();
+        }
+    }
+
+    /// Runs a popup menu item's command via `sh -c`, detached. The spawned
+    /// child is reaped on a background thread so it doesn't linger as a
+    /// zombie for the rest of olshell's (long) lifetime.
+    fn run_command(command: &str) {
+        log::info!("root menu: running {command:?}");
+        match std::process::Command::new("sh").arg("-c").arg(command).spawn() {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(e) => log::warn!("root menu: failed to run {command:?}: {e}"),
+        }
+    }
+}
+
+fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
+    let width = popup.width as i32;
+    let height = popup.height as i32;
+    let stride = width * 4;
+
+    let (buffer, canvas) = pool
+        .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+        .expect("failed to create buffer");
+
+    let (r, g, b) = MENU_BG_COLOR;
+    for pixel in canvas.chunks_exact_mut(4) {
+        pixel[0] = b;
+        pixel[1] = g;
+        pixel[2] = r;
+        pixel[3] = 0xFF;
+    }
+
+    let mut row = 0;
+    if let Some(title) = &popup.title {
+        draw_text(canvas, width, height, MENU_H_PADDING, title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR);
+        row += 1;
+    }
+
+    for (i, item) in popup.items.iter().enumerate() {
+        let row_y0 = (row + i as i32) * MENU_ROW_HEIGHT;
+        if popup.hovered == Some(i) {
+            let (hr, hg, hb) = MENU_HOVER_COLOR;
+            for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
+                for x in 0..width {
+                    let idx = ((y * width + x) * 4) as usize;
+                    canvas[idx] = hb;
+                    canvas[idx + 1] = hg;
+                    canvas[idx + 2] = hr;
+                    canvas[idx + 3] = 0xFF;
+                }
+            }
+        }
+        draw_text_row_centered(
+            canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+            item.label(), font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
+        );
+    }
+
+    let wl_surface = popup.layer.wl_surface();
+    buffer.attach_to(wl_surface).expect("failed to attach buffer");
+    wl_surface.damage_buffer(0, 0, width, height);
+    popup.layer.commit();
 }
 
 /// Rasterizes `text` starting at `start_x`, vertically centered in a canvas
@@ -225,8 +453,40 @@ fn draw_text(
     size: f32,
     color: (u8, u8, u8),
 ) -> i32 {
-    let (r, g, b) = color;
     let baseline_y = canvas_height / 2 + (size as i32) / 3;
+    draw_text_at(canvas, canvas_width, canvas_height, start_x, baseline_y, text, font, size, color)
+}
+
+/// Draws `text` with its baseline at `baseline_y`, rather than centered in
+/// the whole canvas -- e.g. for centering within a single menu row.
+fn draw_text_row_centered(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    row_y0: i32,
+    row_height: i32,
+    start_x: i32,
+    text: &str,
+    font: &fontdue::Font,
+    size: f32,
+    color: (u8, u8, u8),
+) -> i32 {
+    let baseline_y = row_y0 + row_height / 2 + (size as i32) / 3;
+    draw_text_at(canvas, canvas_width, row_y0 + row_height, start_x, baseline_y, text, font, size, color)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_at(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    start_x: i32,
+    baseline_y: i32,
+    text: &str,
+    font: &fontdue::Font,
+    size: f32,
+    color: (u8, u8, u8),
+) -> i32 {
+    let (r, g, b) = color;
     let mut x = start_x;
 
     for ch in text.chars() {
@@ -317,25 +577,47 @@ impl OutputHandler for Olshell {
 }
 
 impl LayerShellHandler for Olshell {
-    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _layer: &LayerSurface) {
-        self.exit = true;
+    fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
+        if layer.wl_surface() == self.layer.wl_surface()
+            || layer.wl_surface() == self.background.wl_surface()
+        {
+            self.exit = true;
+        } else if self.popup.as_ref().is_some_and(|p| layer.wl_surface() == p.layer.wl_surface()) {
+            self.popup = None;
+        }
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _layer: &LayerSurface,
+        layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        self.width = configure.new_size.0;
-        self.height = if configure.new_size.1 > 0 {
-            configure.new_size.1
-        } else {
-            PANEL_HEIGHT
-        };
-        self.draw();
+        if layer.wl_surface() == self.layer.wl_surface() {
+            self.width = configure.new_size.0;
+            self.height = if configure.new_size.1 > 0 {
+                configure.new_size.1
+            } else {
+                PANEL_HEIGHT
+            };
+            self.draw_panel();
+        } else if layer.wl_surface() == self.background.wl_surface() {
+            self.bg_width = configure.new_size.0;
+            self.bg_height = configure.new_size.1;
+            self.draw_background();
+        } else if let Some(popup) = self.popup.as_mut() {
+            if layer.wl_surface() == popup.layer.wl_surface() {
+                if configure.new_size.0 > 0 {
+                    popup.width = configure.new_size.0;
+                }
+                if configure.new_size.1 > 0 {
+                    popup.height = configure.new_size.1;
+                }
+                draw_popup(&mut self.pool, &self.font, popup);
+            }
+        }
     }
 }
 
@@ -345,16 +627,102 @@ impl ShmHandler for Olshell {
     }
 }
 
+impl SeatHandler for Olshell {
+    fn seat_state(&mut self) -> &mut SeatState {
+        &mut self.seat_state
+    }
+
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+
+    fn new_capability(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
+        }
+    }
+
+    fn remove_capability(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _seat: wl_seat::WlSeat,
+        capability: Capability,
+    ) {
+        if capability == Capability::Pointer {
+            if let Some(pointer) = self.pointer.take() {
+                pointer.release();
+            }
+        }
+    }
+
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {}
+}
+
+impl PointerHandler for Olshell {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        events: &[PointerEvent],
+    ) {
+        for event in events {
+            let on_background = event.surface == *self.background.wl_surface();
+            let on_popup = self
+                .popup
+                .as_ref()
+                .is_some_and(|p| event.surface == *p.layer.wl_surface());
+
+            match event.kind {
+                PointerEventKind::Press { button, .. } if on_background && button == BTN_RIGHT => {
+                    self.open_menu(qh, event.position.0, event.position.1);
+                }
+                PointerEventKind::Motion { .. } if on_popup => {
+                    let popup = self.popup.as_mut().unwrap();
+                    let hovered = popup.item_at(event.position.1);
+                    if popup.hovered != hovered {
+                        popup.hovered = hovered;
+                        draw_popup(&mut self.pool, &self.font, popup);
+                    }
+                }
+                PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
+                    if on_popup {
+                        let popup = self.popup.as_ref().unwrap();
+                        if let Some(index) = popup.item_at(event.position.1) {
+                            if let MenuNode::Item { command, .. } = &popup.items[index] {
+                                Self::run_command(command);
+                            } else {
+                                log::info!("root menu: submenus aren't interactive yet");
+                            }
+                        }
+                    }
+                    if self.popup.is_some() {
+                        self.close_menu();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
 impl ProvidesRegistryState for Olshell {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
     }
-    registry_handlers![OutputState];
+    registry_handlers![OutputState, SeatState];
 }
 
 delegate_compositor!(Olshell);
 delegate_output!(Olshell);
 delegate_shm!(Olshell);
+delegate_seat!(Olshell);
+delegate_pointer!(Olshell);
 delegate_layer!(Olshell);
 delegate_registry!(Olshell);
 
@@ -415,12 +783,12 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                         info.title, info.app_id, info.states
                     );
                 }
-                state.draw();
+                state.draw_panel();
             }
             Event::Closed => {
                 state.toplevels.remove(&proxy.id());
                 proxy.destroy();
-                state.draw();
+                state.draw_panel();
             }
             Event::OutputEnter { .. } | Event::OutputLeave { .. } | Event::Parent { .. } => {}
             _ => {}
