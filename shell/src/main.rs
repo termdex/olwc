@@ -121,11 +121,15 @@ impl MenuPopup {
 
     /// Item index under `y` (surface-local), if any.
     fn item_at(&self, y: f64) -> Option<usize> {
-        let row = (y as i32 - self.title_rows() * MENU_ROW_HEIGHT) / MENU_ROW_HEIGHT;
-        if row < 0 {
+        // Do the boundary check and division in f64 throughout -- mixing in
+        // i32 here is a trap: integer division truncates toward zero, not
+        // toward -inf, so a title-row y (which makes the numerator
+        // negative) doesn't reliably come out negative after dividing.
+        let title_h = (self.title_rows() * MENU_ROW_HEIGHT) as f64;
+        if y < title_h {
             return None;
         }
-        let row = row as usize;
+        let row = ((y - title_h) / MENU_ROW_HEIGHT as f64) as usize;
         (row < self.items.len()).then_some(row)
     }
 }
@@ -370,9 +374,12 @@ impl Olshell {
     }
 
     fn close_menu(&mut self) {
-        if let Some(popup) = self.popup.take() {
-            popup.layer.wl_surface().destroy();
-        }
+        // Just drop it -- sctk's LayerSurface::Drop already destroys the
+        // zwlr_layer_surface_v1 role object before the wl_surface, in the
+        // order the protocol requires. Destroying the wl_surface ourselves
+        // first (as this used to do) is a protocol violation: "surface was
+        // destroyed before its role object".
+        self.popup = None;
     }
 
     /// Runs a popup menu item's command via `sh -c`, detached. The spawned
@@ -410,7 +417,14 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
 
     let mut row = 0;
     if let Some(title) = &popup.title {
-        draw_text(canvas, width, height, MENU_H_PADDING, title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR);
+        // draw_text centers in the *whole* canvas height, not just this
+        // row -- for a multi-row popup that puts the title text down in
+        // the first item's row instead of its own, leaving row 0 blank
+        // and garbling whatever's hovered in row 1. Row-centered instead.
+        draw_text_row_centered(
+            canvas, width, 0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+            title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
+        );
         row += 1;
     }
 
