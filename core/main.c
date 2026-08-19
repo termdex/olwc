@@ -624,6 +624,23 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 	if (output != NULL) {
 		arrange_output_layers(output);
 	}
+
+	// Per wlr-layer-shell, "exclusive" keyboard interactivity on the top or
+	// overlay layer means this surface should get keyboard focus for as
+	// long as it's mapped (e.g. a menu popup that Escape should be able to
+	// dismiss). keyboard_handle_key() already forwards key events to
+	// whatever the seat considers focused, so granting focus here is the
+	// only piece needed to make that work.
+	struct wlr_layer_surface_v1 *wlr_layer_surface = layer_surface->layer_surface;
+	if (wlr_layer_surface->current.keyboard_interactive ==
+			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE) {
+		struct wlr_seat *seat = layer_surface->server->seat;
+		struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+		wlr_seat_keyboard_notify_enter(seat, wlr_layer_surface->surface,
+			keyboard ? keyboard->keycodes : NULL,
+			keyboard ? keyboard->num_keycodes : 0,
+			keyboard ? &keyboard->modifiers : NULL);
+	}
 }
 
 static void layer_surface_commit(struct wl_listener *listener, void *data) {
@@ -648,13 +665,28 @@ static void layer_surface_commit(struct wl_listener *listener, void *data) {
 
 static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	struct olc_layer_surface *layer_surface = wl_container_of(listener, layer_surface, destroy);
+	struct olc_server *server = layer_surface->server;
 	struct olc_output *output =
-		output_from_wlr_output(layer_surface->server, layer_surface->layer_surface->output);
+		output_from_wlr_output(server, layer_surface->layer_surface->output);
+
+	bool had_keyboard_focus =
+		server->seat->keyboard_state.focused_surface == layer_surface->layer_surface->surface;
+
 	wl_list_remove(&layer_surface->map.link);
 	wl_list_remove(&layer_surface->commit.link);
 	wl_list_remove(&layer_surface->destroy.link);
 	wl_list_remove(&layer_surface->link);
 	free(layer_surface);
+
+	if (had_keyboard_focus) {
+		wlr_seat_keyboard_notify_clear_focus(server->seat);
+		struct olc_toplevel *toplevel;
+		wl_list_for_each(toplevel, &server->toplevels, link) {
+			focus_toplevel(toplevel);
+			break;
+		}
+	}
+
 	if (output != NULL) {
 		arrange_output_layers(output);
 	}

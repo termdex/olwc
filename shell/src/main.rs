@@ -6,12 +6,13 @@
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_layer, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_shm,
+    delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
+    delegate_registry, delegate_seat, delegate_shm,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers},
         pointer::{PointerEvent, PointerEventKind, PointerHandler},
         Capability, SeatHandler, SeatState,
     },
@@ -27,7 +28,7 @@ use smithay_client_toolkit::{
 use wayland_client::{
     backend::ObjectId,
     globals::registry_queue_init,
-    protocol::{wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
     Connection, Dispatch, Proxy, QueueHandle,
 };
 
@@ -219,6 +220,7 @@ fn main() {
         font,
         menu,
         pointer: None,
+        keyboard: None,
         popup: None,
     };
 
@@ -254,6 +256,7 @@ struct Olshell {
     font: fontdue::Font,
     menu: Menu,
     pointer: Option<wl_pointer::WlPointer>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
     popup: Option<MenuPopup>,
 }
 
@@ -367,7 +370,9 @@ impl Olshell {
         layer.set_anchor(Anchor::TOP | Anchor::LEFT);
         layer.set_margin(y as i32, 0, 0, x as i32);
         layer.set_size(width, height);
-        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        // Exclusive so olcore grants it keyboard focus while mapped (see
+        // layer_surface_map() there) -- that's what lets Escape reach us.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
 
         self.popup = Some(MenuPopup { layer, items, title, width, height, hovered: None });
@@ -658,6 +663,9 @@ impl SeatHandler for Olshell {
         if capability == Capability::Pointer && self.pointer.is_none() {
             self.pointer = self.seat_state.get_pointer(qh, &seat).ok();
         }
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+        }
     }
 
     fn remove_capability(
@@ -670,6 +678,11 @@ impl SeatHandler for Olshell {
         if capability == Capability::Pointer {
             if let Some(pointer) = self.pointer.take() {
                 pointer.release();
+            }
+        }
+        if capability == Capability::Keyboard {
+            if let Some(keyboard) = self.keyboard.take() {
+                keyboard.release();
             }
         }
     }
@@ -725,6 +738,67 @@ impl PointerHandler for Olshell {
     }
 }
 
+impl KeyboardHandler for Olshell {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        event: KeyEvent,
+    ) {
+        // The only surface we ever request keyboard focus for is the menu
+        // popup (Exclusive interactivity), so there's nothing else to gate
+        // this on -- if we're getting key events at all, they're for it.
+        if event.keysym == Keysym::Escape && self.popup.is_some() {
+            self.close_menu();
+        }
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _modifiers: Modifiers,
+        _layout: u32,
+    ) {
+    }
+}
+
 impl ProvidesRegistryState for Olshell {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -737,6 +811,7 @@ delegate_output!(Olshell);
 delegate_shm!(Olshell);
 delegate_seat!(Olshell);
 delegate_pointer!(Olshell);
+delegate_keyboard!(Olshell);
 delegate_layer!(Olshell);
 delegate_registry!(Olshell);
 
