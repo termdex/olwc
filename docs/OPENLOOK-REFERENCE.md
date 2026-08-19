@@ -67,6 +67,39 @@ matching in `olshell`'s decoration rendering:
 - **Footer / resize-only region** — a bottom strip dedicated to
   resize, separate from the header.
 
+### Window menu (observed from screenshots)
+
+Two reference screenshots live in `screenshots/` at the repo root:
+`Olvwm-desktop.jpg` (olvwm on X11 — a faithful, era-accurate OPEN LOOK
+reference) and `Openwindows.jpg` (a later Sun desktop, closer to
+CDE/Java Desktop System, with similar window chrome but a more modern
+icon-and-label taskbar along the screen bottom that is **not** an OPEN
+LOOK convention — don't take that taskbar as a look-and-feel source).
+
+From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
+
+- A small button sits in the title bar's far-left corner (a
+  downward-pointing chevron glyph in a small square, distinct from
+  the pushpin) — SELECT-clicking it pops the window menu below the
+  title bar.
+- Menu contents, top to bottom: `Close`, `Full Size`, `Move`,
+  `Resize`, `Properties` (shown grayed out/disabled — context-
+  dependent), `Back`, `Refresh`, `Stick`, `Quit`. Single column,
+  left-aligned labels, no icons except accelerator-key hints
+  right-aligned on some entries (e.g. `Close` paired with a `W`-style
+  hint, `Quit` paired with a `⇧Q`-style hint).
+- The item under the pointer (`Close`, in the screenshot) is drawn
+  with a distinct pill/oblong outline around it — the same "obround"
+  shape language the Visual language section below calls out for
+  buttons generally, applied here to menu-item highlighting too.
+- The title bar itself: centered title text, a subtle light/dark
+  bevel for 3D shading, and a clean thin border separating it from
+  the content area.
+- The "Virtual Desktop" pager window visible in the corner of both
+  screenshots is olvwm's VDM (Virtual Desktop Manager) — explicitly
+  out of scope per the design doc's non-goals. Useful to see what
+  we're deliberately *not* reproducing, not as something to match.
+
 ## Widget vocabulary (from OLIT / XView, for naming and behavior reference)
 
 | OPEN LOOK term | Rough modern equivalent | Notes |
@@ -91,9 +124,16 @@ matching in `olshell`'s decoration rendering:
 
 ## Open questions for later look-and-feel passes
 
-- Which specific gadget/icon shapes to source or redraw (pushpin,
-  resize corner glyphs) — needs actual asset work, not just spec
-  reading.
+- Window-menu button glyph and pushpin icon shape: the screenshots
+  confirm *what* they are and roughly where they sit, but not exact
+  pixel proportions, colors, or the chevron glyph's precise shape --
+  still needs asset work, not just the description above.
+- Resize corner glyphs specifically aren't visible in either
+  screenshot at usable resolution -- still open.
+- Whether to reproduce the full window-menu item list (`Close`,
+  `Full Size`, `Move`, `Resize`, `Properties`, `Back`, `Refresh`,
+  `Stick`, `Quit`) or a pared-down subset for the first pass.
 - Whether ADJUST (middle-click extend-selection) is worth preserving
   given how rarely modern users have a reliable middle-click.
-- Root menu content/config format (still open from the design doc).
+- ~~Root menu content/config format~~ resolved: olwm-compatible
+  `.openwin-menu`, implemented in `shell/src/menu.rs`.
