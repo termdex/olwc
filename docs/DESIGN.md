@@ -106,10 +106,17 @@ with wlroots compositors generally, not just this project.
 
 ## Open questions for v0.2
 
-- Exact scope of window gadget chrome (title bar buttons, resize
-  handles) — the visual reference pass against OpenLook screenshots
-  is done (see `docs/OPENLOOK-REFERENCE.md`), implementation not yet
-  started.
+- Window gadget chrome: v1 is implemented -- olcore negotiates
+  `xdg-decoration` (server-side) and exposes a new `openlook-decoration`
+  protocol (`protocol/openlook-decoration-unstable-v1.xml`) that lets
+  olshell attach a header (title bar) surface to any toplevel it can see
+  via wlr-foreign-toplevel-management, positioned/stacked by olcore so it
+  moves and raises with the window it belongs to. olshell draws a header
+  with a window-menu button and centered title for every toplevel. Not yet
+  done: the window menu the button is meant to open (Close, Full Size,
+  Move, Resize, ...) isn't interactive yet -- clicking it just logs, same
+  as the root menu's non-interactive submenus -- and there's no footer or
+  resize-corner chrome yet either.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor

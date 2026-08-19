@@ -33,7 +33,9 @@ use wayland_client::{
 };
 
 // Linux input event codes (linux/input-event-codes.h), as reported in
-// wl_pointer button events. OPEN LOOK's MENU button is the right button.
+// wl_pointer button events. OPEN LOOK's MENU button is the right button;
+// SELECT is the left one.
+const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
@@ -69,6 +71,38 @@ use openlook_workspaces::v1::client::zopenlook_workspaces_manager_v1::{
     self, ZopenlookWorkspacesManagerV1,
 };
 
+// Same approach as openlook_workspaces above, but this protocol's
+// get_decoration request also takes a plain wl_surface argument, so its
+// __interfaces module needs wayland-client's own core interfaces in scope
+// too, not just the wlr crate's.
+mod openlook_decoration {
+    pub mod v1 {
+        pub mod client {
+            use wayland_client;
+            use wayland_client::protocol::*;
+            use wayland_protocols_wlr::foreign_toplevel::v1::client::*;
+
+            pub mod __interfaces {
+                use wayland_client::protocol::__interfaces::*;
+                use wayland_protocols_wlr::foreign_toplevel::v1::client::__interfaces::*;
+                wayland_scanner::generate_interfaces!(
+                    "../protocol/openlook-decoration-unstable-v1.xml"
+                );
+            }
+            use self::__interfaces::*;
+
+            wayland_scanner::generate_client_code!(
+                "../protocol/openlook-decoration-unstable-v1.xml"
+            );
+        }
+    }
+}
+
+use openlook_decoration::v1::client::{
+    zopenlook_decoration_manager_v1::{self, ZopenlookDecorationManagerV1},
+    zopenlook_decoration_v1::{self, ZopenlookDecorationV1},
+};
+
 mod menu;
 use menu::{Menu, MenuNode};
 
@@ -91,14 +125,63 @@ const PUSHPIN_SIZE: i32 = 10;
 const PUSHPIN_UNPINNED_COLOR: (u8, u8, u8) = MENU_TITLE_COLOR;
 const PUSHPIN_PINNED_COLOR: (u8, u8, u8) = (0xA8, 0x30, 0x28);
 
+// Window decoration (header/title bar). See docs/OPENLOOK-REFERENCE.md's
+// "Window menu" section -- this is the title bar these constants describe;
+// the window-menu popup that its button is meant to open is follow-up work
+// (see the button-click handler in PointerHandler::pointer_frame below).
+const DECORATION_HEIGHT: u32 = 22;
+// Deliberately a shade darker than the panel's (0xBE,0xBE,0xBE) -- same
+// palette family, but visually distinct chrome, matching the reference's
+// "clean thin border separating it from the content area" cue rather than
+// blending into the desktop panel above it.
+const DECORATION_BG_COLOR: (u8, u8, u8) = (0xA8, 0xA8, 0xA8);
+const DECORATION_BEVEL_LIGHT: (u8, u8, u8) = (0xE8, 0xE8, 0xE8);
+const DECORATION_BEVEL_DARK: (u8, u8, u8) = (0x70, 0x70, 0x70);
+const DECORATION_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
+const DECORATION_BUTTON_SIZE: i32 = 14;
+const DECORATION_BUTTON_MARGIN: i32 = 4;
+const DECORATION_BUTTON_HOVER_COLOR: (u8, u8, u8) = MENU_HOVER_COLOR;
+const DECORATION_FONT_SIZE: f32 = 15.0;
+
 // SIL Open Font License 1.1, see assets/fonts/OFL.txt.
 static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
 
-#[derive(Default, Debug)]
+#[derive(Default)]
 struct ToplevelInfo {
     title: String,
     app_id: String,
     states: Vec<u32>,
+    // Kept so we can send it control requests later (close, maximize, ...)
+    // and pass it to openlook-decoration's get_decoration. None only very
+    // briefly, between insertion and the first event carrying it -- in
+    // practice always Some by the time anything else reads this struct.
+    handle: Option<ZwlrForeignToplevelHandleV1>,
+    decoration: Option<Decoration>,
+}
+
+/// The header (title bar) chrome olshell draws for one toplevel it doesn't
+/// own, via openlook-decoration. Rendering only; the window-menu popup its
+/// button is meant to open is follow-up work (see pointer_frame below).
+struct Decoration {
+    surface: wl_surface::WlSurface,
+    object: ZopenlookDecorationV1,
+    width: u32,
+    height: u32,
+    button_hovered: bool,
+}
+
+impl Decoration {
+    fn button_rect(&self) -> (i32, i32, i32, i32) {
+        let x0 = DECORATION_BUTTON_MARGIN;
+        let y0 = (self.height as i32 - DECORATION_BUTTON_SIZE) / 2;
+        (x0, y0, x0 + DECORATION_BUTTON_SIZE, y0 + DECORATION_BUTTON_SIZE)
+    }
+
+    fn is_on_button(&self, x: f64, y: f64) -> bool {
+        let (x0, y0, x1, y1) = self.button_rect();
+        let (x, y) = (x as i32, y as i32);
+        x >= x0 && x < x1 && y >= y0 && y < y1
+    }
 }
 
 /// A transient root-menu popup: press MENU on the background to open one,
@@ -217,6 +300,11 @@ fn main() {
         .ok();
     log::info!("openlook-workspaces: {}",
         if workspaces_manager.is_some() { "bound" } else { "not available" });
+    let decoration_manager = globals
+        .bind::<ZopenlookDecorationManagerV1, _, _>(&qh, 1..=1, ())
+        .ok();
+    log::info!("openlook-decoration: {}",
+        if decoration_manager.is_some() { "bound" } else { "not available" });
 
     let font = fontdue::Font::from_bytes(PANEL_FONT_BYTES, fontdue::FontSettings::default())
         .expect("failed to parse embedded panel font");
@@ -238,6 +326,7 @@ fn main() {
         exit: false,
         foreign_toplevel_manager,
         workspaces_manager,
+        decoration_manager,
         toplevels: std::collections::HashMap::new(),
         workspace_count: 0,
         active_workspace: 0,
@@ -274,6 +363,7 @@ struct Olshell {
     foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
     #[allow(dead_code)]
     workspaces_manager: Option<ZopenlookWorkspacesManagerV1>,
+    decoration_manager: Option<ZopenlookDecorationManagerV1>,
     toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
     workspace_count: u32,
     active_workspace: u32,
@@ -361,6 +451,94 @@ impl Olshell {
         self.background.commit();
     }
 
+    /// Requests a header decoration for `toplevel_id` if openlook-decoration
+    /// is available and it doesn't already have one. Actual drawing happens
+    /// once the compositor's first configure event arrives (draw_decoration
+    /// below), same as every other surface here.
+    fn ensure_decoration(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId) {
+        let Some(manager) = self.decoration_manager.as_ref() else {
+            return;
+        };
+        let Some(info) = self.toplevels.get(toplevel_id) else {
+            return;
+        };
+        if info.decoration.is_some() {
+            return;
+        }
+        let Some(handle) = info.handle.clone() else {
+            return;
+        };
+
+        log::info!("decoration: requesting header for {toplevel_id:?}");
+        let surface = self.compositor.create_surface(qh);
+        let object =
+            manager.get_decoration(&surface, &handle, DECORATION_HEIGHT, qh, toplevel_id.clone());
+
+        let info = self.toplevels.get_mut(toplevel_id).unwrap();
+        info.decoration = Some(Decoration {
+            surface,
+            object,
+            width: 0,
+            height: DECORATION_HEIGHT,
+            button_hovered: false,
+        });
+    }
+
+    /// Draws one toplevel's header: OPEN LOOK-style raised bevel, a
+    /// window-menu button in the top-left corner, and the centered title.
+    fn draw_decoration(&mut self, toplevel_id: &ObjectId) {
+        let Some(info) = self.toplevels.get(toplevel_id) else {
+            return;
+        };
+        let Some(dec) = info.decoration.as_ref() else {
+            return;
+        };
+        if dec.width == 0 {
+            return;
+        }
+        let width = dec.width as i32;
+        let height = dec.height.max(1) as i32;
+        let stride = width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+
+        let (r, g, b) = DECORATION_BG_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+        // 3D beveled shading: a light edge along the top, a dark edge along
+        // the bottom, raised-unpressed per docs/OPENLOOK-REFERENCE.md.
+        paint_row(canvas, width, 0, DECORATION_BEVEL_LIGHT);
+        if height > 1 {
+            paint_row(canvas, width, height - 1, DECORATION_BEVEL_DARK);
+        }
+
+        let (bx0, by0, bx1, by1) = dec.button_rect();
+        let button_color =
+            if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { DECORATION_BG_COLOR };
+        fill_rect(canvas, width, height, bx0, by0, bx1, by1, button_color);
+        draw_chevron(canvas, width, height, bx0, by0, bx1, by1, DECORATION_TEXT_COLOR);
+
+        if !info.title.is_empty() {
+            draw_text_row_centered(
+                canvas, width, 0, height, bx1 + DECORATION_BUTTON_MARGIN,
+                &info.title, &self.font, DECORATION_FONT_SIZE, DECORATION_TEXT_COLOR,
+            );
+        }
+
+        let wl_surface = &dec.surface;
+        buffer.attach_to(wl_surface).expect("failed to attach buffer");
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
+        log::info!("decoration: drew {toplevel_id:?} at {width}x{height}");
+    }
+
     /// Opens the root menu at `(x, y)` (surface-local coordinates on the
     /// background, which is fullscreen so those are effectively screen
     /// coordinates). Anchoring a layer surface to top-left with margins is
@@ -414,6 +592,13 @@ impl Olshell {
         // first (as this used to do) is a protocol violation: "surface was
         // destroyed before its role object".
         self.popup = None;
+    }
+
+    /// The toplevel whose decoration surface `surface` is, if any.
+    fn decoration_toplevel_id(&self, surface: &wl_surface::WlSurface) -> Option<ObjectId> {
+        self.toplevels.iter().find_map(|(id, info)| {
+            info.decoration.as_ref().filter(|dec| dec.surface == *surface).map(|_| id.clone())
+        })
     }
 
     /// Runs a popup menu item's command via `sh -c`, detached. The spawned
@@ -558,6 +743,87 @@ fn draw_pushpin(
                 continue;
             }
             let idx = ((py * canvas_width + px) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
+/// Fills one full-width row of `canvas` with an opaque color -- used for the
+/// light/dark bevel edges along a decoration header's top and bottom.
+fn paint_row(canvas: &mut [u8], canvas_width: i32, y: i32, color: (u8, u8, u8)) {
+    let (r, g, b) = color;
+    for x in 0..canvas_width {
+        let idx = ((y * canvas_width + x) * 4) as usize;
+        canvas[idx] = b;
+        canvas[idx + 1] = g;
+        canvas[idx + 2] = r;
+        canvas[idx + 3] = 0xFF;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_rect(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: (u8, u8, u8),
+) {
+    let (r, g, b) = color;
+    for y in y0.max(0)..y1.min(canvas_height) {
+        for x in x0.max(0)..x1.min(canvas_width) {
+            let idx = ((y * canvas_width + x) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
+/// Draws a small downward-pointing chevron (the window-menu button glyph)
+/// filling the given box. Drawn geometrically rather than as a font glyph,
+/// same reasoning as draw_pushpin -- no dependency on a specific glyph
+/// being present in the embedded font. Exact proportions are a placeholder;
+/// docs/OPENLOOK-REFERENCE.md notes the real glyph shape still needs asset
+/// work.
+#[allow(clippy::too_many_arguments)]
+fn draw_chevron(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: (u8, u8, u8),
+) {
+    let (r, g, b) = color;
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let inset = (w.min(h) / 4).max(1);
+    let top = y0 + inset;
+    let bottom = y1 - inset;
+    let mid_x = (x0 + x1) / 2;
+    for y in top..bottom {
+        if bottom == top {
+            break;
+        }
+        // Widens linearly from a point at `top` to the full inset width at
+        // `bottom`, forming a downward-pointing "v".
+        let t = (y - top) as f64 / (bottom - top) as f64;
+        let half = ((mid_x - x0 - inset) as f64 * t) as i32;
+        for x in (mid_x - half)..=(mid_x + half) {
+            if x < 0 || y < 0 || x >= canvas_width || y >= canvas_height {
+                continue;
+            }
+            let idx = ((y * canvas_width + x) * 4) as usize;
             canvas[idx] = b;
             canvas[idx + 1] = g;
             canvas[idx + 2] = r;
@@ -777,10 +1043,51 @@ impl PointerHandler for Olshell {
                 .popup
                 .as_ref()
                 .is_some_and(|p| event.surface == *p.layer.wl_surface());
+            let decoration_toplevel = self.decoration_toplevel_id(&event.surface);
 
             match event.kind {
                 PointerEventKind::Press { button, .. } if on_background && button == BTN_RIGHT => {
                     self.open_menu(qh, event.position.0, event.position.1);
+                }
+                PointerEventKind::Motion { .. } if decoration_toplevel.is_some() => {
+                    let id = decoration_toplevel.unwrap();
+                    if let Some(dec) =
+                        self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
+                    {
+                        let hovered = dec.is_on_button(event.position.0, event.position.1);
+                        if dec.button_hovered != hovered {
+                            dec.button_hovered = hovered;
+                            self.draw_decoration(&id);
+                        }
+                    }
+                }
+                PointerEventKind::Leave { .. } if decoration_toplevel.is_some() => {
+                    let id = decoration_toplevel.unwrap();
+                    if let Some(dec) =
+                        self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
+                    {
+                        if dec.button_hovered {
+                            dec.button_hovered = false;
+                            self.draw_decoration(&id);
+                        }
+                    }
+                }
+                PointerEventKind::Press { button, .. }
+                    if decoration_toplevel.is_some() && button == BTN_LEFT =>
+                {
+                    let id = decoration_toplevel.unwrap();
+                    let on_button = self
+                        .toplevels
+                        .get(&id)
+                        .and_then(|info| info.decoration.as_ref())
+                        .is_some_and(|dec| dec.is_on_button(event.position.0, event.position.1));
+                    if on_button {
+                        // The window menu (Close, Full Size, Move, Resize,
+                        // ...) this button is meant to open isn't
+                        // interactive yet -- follow-up work, same as the
+                        // root menu's submenus.
+                        log::info!("window menu: not yet interactive");
+                    }
                 }
                 PointerEventKind::Motion { .. } if on_popup => {
                     let popup = self.popup.as_mut().unwrap();
@@ -937,7 +1244,10 @@ impl Dispatch<ZwlrForeignToplevelManagerV1, ()> for Olshell {
         _qh: &QueueHandle<Self>,
     ) {
         if let zwlr_foreign_toplevel_manager_v1::Event::Toplevel { toplevel } = event {
-            state.toplevels.insert(toplevel.id(), ToplevelInfo::default());
+            state.toplevels.insert(
+                toplevel.id(),
+                ToplevelInfo { handle: Some(toplevel), ..Default::default() },
+            );
         }
     }
 
@@ -953,7 +1263,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
         event: zwlr_foreign_toplevel_handle_v1::Event,
         _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         use zwlr_foreign_toplevel_handle_v1::Event;
 
@@ -979,14 +1289,69 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                     );
                 }
                 state.draw_panel();
+                state.ensure_decoration(qh, &proxy.id());
+                state.draw_decoration(&proxy.id());
             }
             Event::Closed => {
-                state.toplevels.remove(&proxy.id());
+                if let Some(mut info) = state.toplevels.remove(&proxy.id()) {
+                    if let Some(dec) = info.decoration.take() {
+                        dec.object.destroy();
+                        dec.surface.destroy();
+                    }
+                }
                 proxy.destroy();
                 state.draw_panel();
             }
             Event::OutputEnter { .. } | Event::OutputLeave { .. } | Event::Parent { .. } => {}
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<ZopenlookDecorationManagerV1, ()> for Olshell {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZopenlookDecorationManagerV1,
+        _event: zopenlook_decoration_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // No events defined by this interface.
+    }
+}
+
+impl Dispatch<ZopenlookDecorationV1, ObjectId> for Olshell {
+    fn event(
+        state: &mut Self,
+        proxy: &ZopenlookDecorationV1,
+        event: zopenlook_decoration_v1::Event,
+        toplevel_id: &ObjectId,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use zopenlook_decoration_v1::Event;
+
+        match event {
+            Event::Configure { serial, width, height } => {
+                log::info!("decoration: configure {toplevel_id:?} {width}x{height}");
+                proxy.ack_configure(serial);
+                if let Some(dec) =
+                    state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.as_mut())
+                {
+                    dec.width = width;
+                    dec.height = height;
+                }
+                state.draw_decoration(toplevel_id);
+            }
+            Event::Closed => {
+                if let Some(dec) =
+                    state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.take())
+                {
+                    dec.object.destroy();
+                    dec.surface.destroy();
+                }
+            }
         }
     }
 }

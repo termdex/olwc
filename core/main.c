@@ -34,10 +34,12 @@
 #include <wlr/types/wlr_seat.h>
 #include <wlr/types/wlr_subcompositor.h>
 #include <wlr/types/wlr_xcursor_manager.h>
+#include <wlr/types/wlr_xdg_decoration_v1.h>
 #include <wlr/types/wlr_xdg_shell.h>
 #include <wlr/util/log.h>
 #include <xkbcommon/xkbcommon.h>
 
+#include "openlook-decoration-unstable-v1-protocol.h"
 #include "openlook-workspaces-unstable-v1-protocol.h"
 
 // Fixed linear workspace count for this scaffold. A real implementation
@@ -77,6 +79,15 @@ struct olc_server {
 	struct wl_listener new_xdg_popup;
 	struct wl_list toplevels; // olc_toplevel::link
 	struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_manager;
+
+	// xdg-decoration: tells well-behaved clients to skip drawing their own
+	// title bar, since olshell draws one via openlook-decoration below.
+	struct wlr_xdg_decoration_manager_v1 *xdg_decoration_manager;
+	struct wl_listener new_xdg_toplevel_decoration;
+
+	// openlook-decoration: lets olshell attach header chrome to a toplevel
+	// it doesn't own. See protocol/openlook-decoration-unstable-v1.xml.
+	struct wl_global *decoration_manager_global;
 
 	struct wlr_layer_shell_v1 *layer_shell;
 	struct wl_listener new_layer_surface;
@@ -120,6 +131,11 @@ struct olc_output {
 	struct wl_listener frame;
 	struct wl_listener request_state;
 	struct wl_listener destroy;
+
+	// The output's box minus space claimed by exclusive-zone layer-shell
+	// surfaces (the panel, primarily). Updated by arrange_output_layers();
+	// zeroed (and thus not yet meaningful) until that's run at least once.
+	struct wlr_box usable_area;
 };
 
 struct olc_toplevel {
@@ -147,6 +163,33 @@ struct olc_toplevel {
 	struct wl_listener foreign_request_fullscreen;
 	struct wl_listener foreign_request_close;
 	uint32_t workspace_index;
+
+	// openlook-decoration: at most one header decoration, requested by
+	// olshell. NULL until olshell asks for one; see get_decoration.
+	struct olc_decoration *decoration;
+
+	// xdg-decoration: set in server_new_xdg_toplevel_decoration when a
+	// client asks for a decoration object before its xdg_surface is ready
+	// to receive configures (the common case -- clients typically do this
+	// right after creating the toplevel, before their first commit).
+	// Consumed (and cleared) by xdg_toplevel_commit once it's ready to
+	// call wlr_xdg_toplevel_decoration_v1_set_mode() safely.
+	struct wlr_xdg_toplevel_decoration_v1 *pending_xdg_decoration;
+};
+
+// One olshell-supplied surface acting as the header decoration for a single
+// toplevel. Heap-allocated separately from olc_toplevel (rather than
+// embedded) so it can safely outlive the toplevel being destroyed out from
+// under it -- see decoration_send_closed().
+struct olc_decoration {
+	struct wl_resource *resource; // zopenlook_decoration_v1; never NULL
+	struct olc_toplevel *toplevel; // NULL once the toplevel is gone
+	struct wlr_surface *surface;
+	struct wlr_scene_tree *scene_tree; // child of toplevel->scene_tree
+	struct wl_listener surface_destroy;
+	uint32_t height;
+	uint32_t configured_width;
+	bool configured;
 };
 
 struct olc_popup {
@@ -615,6 +658,8 @@ static void arrange_output_layers(struct olc_output *output) {
 			layer_surface->scene_layer_surface->tree->node.x + output_box.x,
 			layer_surface->scene_layer_surface->tree->node.y + output_box.y);
 	}
+
+	output->usable_area = usable_area;
 }
 
 static void layer_surface_map(struct wl_listener *listener, void *data) {
@@ -802,9 +847,30 @@ static void toplevel_handle_set_app_id(struct wl_listener *listener, void *data)
 	}
 }
 
+// Places a newly-mapped toplevel at the top-left corner of the first
+// output's usable area (the output box minus space claimed by exclusive-
+// zone layer-shell surfaces, i.e. below/beside the panel). No cascading or
+// centering -- just enough that new windows don't spawn with their top
+// edge, and any header decoration olshell later attaches above it, hidden
+// under the panel. Falls back to (0,0) if there's no output yet or layers
+// haven't been arranged yet (usable_area still its zeroed initial value).
+static void place_new_toplevel(struct olc_toplevel *toplevel) {
+	if (wl_list_empty(&toplevel->server->outputs)) {
+		return;
+	}
+	struct olc_output *output =
+		wl_container_of(toplevel->server->outputs.next, output, link);
+	if (output->usable_area.width <= 0 || output->usable_area.height <= 0) {
+		return;
+	}
+	wlr_scene_node_set_position(&toplevel->scene_tree->node,
+		output->usable_area.x, output->usable_area.y);
+}
+
 static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	struct olc_toplevel *toplevel = wl_container_of(listener, toplevel, map);
 	wl_list_insert(&toplevel->server->toplevels, &toplevel->link);
+	place_new_toplevel(toplevel);
 
 	toplevel->foreign_handle =
 		wlr_foreign_toplevel_handle_v1_create(toplevel->server->foreign_toplevel_manager);
@@ -835,12 +901,30 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 	broadcast_toplevel_workspace(toplevel->server, toplevel->foreign_handle, toplevel->workspace_index);
 }
 
+// Tells olshell this decoration's toplevel is gone and drops olcore's side
+// of the relationship. The wl_resource itself lives on until olshell
+// destroys it in response (or its client disconnects); until then,
+// decoration->toplevel == NULL marks it as inert.
+static void decoration_detach(struct olc_decoration *decoration) {
+	if (decoration->toplevel == NULL) {
+		return;
+	}
+	decoration->toplevel->decoration = NULL;
+	decoration->toplevel = NULL;
+	wlr_scene_node_destroy(&decoration->scene_tree->node);
+	zopenlook_decoration_v1_send_closed(decoration->resource);
+}
+
 static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	struct olc_toplevel *toplevel = wl_container_of(listener, toplevel, unmap);
 	if (toplevel == toplevel->server->grabbed_toplevel) {
 		reset_cursor_mode(toplevel->server);
 	}
 	wl_list_remove(&toplevel->link);
+
+	if (toplevel->decoration != NULL) {
+		decoration_detach(toplevel->decoration);
+	}
 
 	if (toplevel->foreign_handle != NULL) {
 		wl_list_remove(&toplevel->foreign_request_maximize.link);
@@ -853,10 +937,35 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 	}
 }
 
+// Sends a fresh configure to a toplevel's decoration whenever the
+// toplevel's width has changed since the last one, so the header always
+// tracks the window it belongs to. Cheap no-op otherwise.
+static void configure_decoration(struct olc_decoration *decoration) {
+	struct wlr_box geo = decoration->toplevel->xdg_toplevel->base->geometry;
+	uint32_t width = geo.width > 0 ? (uint32_t)geo.width : 0;
+	if (decoration->configured && width == decoration->configured_width) {
+		return;
+	}
+	decoration->configured = true;
+	decoration->configured_width = width;
+	uint32_t serial = wl_display_next_serial(decoration->toplevel->server->wl_display);
+	wlr_log(WLR_INFO, "openlook-decoration: configure %ux%u (toplevel geo %dx%d)",
+		width, decoration->height, geo.width, geo.height);
+	zopenlook_decoration_v1_send_configure(decoration->resource, serial, width, decoration->height);
+}
+
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
 	struct olc_toplevel *toplevel = wl_container_of(listener, toplevel, commit);
 	if (toplevel->xdg_toplevel->base->initial_commit) {
 		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel, 0, 0);
+	}
+	if (toplevel->pending_xdg_decoration != NULL && toplevel->xdg_toplevel->base->initialized) {
+		wlr_xdg_toplevel_decoration_v1_set_mode(
+			toplevel->pending_xdg_decoration, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+		toplevel->pending_xdg_decoration = NULL;
+	}
+	if (toplevel->decoration != NULL) {
+		configure_decoration(toplevel->decoration);
 	}
 }
 
@@ -1064,6 +1173,203 @@ static void workspaces_manager_bind(
 	}
 }
 
+// xdg-decoration: unconditionally tell any client that asks for
+// server-side decoration that it's getting it, since olshell always draws
+// a header for mapped toplevels via openlook-decoration. Clients that never
+// ask (or that only support client-side) are left alone; olshell simply
+// won't have a matching foreign-toplevel handle to decorate them with
+// server-side chrome layered on top of whatever they draw themselves.
+//
+// wlr_xdg_toplevel_decoration_v1_set_mode() internally schedules an
+// xdg_surface configure, which asserts the xdg_surface is already
+// "initialized" (ready to receive configures). Clients request a
+// decoration object right after creating their xdg_toplevel, generally
+// before their first commit -- i.e. before that's true -- so the mode has
+// to be applied later; see the pending_xdg_decoration field it gets
+// stashed in and xdg_toplevel_commit(), which applies it once safe.
+static void xdg_toplevel_decoration_handle_destroy(struct wl_listener *listener, void *data) {
+	struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+	struct olc_toplevel *toplevel = olc_toplevel_from_xdg_toplevel(decoration->toplevel);
+	if (toplevel != NULL && toplevel->pending_xdg_decoration == decoration) {
+		toplevel->pending_xdg_decoration = NULL;
+	}
+	wl_list_remove(&listener->link);
+	free(listener);
+}
+
+static void server_new_xdg_toplevel_decoration(struct wl_listener *listener, void *data) {
+	struct wlr_xdg_toplevel_decoration_v1 *decoration = data;
+
+	struct wl_listener *destroy_listener = calloc(1, sizeof(*destroy_listener));
+	destroy_listener->notify = xdg_toplevel_decoration_handle_destroy;
+	wl_signal_add(&decoration->events.destroy, destroy_listener);
+
+	struct olc_toplevel *toplevel = olc_toplevel_from_xdg_toplevel(decoration->toplevel);
+	if (toplevel == NULL) {
+		return;
+	}
+	if (toplevel->xdg_toplevel->base->initialized) {
+		wlr_xdg_toplevel_decoration_v1_set_mode(decoration, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+	} else {
+		toplevel->pending_xdg_decoration = decoration;
+	}
+}
+
+// Finds the olc_toplevel a client-supplied zwlr_foreign_toplevel_handle_v1
+// resource refers to. Deliberately avoids relying on that resource's
+// wl_resource user-data layout (an internal wlroots detail we don't
+// control) and instead walks the per-client resource lists we already
+// maintain a reference into via olc_toplevel::foreign_handle.
+static struct olc_toplevel *toplevel_from_foreign_handle_resource(
+		struct olc_server *server, struct wl_resource *handle_resource) {
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->foreign_handle == NULL) {
+			continue;
+		}
+		struct wl_resource *r;
+		wl_resource_for_each(r, &toplevel->foreign_handle->resources) {
+			if (r == handle_resource) {
+				return toplevel;
+			}
+		}
+	}
+	return NULL;
+}
+
+static void decoration_handle_ack_configure(
+		struct wl_client *client, struct wl_resource *resource, uint32_t serial) {
+	// v1 has nothing to validate beyond the serial round-trip itself; only
+	// one configure is ever outstanding at a time.
+	(void)client;
+	(void)resource;
+	(void)serial;
+}
+
+static void decoration_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct zopenlook_decoration_v1_interface decoration_impl = {
+	.ack_configure = decoration_handle_ack_configure,
+	.destroy = decoration_handle_destroy,
+};
+
+static void decoration_teardown(struct olc_decoration *decoration) {
+	if (decoration->toplevel != NULL) {
+		decoration->toplevel->decoration = NULL;
+		wlr_scene_node_destroy(&decoration->scene_tree->node);
+	}
+	wl_list_remove(&decoration->surface_destroy.link);
+	free(decoration);
+}
+
+// Fires if olshell destroys its wl_surface without destroying the
+// decoration object first -- otherwise unreachable since olshell is
+// well-behaved, but a client-supplied surface can still go away unexpectedly
+// (e.g. client crash), so this keeps olc_decoration from outliving it.
+static void decoration_surface_handle_destroy(struct wl_listener *listener, void *data) {
+	struct olc_decoration *decoration = wl_container_of(listener, decoration, surface_destroy);
+	wl_resource_set_user_data(decoration->resource, NULL);
+	decoration_teardown(decoration);
+}
+
+static void decoration_resource_destroy(struct wl_resource *resource) {
+	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
+	if (decoration == NULL) {
+		// Already torn down via decoration_surface_handle_destroy.
+		return;
+	}
+	decoration_teardown(decoration);
+}
+
+static void decoration_manager_handle_get_decoration(
+		struct wl_client *client, struct wl_resource *manager_resource, uint32_t id,
+		struct wl_resource *surface_resource, struct wl_resource *toplevel_handle_resource,
+		uint32_t height) {
+	struct olc_server *server = wl_resource_get_user_data(manager_resource);
+
+	struct olc_toplevel *toplevel =
+		toplevel_from_foreign_handle_resource(server, toplevel_handle_resource);
+	if (toplevel == NULL) {
+		wlr_log(WLR_ERROR, "openlook-decoration: get_decoration: no matching toplevel for handle");
+		wl_resource_post_error(manager_resource, ZOPENLOOK_DECORATION_MANAGER_V1_ERROR_NO_SUCH_TOPLEVEL,
+			"handle does not name a currently-mapped toplevel");
+		return;
+	}
+	wlr_log(WLR_INFO, "openlook-decoration: get_decoration for toplevel %p, height=%u", (void *)toplevel, height);
+	if (toplevel->decoration != NULL) {
+		wl_resource_post_error(manager_resource, ZOPENLOOK_DECORATION_MANAGER_V1_ERROR_ALREADY_DECORATED,
+			"toplevel already has a header decoration");
+		return;
+	}
+
+	uint32_t version = wl_resource_get_version(manager_resource);
+	struct wl_resource *resource =
+		wl_resource_create(client, &zopenlook_decoration_v1_interface, (int)version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	struct olc_decoration *decoration = calloc(1, sizeof(*decoration));
+	if (decoration == NULL) {
+		wl_resource_destroy(resource);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	decoration->resource = resource;
+	decoration->toplevel = toplevel;
+	decoration->surface = wlr_surface_from_resource(surface_resource);
+	decoration->height = height;
+	toplevel->decoration = decoration;
+
+	decoration->scene_tree = wlr_scene_tree_create(toplevel->scene_tree);
+	wlr_scene_node_set_position(&decoration->scene_tree->node, 0, -(int)height);
+	wlr_scene_surface_create(decoration->scene_tree, decoration->surface);
+
+	// Push the toplevel itself down by the header height so the header
+	// (positioned just above the toplevel's origin, above) lands where the
+	// toplevel used to be instead of off the top edge of the output --
+	// olcore doesn't reserve headroom for a header up front, since it has
+	// no way to know one is coming until olshell actually asks for it.
+	wlr_scene_node_set_position(&toplevel->scene_tree->node,
+		toplevel->scene_tree->node.x, toplevel->scene_tree->node.y + (int)height);
+	wlr_log(WLR_INFO, "openlook-decoration: toplevel now at (%d,%d), header at (%d,%d) rel",
+		toplevel->scene_tree->node.x, toplevel->scene_tree->node.y,
+		decoration->scene_tree->node.x, decoration->scene_tree->node.y);
+
+	decoration->surface_destroy.notify = decoration_surface_handle_destroy;
+	wl_signal_add(&decoration->surface->events.destroy, &decoration->surface_destroy);
+
+	wl_resource_set_implementation(resource, &decoration_impl, decoration, decoration_resource_destroy);
+
+	configure_decoration(decoration);
+}
+
+static void decoration_manager_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct zopenlook_decoration_manager_v1_interface decoration_manager_impl = {
+	.get_decoration = decoration_manager_handle_get_decoration,
+	.destroy = decoration_manager_handle_destroy,
+};
+
+static void decoration_manager_bind(
+		struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+	struct olc_server *server = data;
+	struct wl_resource *resource =
+		wl_resource_create(client, &zopenlook_decoration_manager_v1_interface, (int)version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &decoration_manager_impl, server, NULL);
+}
+
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
 	char *startup_cmd = NULL;
@@ -1129,6 +1435,14 @@ int main(int argc, char *argv[]) {
 	server.new_xdg_popup.notify = server_new_xdg_popup;
 	wl_signal_add(&server.xdg_shell->events.new_popup, &server.new_xdg_popup);
 	server.foreign_toplevel_manager = wlr_foreign_toplevel_manager_v1_create(server.wl_display);
+
+	server.xdg_decoration_manager = wlr_xdg_decoration_manager_v1_create(server.wl_display);
+	server.new_xdg_toplevel_decoration.notify = server_new_xdg_toplevel_decoration;
+	wl_signal_add(&server.xdg_decoration_manager->events.new_toplevel_decoration,
+		&server.new_xdg_toplevel_decoration);
+
+	server.decoration_manager_global = wl_global_create(server.wl_display,
+		&zopenlook_decoration_manager_v1_interface, 1, &server, decoration_manager_bind);
 
 	wl_list_init(&server.layer_surfaces);
 	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);

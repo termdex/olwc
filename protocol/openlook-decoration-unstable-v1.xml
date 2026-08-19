@@ -1,0 +1,128 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="openlook_decoration_unstable_v1">
+  <copyright>
+    Copyright © 2026 olwc contributors
+
+    Permission to use, copy, modify, distribute, and sell this
+    software and its documentation for any purpose is hereby granted
+    without fee, provided that the above copyright notice appear in
+    all copies and that both that copyright notice and this permission
+    notice appear in supporting documentation, and that the name of
+    the copyright holders not be used in advertising or publicity
+    pertaining to distribution of the software without specific,
+    written prior permission.  The copyright holders make no
+    representations about the suitability of this software for any
+    purpose.  It is provided "as is" without express or implied
+    warranty.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER
+    IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+    THIS SOFTWARE.
+  </copyright>
+
+  <interface name="zopenlook_decoration_manager_v1" version="1">
+    <description summary="create OpenLook-style chrome for another client's window">
+      Standard Wayland deliberately gives a client no way to learn another
+      client's window position, or to attach a surface to another client's
+      surface. That makes it impossible for an ordinary client to draw
+      decoration chrome around windows it doesn't own -- exactly what
+      olshell needs to do for OpenLook-style title bars, since olcore
+      (the design's privileged half) is meant to stay ignorant of
+      OpenLook's visual style.
+
+      This protocol bridges that gap. olshell identifies which toplevel to
+      decorate using the handle it already holds from
+      wlr-foreign-toplevel-management-unstable-v1, and supplies its own
+      plain wl_surface (created via wl_compositor, exactly as for any
+      other olshell-owned surface). The compositor -- which does have
+      access to both surfaces -- takes over positioning and stacking that
+      surface relative to the toplevel, the same way wlr-layer-shell takes
+      over positioning a plain surface relative to an output.
+
+      Warning! The protocol described in this file is currently in the
+      testing phase. Backward compatible changes may be added together
+      with the corresponding interface version bump. Backward incompatible
+      changes can only be done by bumping the major version number in the
+      protocol and interface names.
+    </description>
+
+    <request name="get_decoration">
+      <description summary="create a header decoration for a toplevel">
+        Assigns surface to be the header (title bar) decoration for
+        toplevel. surface must be a freshly-created wl_surface with no
+        buffer and no other role. height is olshell's fixed preferred
+        header height in surface-local pixels; olcore does not
+        second-guess it.
+
+        Only one header decoration may exist per toplevel at a time, and
+        toplevel must currently be mapped. Violating either sends the
+        already_decorated or no_such_toplevel protocol error and leaves
+        the new object inert (any request on it is ignored).
+      </description>
+      <arg name="id" type="new_id" interface="zopenlook_decoration_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="toplevel" type="object" interface="zwlr_foreign_toplevel_handle_v1"/>
+      <arg name="height" type="uint" summary="preferred header height, surface-local pixels"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager object">
+        Destroys this manager object. Does not affect any decorations
+        already created through it.
+      </description>
+    </request>
+
+    <enum name="error">
+      <entry name="no_such_toplevel" value="0" summary="the handle does not name a currently-mapped toplevel"/>
+      <entry name="already_decorated" value="1" summary="the toplevel already has a header decoration"/>
+    </enum>
+  </interface>
+
+  <interface name="zopenlook_decoration_v1" version="1">
+    <description summary="a header decoration attached to one toplevel">
+      Follows the same configure/ack_configure pattern as xdg_surface and
+      zwlr_layer_surface_v1: after creation, and again whenever the
+      decorated toplevel's width changes, the compositor sends a
+      configure event; olshell resizes its buffer to match, then
+      attaches/commits it and acks the configure by serial.
+    </description>
+
+    <request name="ack_configure">
+      <description summary="acknowledge a configure event"/>
+      <arg name="serial" type="uint" summary="serial from the configure event"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy this decoration">
+        The header disappears immediately. The underlying wl_surface is
+        unaffected and may be destroyed separately by olshell.
+      </description>
+    </request>
+
+    <event name="configure">
+      <description summary="suggest a size for the header">
+        width tracks the decorated toplevel's current width and is
+        authoritative -- olshell should size its buffer to exactly
+        width x height. height simply echoes back what get_decoration
+        was called with.
+      </description>
+      <arg name="serial" type="uint"/>
+      <arg name="width" type="uint"/>
+      <arg name="height" type="uint"/>
+    </event>
+
+    <event name="closed">
+      <description summary="the decorated toplevel is gone">
+        Sent once, when the toplevel this decoration is attached to is
+        unmapped or destroyed. olshell should destroy this object (and
+        may destroy or recycle the underlying wl_surface) in response;
+        olcore has already dropped its own reference to it.
+      </description>
+    </event>
+  </interface>
+</protocol>

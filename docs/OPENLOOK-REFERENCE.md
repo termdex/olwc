@@ -126,14 +126,21 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
 
 - Window-menu button glyph and pushpin icon shape: the screenshots
   confirm *what* they are and roughly where they sit, but not exact
-  pixel proportions, colors, or the chevron glyph's precise shape --
-  still needs asset work, not just the description above.
+  pixel proportions, colors, or the chevron glyph's precise shape.
+  `shell/src/main.rs`'s `draw_chevron()` is an explicitly placeholder
+  geometric approximation (a filled downward wedge), not asset-accurate.
 - Resize corner glyphs specifically aren't visible in either
-  screenshot at usable resolution -- still open.
+  screenshot at usable resolution -- still open, and no footer/corner
+  chrome exists yet at all (see `docs/DESIGN.md`).
 - Whether to reproduce the full window-menu item list (`Close`,
   `Full Size`, `Move`, `Resize`, `Properties`, `Back`, `Refresh`,
-  `Stick`, `Quit`) or a pared-down subset for the first pass.
+  `Stick`, `Quit`) or a pared-down subset -- moot until the menu itself
+  is interactive; the button that's meant to open it currently only
+  logs a placeholder on click.
 - Whether ADJUST (middle-click extend-selection) is worth preserving
   given how rarely modern users have a reliable middle-click.
 - ~~Root menu content/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
+- ~~Window header chrome~~ v1 resolved: see `docs/DESIGN.md`'s window
+  gadget chrome entry. The window *menu* itself (as opposed to the
+  header it hangs off) is still open.

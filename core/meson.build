@@ -83,6 +83,25 @@ wlr_foreign_toplevel_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# openlook-decoration is likewise our own protocol; its get_decoration
+# request references zwlr_foreign_toplevel_handle_v1, whose wl_interface
+# symbol wlr_foreign_toplevel_code (above) already provides.
+openlook_decoration_xml = files('../protocol/openlook-decoration-unstable-v1.xml')
+
+openlook_decoration_header = custom_target(
+  'openlook-decoration-unstable-v1-protocol.h',
+  input: openlook_decoration_xml,
+  output: 'openlook-decoration-unstable-v1-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+
+openlook_decoration_code = custom_target(
+  'openlook-decoration-unstable-v1-protocol.c',
+  input: openlook_decoration_xml,
+  output: 'openlook-decoration-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 olcore_deps = [
   wayland_server,
   wlroots,
@@ -102,6 +121,8 @@ executable(
   wlr_layer_shell_server_header,
   openlook_workspaces_header,
   openlook_workspaces_code,
+  openlook_decoration_header,
+  openlook_decoration_code,
   wlr_foreign_toplevel_code,
   dependencies: olcore_deps,
   install: true,
