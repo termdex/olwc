@@ -117,6 +117,14 @@ struct olc_server {
 	double grab_x, grab_y;
 	struct wlr_box grab_geobox;
 	uint32_t resize_edges;
+	// A move/resize grab started with a button already held (dragging the
+	// header, or a client's own CSD) naturally ends when that button is
+	// released. One started with nothing held (the window menu's Move/
+	// Resize items: by the time their request reaches olcore, the click
+	// that selected them has already fully released) has no held button
+	// to end on, so it instead ends on the *next* press, click-to-arm/
+	// click-to-confirm style. See start_move_grab/start_resize_grab.
+	bool cursor_end_on_press;
 
 	struct wlr_output_layout *output_layout;
 	struct wl_list outputs; // olc_output::link
@@ -508,9 +516,15 @@ static void server_cursor_button(struct wl_listener *listener, void *data) {
 	struct wlr_surface *surface = NULL;
 	struct olc_toplevel *toplevel = desktop_toplevel_at(server,
 		server->cursor->x, server->cursor->y, &surface, &sx, &sy);
+	bool grabbing = server->cursor_mode != OLC_CURSOR_PASSTHROUGH;
 	if (event->state == WL_POINTER_BUTTON_STATE_RELEASED) {
-		reset_cursor_mode(server);
+		if (grabbing && !server->cursor_end_on_press) {
+			reset_cursor_mode(server);
+		}
 	} else {
+		if (grabbing && server->cursor_end_on_press) {
+			reset_cursor_mode(server);
+		}
 		focus_toplevel(toplevel);
 	}
 }
@@ -994,6 +1008,7 @@ static void start_move_grab(struct olc_toplevel *toplevel) {
 	struct olc_server *server = toplevel->server;
 	server->grabbed_toplevel = toplevel;
 	server->cursor_mode = OLC_CURSOR_MOVE;
+	server->cursor_end_on_press = server->seat->pointer_state.button_count == 0;
 	server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
 	server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
 }
@@ -1003,6 +1018,7 @@ static void start_resize_grab(struct olc_toplevel *toplevel, uint32_t edges) {
 	struct olc_server *server = toplevel->server;
 	server->grabbed_toplevel = toplevel;
 	server->cursor_mode = OLC_CURSOR_RESIZE;
+	server->cursor_end_on_press = server->seat->pointer_state.button_count == 0;
 	struct wlr_box geo_box = toplevel->xdg_toplevel->base->geometry;
 
 	double border_x = (toplevel->scene_tree->node.x + geo_box.x) +
