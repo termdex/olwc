@@ -187,6 +187,7 @@ struct olc_decoration {
 	struct wlr_surface *surface;
 	struct wlr_scene_tree *scene_tree; // child of toplevel->scene_tree
 	struct wl_listener surface_destroy;
+	struct wl_listener surface_commit;
 	uint32_t height;
 	uint32_t configured_width;
 	bool configured;
@@ -1286,6 +1287,7 @@ static void decoration_teardown(struct olc_decoration *decoration) {
 		wlr_scene_node_destroy(&decoration->scene_tree->node);
 	}
 	wl_list_remove(&decoration->surface_destroy.link);
+	wl_list_remove(&decoration->surface_commit.link);
 	free(decoration);
 }
 
@@ -1297,6 +1299,18 @@ static void decoration_surface_handle_destroy(struct wl_listener *listener, void
 	struct olc_decoration *decoration = wl_container_of(listener, decoration, surface_destroy);
 	wl_resource_set_user_data(decoration->resource, NULL);
 	decoration_teardown(decoration);
+}
+
+// wlr_surface_map() asserts the surface already has a buffer, so it can't
+// be called at get_decoration time -- olshell hasn't drawn anything yet.
+// Map on the first commit that actually has one instead; harmless to check
+// on every later commit too, since wlr_scene_subsurface_tree_create needs
+// this regardless of whichever commit happens to be the first with content.
+static void decoration_surface_handle_commit(struct wl_listener *listener, void *data) {
+	struct olc_decoration *decoration = wl_container_of(listener, decoration, surface_commit);
+	if (!decoration->surface->mapped && wlr_surface_has_buffer(decoration->surface)) {
+		wlr_surface_map(decoration->surface);
+	}
 }
 
 static void decoration_resource_destroy(struct wl_resource *resource) {
@@ -1353,6 +1367,14 @@ static void decoration_manager_handle_get_decoration(
 	// olshell attaches to the header -- the window menu popup -- are
 	// composited and hit-tested too. olshell owns both surfaces, so a
 	// regular wl_subsurface works fine here; no protocol extension needed.
+	//
+	// Unlike wlr_scene_surface_create, this helper is written for surfaces
+	// that go through a normal role lifecycle and won't composite the
+	// surface until it's mapped. We don't give this surface a formal
+	// wlr_surface_role (no protocol need for one), so nothing else would
+	// ever call wlr_surface_map() on its behalf -- decoration_surface_handle_commit
+	// does it the first time the surface actually has a buffer to show
+	// (mapping any earlier asserts: a surface can't be mapped without one).
 	decoration->scene_tree = wlr_scene_subsurface_tree_create(toplevel->scene_tree, decoration->surface);
 	wlr_scene_node_set_position(&decoration->scene_tree->node, 0, -(int)height);
 
@@ -1369,6 +1391,8 @@ static void decoration_manager_handle_get_decoration(
 
 	decoration->surface_destroy.notify = decoration_surface_handle_destroy;
 	wl_signal_add(&decoration->surface->events.destroy, &decoration->surface_destroy);
+	decoration->surface_commit.notify = decoration_surface_handle_commit;
+	wl_signal_add(&decoration->surface->events.commit, &decoration->surface_commit);
 
 	wl_resource_set_implementation(resource, &decoration_impl, decoration, decoration_resource_destroy);
 
