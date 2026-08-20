@@ -177,6 +177,13 @@ struct olc_toplevel {
 	// not clobber the other (e.g. switching to a minimized window's
 	// workspace shouldn't un-minimize it).
 	bool minimized;
+	// A sticky toplevel stays visible regardless of workspace_index --
+	// exempt from the hiding switching workspaces normally causes.
+	// workspace_index itself is left alone by stickiness (still its
+	// nominal "home" workspace), so un-sticking it later just resumes
+	// normal per-workspace visibility rather than needing to remember or
+	// restore anything.
+	bool sticky;
 
 	// openlook-decoration: at most one header decoration, requested by
 	// olshell. NULL until olshell asks for one; see get_decoration.
@@ -251,10 +258,13 @@ static struct olc_toplevel *olc_toplevel_from_xdg_toplevel(struct wlr_xdg_toplev
 // setting one doesn't accidentally clobber the other. The decoration
 // header is a child of scene_tree, so disabling the toplevel already
 // takes it along for free.
+static bool toplevel_is_visible(struct olc_toplevel *toplevel) {
+	return !toplevel->minimized &&
+		(toplevel->sticky || toplevel->workspace_index == toplevel->server->active_workspace);
+}
+
 static void update_toplevel_visibility(struct olc_toplevel *toplevel) {
-	bool visible = !toplevel->minimized &&
-		toplevel->workspace_index == toplevel->server->active_workspace;
-	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, visible);
+	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, toplevel_is_visible(toplevel));
 }
 
 static void focus_toplevel(struct olc_toplevel *toplevel) {
@@ -1214,13 +1224,12 @@ static void refocus_if_hidden(struct olc_server *server) {
 		focused ? wlr_xdg_toplevel_try_from_wlr_surface(focused) : NULL;
 	struct olc_toplevel *focused_toplevel =
 		focused_xdg_toplevel ? olc_toplevel_from_xdg_toplevel(focused_xdg_toplevel) : NULL;
-	if (focused_toplevel != NULL && focused_toplevel->workspace_index == server->active_workspace &&
-			!focused_toplevel->minimized) {
+	if (focused_toplevel != NULL && toplevel_is_visible(focused_toplevel)) {
 		return;
 	}
 	struct olc_toplevel *toplevel;
 	wl_list_for_each(toplevel, &server->toplevels, link) {
-		if (toplevel->workspace_index == server->active_workspace && !toplevel->minimized) {
+		if (toplevel_is_visible(toplevel)) {
 			focus_toplevel(toplevel);
 			return;
 		}
@@ -1419,6 +1428,21 @@ static void decoration_handle_lower(struct wl_client *client, struct wl_resource
 	wl_list_insert(toplevel->server->toplevels.prev, &toplevel->link);
 }
 
+// Toggles rather than taking an explicit target state: olcore doesn't
+// report sticky state back to olshell (no protocol event for it), so
+// olshell has no way to know which direction to ask for -- same reasoning
+// as Full Size toggling maximize based on state only olcore tracks.
+static void decoration_handle_toggle_sticky(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
+	if (decoration == NULL || decoration->toplevel == NULL) {
+		return;
+	}
+	struct olc_toplevel *toplevel = decoration->toplevel;
+	toplevel->sticky = !toplevel->sticky;
+	update_toplevel_visibility(toplevel);
+}
+
 // Quit's "same application instance" grouping is by wl_client, not app_id:
 // app_id only identifies *which app*, not *which running copy of it* --
 // two separately-launched instances of the same app share an app_id but
@@ -1453,6 +1477,7 @@ static const struct zopenlook_decoration_v1_interface decoration_impl = {
 	.resize = decoration_handle_resize,
 	.lower = decoration_handle_lower,
 	.quit = decoration_handle_quit,
+	.toggle_sticky = decoration_handle_toggle_sticky,
 };
 
 static void decoration_teardown(struct olc_decoration *decoration) {

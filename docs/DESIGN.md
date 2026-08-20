@@ -136,9 +136,12 @@ with wlroots compositors generally, not just this project.
   connection, i.e. running app instance -- deliberately not matching by
   `app_id`, which two separately-launched instances of the same app would
   share despite needing to stay independent; only olcore can see the real
-  grouping). `Stick` is deliberately still a placeholder -- see the
-  workspace-switching bullet below, it has nothing to opt out of yet.
-  `Properties` (shown disabled) logs a placeholder on click too, same as
+  grouping), and a `toggle_sticky` request for `Stick` (a sticky toplevel
+  is exempt from the per-workspace hiding the workspace switcher strip
+  below causes; toggles rather than taking a target state, since olcore
+  doesn't report sticky state back to olshell, mirroring how `Full Size`
+  toggles maximize). `Properties` (shown disabled) logs a placeholder on
+  click too, same as
   the root menu's non-interactive submenus. No keyboard focus on the
   window menu yet, so only click-elsewhere closes it, not Escape --
   follow-up, same as Escape support was for the root menu. Still no footer
@@ -167,8 +170,9 @@ with wlroots compositors generally, not just this project.
   switching to it, via a new `assign_toplevel` request on the workspaces
   protocol -- borrowed from modern multi-workspace desktops rather than
   an OPEN LOOK convention, but a fitting real use for the ADJUST button.
-  `Stick` (the window menu's remaining placeholder) can now be
-  implemented for real against this.
+  `Stick` (see the window menu bullet above) is built against this too --
+  every window-menu item is now either a real action or an intentional
+  placeholder (`Properties`, disabled to match the reference screenshot).
 - Theming flexibility: later on, users may want to choose between a
   "pure" original-OPEN-LOOK visual style and the more Sun-ified look
   seen in later desktops built on it (see the taskbar/icon convention

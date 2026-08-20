@@ -156,6 +156,18 @@
       </description>
     </request>
 
+    <request name="toggle_sticky">
+      <description summary="toggle whether the toplevel is visible on every workspace">
+        A sticky toplevel stays visible regardless of which workspace is
+        active, exempt from the hiding switching workspaces normally
+        causes. Toggles current state rather than taking an explicit
+        target, since olcore doesn't report sticky state back to olshell
+        -- there's no need for olshell to track it itself, only to ask for
+        the opposite of whatever it currently is. The window menu's Stick
+        item is the only caller.
+      </description>
+    </request>
+
     <enum name="edge">
       <entry name="top" value="1"/>
       <entry name="bottom" value="2"/>

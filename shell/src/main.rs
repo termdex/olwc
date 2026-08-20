@@ -182,6 +182,7 @@ enum WindowMenuAction {
     Resize,
     Lower,
     Quit,
+    ToggleSticky,
     /// Not wired up yet -- logs a placeholder, same as the root menu's
     /// non-interactive submenus.
     Unimplemented,
@@ -213,7 +214,7 @@ const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Resize", action: WindowMenuAction::Resize, disabled: false },
     WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
     WindowMenuItem { label: "Back", action: WindowMenuAction::Lower, disabled: false },
-    WindowMenuItem { label: "Stick", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Stick", action: WindowMenuAction::ToggleSticky, disabled: false },
     WindowMenuItem { label: "Quit", action: WindowMenuAction::Quit, disabled: false },
 ];
 
@@ -1468,6 +1469,15 @@ impl PointerHandler for Olshell {
                                         .and_then(|i| i.decoration.as_ref())
                                     {
                                         dec.object.quit();
+                                    }
+                                }
+                                WindowMenuAction::ToggleSticky => {
+                                    if let Some(dec) = self
+                                        .toplevels
+                                        .get(&toplevel_id)
+                                        .and_then(|i| i.decoration.as_ref())
+                                    {
+                                        dec.object.toggle_sticky();
                                     }
                                 }
                                 WindowMenuAction::Unimplemented => {
