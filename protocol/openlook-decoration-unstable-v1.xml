@@ -192,10 +192,19 @@
         authoritative -- olshell should size its buffer to exactly
         width x height. height simply echoes back what get_decoration
         was called with.
+
+        toplevel_height is the decorated toplevel's own current content
+        height -- not the header's, which is always just height. olshell
+        has no other way to learn this (wlr-foreign-toplevel-management
+        deliberately carries no geometry), and needs it to position
+        chrome relative to the toplevel's bottom edge, e.g. bottom
+        resize-corner handles, as subsurfaces of the header positioned
+        far enough down to reach it.
       </description>
       <arg name="serial" type="uint"/>
       <arg name="width" type="uint"/>
       <arg name="height" type="uint"/>
+      <arg name="toplevel_height" type="uint"/>
     </event>
 
     <event name="closed">

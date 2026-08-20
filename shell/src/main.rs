@@ -158,6 +158,13 @@ const DECORATION_BUTTON_MARGIN: i32 = 4;
 const DECORATION_BUTTON_HOVER_COLOR: (u8, u8, u8) = MENU_HOVER_COLOR;
 const DECORATION_FONT_SIZE: f32 = 15.0;
 
+// Bottom resize-corner handles, per docs/OPENLOOK-REFERENCE.md's "obround/
+// pill-shaped resize handles at frame corners" -- approximated here as a
+// filled circle (same drawing code as the pushpin, just always filled)
+// rather than true obround, same placeholder-glyph caveat draw_chevron
+// already carries.
+const CORNER_HANDLE_SIZE: i32 = 14;
+
 // Window menu: the popup the decoration header's button opens. Reuses the
 // root menu's palette (MENU_BG_COLOR etc.) -- both are menus and should
 // look the same per OPEN LOOK's visual language -- plus one addition for
@@ -242,10 +249,29 @@ struct Decoration {
     object: ZopenlookDecorationV1,
     width: u32,
     height: u32,
+    /// The decorated toplevel's own current content height -- not this
+    /// header's, which is always `height`. Needed to position the bottom
+    /// corner handles, which have to reach the toplevel's bottom edge;
+    /// see the protocol's configure event doc comment for why olcore has
+    /// to tell us this rather than us computing it some other way.
+    toplevel_height: u32,
     button_hovered: bool,
     /// Mirrors olcore's state, kept in sync via the sticky_changed event --
     /// olshell never decides this itself, only asks to toggle it.
     sticky: bool,
+    bottom_left: CornerHandle,
+    bottom_right: CornerHandle,
+}
+
+/// A resize-corner handle: a small subsurface of the header (same trick as
+/// the window menu -- both are olshell-owned surfaces, so no protocol
+/// extension needed) positioned at one of the toplevel's bottom corners.
+/// Top corners aren't implemented yet -- this is a first pass covering the
+/// two most commonly expected resize handles.
+struct CornerHandle {
+    subsurface: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
+    hovered: bool,
 }
 
 impl Decoration {
@@ -263,6 +289,17 @@ impl Decoration {
         let x0 = x1 - PUSHPIN_SIZE;
         let y0 = (self.height as i32 - PUSHPIN_SIZE) / 2;
         (x0, y0, x1, y0 + PUSHPIN_SIZE)
+    }
+
+    /// Header-local position for a bottom corner handle -- header-local
+    /// because both handles are subsurfaces of the header (see
+    /// CornerHandle's doc comment), positioned far enough below it
+    /// (`self.height` + the toplevel's own content height) to reach the
+    /// toplevel's actual bottom edge.
+    fn corner_handle_position(&self, right: bool) -> (i32, i32) {
+        let x = if right { self.width as i32 - CORNER_HANDLE_SIZE } else { 0 };
+        let y = self.height as i32 + self.toplevel_height as i32 - CORNER_HANDLE_SIZE;
+        (x, y)
     }
 
     fn is_on_button(&self, x: f64, y: f64) -> bool {
@@ -603,14 +640,34 @@ impl Olshell {
         let object =
             manager.get_decoration(&surface, &handle, DECORATION_HEIGHT, qh, toplevel_id.clone());
 
+        // Bottom corner handles: subsurfaces of the header, same as the
+        // window menu. Positioned once real dimensions are known, in
+        // draw_decoration (via the next configure), not here.
+        let (bl_subsurface, bl_surface) = self.subcompositor.create_subsurface(surface.clone(), qh);
+        bl_subsurface.set_desync();
+        let (br_subsurface, br_surface) = self.subcompositor.create_subsurface(surface.clone(), qh);
+        br_subsurface.set_desync();
+        // Newly-created subsurfaces don't actually composite until the
+        // parent commits at least once after the relationship is
+        // established -- see open_window_menu's identical follow-up
+        // commit for the live-tested reasoning.
+        surface.commit();
+
         let info = self.toplevels.get_mut(toplevel_id).unwrap();
         info.decoration = Some(Decoration {
             surface,
             object,
             width: 0,
             height: DECORATION_HEIGHT,
+            toplevel_height: 0,
             button_hovered: false,
             sticky: false,
+            bottom_left: CornerHandle { subsurface: bl_subsurface, surface: bl_surface, hovered: false },
+            bottom_right: CornerHandle {
+                subsurface: br_subsurface,
+                surface: br_surface,
+                hovered: false,
+            },
         });
     }
 
@@ -672,6 +729,24 @@ impl Olshell {
         wl_surface.damage_buffer(0, 0, width, height);
         wl_surface.commit();
         log::info!("decoration: drew {toplevel_id:?} at {width}x{height}");
+
+        if dec.toplevel_height > 0 {
+            let (bl_x, bl_y) = dec.corner_handle_position(false);
+            dec.bottom_left.subsurface.set_position(bl_x, bl_y);
+            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, dec.bottom_left.hovered);
+
+            let (br_x, br_y) = dec.corner_handle_position(true);
+            dec.bottom_right.subsurface.set_position(br_x, br_y);
+            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, dec.bottom_right.hovered);
+
+            // The corner handles' very first content commit (above) needs
+            // a fresh parent commit to actually become visible, same
+            // subsurface gotcha as the window menu -- confirmed live: the
+            // early "nudge" commit in ensure_decoration, sent before
+            // either corner had any content yet, wasn't enough on its
+            // own. No new header content, just the nudge.
+            dec.surface.commit();
+        }
     }
 
     /// Opens the window menu for `toplevel_id`'s decoration, replacing any
@@ -860,6 +935,21 @@ impl Olshell {
         })
     }
 
+    /// (toplevel, is_right) for whichever bottom corner handle `surface`
+    /// is, if any.
+    fn corner_handle_at(&self, surface: &wl_surface::WlSurface) -> Option<(ObjectId, bool)> {
+        self.toplevels.iter().find_map(|(id, info)| {
+            let dec = info.decoration.as_ref()?;
+            if dec.bottom_left.surface == *surface {
+                Some((id.clone(), false))
+            } else if dec.bottom_right.surface == *surface {
+                Some((id.clone(), true))
+            } else {
+                None
+            }
+        })
+    }
+
     /// Workspace index (0-based) the panel-local `x` falls on, if any.
     fn workspace_at(&self, x: f64) -> Option<u32> {
         let x = x as i32;
@@ -890,6 +980,29 @@ impl Olshell {
             Err(e) => log::warn!("root menu: failed to run {command:?}: {e}"),
         }
     }
+}
+
+/// Draws a resize-corner handle: a filled circle marker (reusing
+/// draw_pushpin's shape) on an otherwise fully transparent buffer, so it
+/// reads as a small floating marker over the toplevel's own corner rather
+/// than a rectangle sitting on top of it.
+fn draw_corner_handle(pool: &mut SlotPool, surface: &wl_surface::WlSurface, hovered: bool) {
+    let size = CORNER_HANDLE_SIZE;
+    let stride = size * 4;
+    let (buffer, canvas) =
+        pool.create_buffer(size, size, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
+    // Zero the whole pixel, not just alpha: SlotPool buffers are reused
+    // memory, so leftover RGB from a previous draw would still be sitting
+    // there. wl_shm Argb8888 buffers are expected premultiplied, and a
+    // stale-RGB/zero-alpha pixel isn't validly premultiplied -- confirmed
+    // live, it rendered as a faint ghost of whatever was drawn here before
+    // instead of true transparency.
+    canvas.fill(0);
+    let color = if hovered { DECORATION_BUTTON_HOVER_COLOR } else { DECORATION_TEXT_COLOR };
+    draw_pushpin(canvas, size, size, 0, 0, size, size, true, color);
+    buffer.attach_to(surface).expect("failed to attach buffer");
+    surface.damage_buffer(0, 0, size, size);
+    surface.commit();
 }
 
 fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
@@ -1311,6 +1424,7 @@ impl PointerHandler for Olshell {
                 .as_ref()
                 .is_some_and(|p| event.surface == *p.layer.wl_surface());
             let decoration_toplevel = self.decoration_toplevel_id(&event.surface);
+            let corner_handle = self.corner_handle_at(&event.surface);
             let on_window_menu =
                 self.window_menu.as_ref().is_some_and(|wm| event.surface == wm.surface);
             // Captured before the "click elsewhere closes it" step below
@@ -1417,6 +1531,40 @@ impl PointerHandler for Olshell {
                         // fires from the press itself, so the button is
                         // still down -- the move ends when it's released.
                         dec.object._move(1);
+                    }
+                }
+                PointerEventKind::Motion { .. } if corner_handle.is_some() => {
+                    let (id, right) = corner_handle.clone().unwrap();
+                    if let Some(dec) =
+                        self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
+                    {
+                        let handle = if right { &mut dec.bottom_right } else { &mut dec.bottom_left };
+                        if !handle.hovered {
+                            handle.hovered = true;
+                            self.draw_decoration(&id);
+                        }
+                    }
+                }
+                PointerEventKind::Leave { .. } if corner_handle.is_some() => {
+                    let (id, right) = corner_handle.clone().unwrap();
+                    if let Some(dec) =
+                        self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
+                    {
+                        let handle = if right { &mut dec.bottom_right } else { &mut dec.bottom_left };
+                        if handle.hovered {
+                            handle.hovered = false;
+                            self.draw_decoration(&id);
+                        }
+                    }
+                }
+                PointerEventKind::Press { button, .. } if corner_handle.is_some() && button == BTN_LEFT => {
+                    let (id, right) = corner_handle.clone().unwrap();
+                    if let Some(dec) = self.toplevels.get(&id).and_then(|info| info.decoration.as_ref()) {
+                        let edges = EDGE_BOTTOM | if right { EDGE_RIGHT } else { EDGE_LEFT };
+                        // held=1: this fires from the press itself, same
+                        // reasoning as the header drag above -- a real
+                        // press-hold-drag gesture, not a discrete click.
+                        dec.object.resize(edges, 1);
                     }
                 }
                 PointerEventKind::Motion { .. } if on_window_menu => {
@@ -1778,14 +1926,15 @@ impl Dispatch<ZopenlookDecorationV1, ObjectId> for Olshell {
         use zopenlook_decoration_v1::Event;
 
         match event {
-            Event::Configure { serial, width, height } => {
-                log::info!("decoration: configure {toplevel_id:?} {width}x{height}");
+            Event::Configure { serial, width, height, toplevel_height } => {
+                log::info!("decoration: configure {toplevel_id:?} {width}x{height} (toplevel {toplevel_height})");
                 proxy.ack_configure(serial);
                 if let Some(dec) =
                     state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.as_mut())
                 {
                     dec.width = width;
                     dec.height = height;
+                    dec.toplevel_height = toplevel_height;
                 }
                 state.draw_decoration(toplevel_id);
             }
@@ -1796,6 +1945,10 @@ impl Dispatch<ZopenlookDecorationV1, ObjectId> for Olshell {
                 if let Some(dec) =
                     state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.take())
                 {
+                    dec.bottom_left.subsurface.destroy();
+                    dec.bottom_left.surface.destroy();
+                    dec.bottom_right.subsurface.destroy();
+                    dec.bottom_right.surface.destroy();
                     dec.object.destroy();
                     dec.surface.destroy();
                 }

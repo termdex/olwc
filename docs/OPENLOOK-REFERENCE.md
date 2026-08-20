@@ -149,8 +149,11 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
   `shell/src/main.rs`'s `draw_chevron()` is an explicitly placeholder
   geometric approximation (a filled downward wedge), not asset-accurate.
 - Resize corner glyphs specifically aren't visible in either
-  screenshot at usable resolution -- still open, and no footer/corner
-  chrome exists yet at all (see `docs/DESIGN.md`).
+  screenshot at usable resolution -- still open. Bottom-left and
+  bottom-right handles exist now (see `docs/DESIGN.md`'s window gadget
+  chrome entry) as an explicit placeholder shape (a filled circle, not
+  true obround), same caveat as `draw_chevron()` above; top corners and
+  a footer strip are still unimplemented.
 - ~~Whether to reproduce the full window-menu item list~~ resolved: the
   reference set minus `Refresh` (dropped, see `docs/DESIGN.md`'s window
   gadget chrome entry for why). The menu is fully interactive now, with

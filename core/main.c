@@ -211,6 +211,7 @@ struct olc_decoration {
 	struct wl_listener surface_commit;
 	uint32_t height;
 	uint32_t configured_width;
+	uint32_t configured_toplevel_height;
 	bool configured;
 };
 
@@ -1008,15 +1009,19 @@ static void xdg_toplevel_unmap(struct wl_listener *listener, void *data) {
 static void configure_decoration(struct olc_decoration *decoration) {
 	struct wlr_box geo = decoration->toplevel->xdg_toplevel->base->geometry;
 	uint32_t width = geo.width > 0 ? (uint32_t)geo.width : 0;
-	if (decoration->configured && width == decoration->configured_width) {
+	uint32_t toplevel_height = geo.height > 0 ? (uint32_t)geo.height : 0;
+	if (decoration->configured && width == decoration->configured_width &&
+			toplevel_height == decoration->configured_toplevel_height) {
 		return;
 	}
 	decoration->configured = true;
 	decoration->configured_width = width;
+	decoration->configured_toplevel_height = toplevel_height;
 	uint32_t serial = wl_display_next_serial(decoration->toplevel->server->wl_display);
 	wlr_log(WLR_INFO, "openlook-decoration: configure %ux%u (toplevel geo %dx%d)",
 		width, decoration->height, geo.width, geo.height);
-	zopenlook_decoration_v1_send_configure(decoration->resource, serial, width, decoration->height);
+	zopenlook_decoration_v1_send_configure(
+		decoration->resource, serial, width, decoration->height, toplevel_height);
 }
 
 static void xdg_toplevel_commit(struct wl_listener *listener, void *data) {
