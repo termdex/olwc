@@ -162,8 +162,13 @@ with wlroots compositors generally, not just this project.
   represents, SELECT-click switches. No reference exists for this
   specifically -- the non-goals above already replace olvwm's VDM pager
   with plain discrete workspaces, so there's nothing authentic to match,
-  just a plain segmented strip. `Stick` (the window menu's remaining
-  placeholder) can now be implemented for real against this.
+  just a plain segmented strip. ADJUST-click (middle button) on a segment
+  moves the currently-focused toplevel to that workspace instead of
+  switching to it, via a new `assign_toplevel` request on the workspaces
+  protocol -- borrowed from modern multi-workspace desktops rather than
+  an OPEN LOOK convention, but a fitting real use for the ADJUST button.
+  `Stick` (the window menu's remaining placeholder) can now be
+  implemented for real against this.
 - Theming flexibility: later on, users may want to choose between a
   "pure" original-OPEN-LOOK visual style and the more Sun-ified look
   seen in later desktops built on it (see the taskbar/icon convention

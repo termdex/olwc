@@ -35,9 +35,10 @@ use wayland_client::{
 
 // Linux input event codes (linux/input-event-codes.h), as reported in
 // wl_pointer button events. OPEN LOOK's MENU button is the right button;
-// SELECT is the left one.
+// SELECT is the left one; ADJUST is the middle one.
 const BTN_LEFT: u32 = 0x110;
 const BTN_RIGHT: u32 = 0x111;
+const BTN_MIDDLE: u32 = 0x112;
 use wayland_protocols_wlr::foreign_toplevel::v1::client::{
     zwlr_foreign_toplevel_handle_v1::{self, ZwlrForeignToplevelHandleV1},
     zwlr_foreign_toplevel_manager_v1::{self, ZwlrForeignToplevelManagerV1},
@@ -825,6 +826,13 @@ impl Olshell {
         })
     }
 
+    /// The toplevel wlr-foreign-toplevel-management currently reports as
+    /// activated, if any -- state code 2, per that protocol's state enum
+    /// (0=maximized, 1=minimized, 2=activated, 3=fullscreen).
+    fn focused_toplevel_handle(&self) -> Option<ZwlrForeignToplevelHandleV1> {
+        self.toplevels.values().find(|info| info.states.contains(&2)).and_then(|info| info.handle.clone())
+    }
+
     /// Runs a popup menu item's command via `sh -c`, detached. The spawned
     /// child is reaped on a background thread so it doesn't linger as a
     /// zombie for the rest of olshell's (long) lifetime.
@@ -1300,6 +1308,20 @@ impl PointerHandler for Olshell {
                     if let Some(index) = self.workspace_at(event.position.0) {
                         if let Some(manager) = self.workspaces_manager.as_ref() {
                             manager.switch_to(index);
+                        }
+                    }
+                }
+                // ADJUST (middle-click) a segment to move the focused
+                // window there instead of switching to it -- borrowed
+                // from modern multi-workspace desktops; no OPEN LOOK
+                // precedent, but a fitting use for the ADJUST button
+                // (extend/modify an existing selection) all the same.
+                PointerEventKind::Press { button, .. } if on_panel && button == BTN_MIDDLE => {
+                    if let Some(index) = self.workspace_at(event.position.0) {
+                        if let (Some(manager), Some(handle)) =
+                            (self.workspaces_manager.as_ref(), self.focused_toplevel_handle())
+                        {
+                            manager.assign_toplevel(&handle, index);
                         }
                     }
                 }

@@ -55,6 +55,21 @@
       <arg name="index" type="uint" summary="workspace index, 0-based"/>
     </request>
 
+    <request name="assign_toplevel">
+      <description summary="move a toplevel to a different workspace">
+        Requests that toplevel (a handle from
+        wlr-foreign-toplevel-management-unstable-v1) be reassigned to the
+        workspace at index. index must be less than the count most
+        recently sent in a workspace_count event; out-of-range values are
+        ignored, as is a toplevel handle that doesn't currently name a
+        mapped toplevel. Reassigning a toplevel off the active workspace
+        hides it immediately (and moves focus elsewhere if it had it);
+        reassigning one onto the active workspace shows it.
+      </description>
+      <arg name="toplevel" type="object" interface="zwlr_foreign_toplevel_handle_v1"/>
+      <arg name="index" type="uint" summary="workspace index, 0-based"/>
+    </request>
+
     <request name="destroy" type="destructor">
       <description summary="destroy the manager object">
         Destroys this manager object. Does not affect workspace state.

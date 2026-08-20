@@ -151,13 +151,18 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
 - Resize corner glyphs specifically aren't visible in either
   screenshot at usable resolution -- still open, and no footer/corner
   chrome exists yet at all (see `docs/DESIGN.md`).
-- Whether to reproduce the full window-menu item list (`Close`,
-  `Full Size`, `Move`, `Resize`, `Properties`, `Back`, `Refresh`,
-  `Stick`, `Quit`) or a pared-down subset -- moot until the menu itself
-  is interactive; the button that's meant to open it currently only
-  logs a placeholder on click.
-- Whether ADJUST (middle-click extend-selection) is worth preserving
-  given how rarely modern users have a reliable middle-click.
+- ~~Whether to reproduce the full window-menu item list~~ resolved: the
+  reference set minus `Refresh` (dropped, see `docs/DESIGN.md`'s window
+  gadget chrome entry for why). The menu is fully interactive now, with
+  every item either a real action or an intentional placeholder
+  (`Properties` disabled to match the screenshot, `Stick` blocked on
+  workspace membership existing, which it now does -- see the
+  workspace-switcher entry in `docs/DESIGN.md`).
+- ~~Whether ADJUST (middle-click extend-selection) is worth
+  preserving~~ given a real, if non-authentic, use: ADJUST-click on a
+  workspace strip segment moves the focused window there. Whether
+  ADJUST is worth preserving for anything closer to its original
+  extend-selection meaning is still open.
 - ~~Root menu content/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - ~~Window header chrome~~ v1 resolved: see `docs/DESIGN.md`'s window

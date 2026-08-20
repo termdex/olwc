@@ -827,6 +827,28 @@ static void broadcast_toplevel_workspace(struct olc_server *server,
 	}
 }
 
+// Finds the olc_toplevel a client-supplied zwlr_foreign_toplevel_handle_v1
+// resource refers to. Deliberately avoids relying on that resource's
+// wl_resource user-data layout (an internal wlroots detail we don't
+// control) and instead walks the per-client resource lists we already
+// maintain a reference into via olc_toplevel::foreign_handle.
+static struct olc_toplevel *toplevel_from_foreign_handle_resource(
+		struct olc_server *server, struct wl_resource *handle_resource) {
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->foreign_handle == NULL) {
+			continue;
+		}
+		struct wl_resource *r;
+		wl_resource_for_each(r, &toplevel->foreign_handle->resources) {
+			if (r == handle_resource) {
+				return toplevel;
+			}
+		}
+	}
+	return NULL;
+}
+
 static void toplevel_handle_request_maximize(struct wl_listener *listener, void *data) {
 	struct olc_toplevel *toplevel =
 		wl_container_of(listener, toplevel, foreign_request_maximize);
@@ -1178,6 +1200,34 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 	wl_signal_add(&xdg_popup->events.destroy, &popup->destroy);
 }
 
+// If whatever had keyboard focus is now hidden (wrong workspace, or
+// minimized), it shouldn't keep receiving keystrokes for a window the user
+// can no longer see. server->toplevels is kept most-recently-focused-first
+// (see focus_toplevel), so the first visible entry on the active workspace
+// is a reasonable "return to where you left off" choice; if there isn't
+// one, just drop focus instead of leaving it on a hidden window. Shared by
+// switching the active workspace and moving a toplevel to/off of it --
+// both can hide whatever currently has focus.
+static void refocus_if_hidden(struct olc_server *server) {
+	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
+	struct wlr_xdg_toplevel *focused_xdg_toplevel =
+		focused ? wlr_xdg_toplevel_try_from_wlr_surface(focused) : NULL;
+	struct olc_toplevel *focused_toplevel =
+		focused_xdg_toplevel ? olc_toplevel_from_xdg_toplevel(focused_xdg_toplevel) : NULL;
+	if (focused_toplevel != NULL && focused_toplevel->workspace_index == server->active_workspace &&
+			!focused_toplevel->minimized) {
+		return;
+	}
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->workspace_index == server->active_workspace && !toplevel->minimized) {
+			focus_toplevel(toplevel);
+			return;
+		}
+	}
+	wlr_seat_keyboard_notify_clear_focus(server->seat);
+}
+
 static void workspaces_manager_handle_switch_to(
 		struct wl_client *client, struct wl_resource *resource, uint32_t index) {
 	struct olc_workspaces_resource *r = wl_resource_get_user_data(resource);
@@ -1192,37 +1242,35 @@ static void workspaces_manager_handle_switch_to(
 	wl_list_for_each(toplevel, &server->toplevels, link) {
 		update_toplevel_visibility(toplevel);
 	}
-
-	// If whatever had keyboard focus just got hidden, it shouldn't keep
-	// receiving keystrokes for a window the user can no longer see.
-	// server->toplevels is kept most-recently-focused-first (see
-	// focus_toplevel), so the first visible entry on the new workspace is
-	// a reasonable "return to where you left off" choice; if there isn't
-	// one, just drop focus instead of leaving it on a hidden window.
-	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
-	struct wlr_xdg_toplevel *focused_xdg_toplevel =
-		focused ? wlr_xdg_toplevel_try_from_wlr_surface(focused) : NULL;
-	struct olc_toplevel *focused_toplevel =
-		focused_xdg_toplevel ? olc_toplevel_from_xdg_toplevel(focused_xdg_toplevel) : NULL;
-	if (focused_toplevel == NULL || focused_toplevel->workspace_index != server->active_workspace ||
-			focused_toplevel->minimized) {
-		bool refocused = false;
-		wl_list_for_each(toplevel, &server->toplevels, link) {
-			if (toplevel->workspace_index == server->active_workspace && !toplevel->minimized) {
-				focus_toplevel(toplevel);
-				refocused = true;
-				break;
-			}
-		}
-		if (!refocused) {
-			wlr_seat_keyboard_notify_clear_focus(server->seat);
-		}
-	}
+	refocus_if_hidden(server);
 
 	struct olc_workspaces_resource *other;
 	wl_list_for_each(other, &server->workspace_resources, link) {
 		zopenlook_workspaces_manager_v1_send_active_changed(other->resource, server->active_workspace);
 	}
+}
+
+// ADJUST-clicking a workspace strip segment (olshell) calls this to move
+// the currently focused toplevel there -- the only caller for now, but
+// deliberately not tied to "focused" in the protocol itself, in case a
+// future window-menu "Move to Workspace" item wants to target something
+// other than the focused toplevel.
+static void workspaces_manager_handle_assign_toplevel(struct wl_client *client,
+		struct wl_resource *resource, struct wl_resource *toplevel_handle_resource, uint32_t index) {
+	struct olc_workspaces_resource *r = wl_resource_get_user_data(resource);
+	struct olc_server *server = r->server;
+
+	if (index >= server->workspace_count) {
+		return;
+	}
+	struct olc_toplevel *toplevel = toplevel_from_foreign_handle_resource(server, toplevel_handle_resource);
+	if (toplevel == NULL || toplevel->workspace_index == index) {
+		return;
+	}
+	toplevel->workspace_index = index;
+	update_toplevel_visibility(toplevel);
+	refocus_if_hidden(server);
+	broadcast_toplevel_workspace(server, toplevel->foreign_handle, index);
 }
 
 static void workspaces_manager_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
@@ -1231,6 +1279,7 @@ static void workspaces_manager_handle_destroy(struct wl_client *client, struct w
 
 static const struct zopenlook_workspaces_manager_v1_interface workspaces_manager_impl = {
 	.switch_to = workspaces_manager_handle_switch_to,
+	.assign_toplevel = workspaces_manager_handle_assign_toplevel,
 	.destroy = workspaces_manager_handle_destroy,
 };
 
@@ -1316,28 +1365,6 @@ static void server_new_xdg_toplevel_decoration(struct wl_listener *listener, voi
 	} else {
 		toplevel->pending_xdg_decoration = decoration;
 	}
-}
-
-// Finds the olc_toplevel a client-supplied zwlr_foreign_toplevel_handle_v1
-// resource refers to. Deliberately avoids relying on that resource's
-// wl_resource user-data layout (an internal wlroots detail we don't
-// control) and instead walks the per-client resource lists we already
-// maintain a reference into via olc_toplevel::foreign_handle.
-static struct olc_toplevel *toplevel_from_foreign_handle_resource(
-		struct olc_server *server, struct wl_resource *handle_resource) {
-	struct olc_toplevel *toplevel;
-	wl_list_for_each(toplevel, &server->toplevels, link) {
-		if (toplevel->foreign_handle == NULL) {
-			continue;
-		}
-		struct wl_resource *r;
-		wl_resource_for_each(r, &toplevel->foreign_handle->resources) {
-			if (r == handle_resource) {
-				return toplevel;
-			}
-		}
-	}
-	return NULL;
 }
 
 static void decoration_handle_ack_configure(
