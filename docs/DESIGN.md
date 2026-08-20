@@ -130,16 +130,26 @@ with wlroots compositors generally, not just this project.
   additionally always passes bottom|right since there's no resize-corner
   chrome yet to pick a different edge from), and a `lower` request for
   `Back` (instant, not a grab -- opposite of the raise-on-focus that
-  already existed). The rest (`Properties` -- shown disabled, `Stick`,
-  `Quit`) log a placeholder on click, same as the root menu's
-  non-interactive submenus. No keyboard focus on the window menu yet, so
-  only click-elsewhere closes it, not Escape --
+  already existed). `Stick` is deliberately still a placeholder -- see the
+  workspace-switching bullet below, it has nothing to opt out of yet.
+  `Properties` (shown disabled) and `Quit` log a placeholder on click too,
+  same as the root menu's non-interactive submenus. No keyboard focus on
+  the window menu yet, so only click-elsewhere closes it, not Escape --
   follow-up, same as Escape support was for the root menu. Still no footer
   or resize-corner chrome.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
   workspaces vs. shared).
+- Workspace switching has no visual effect yet: `workspaces_manager_
+  handle_switch_to` (`core/main.c`) only updates `active_workspace` and
+  notifies clients -- nothing hides or shows toplevels based on which
+  workspace they're assigned to, so every window is currently visible
+  regardless of the active workspace. Discovered while scoping the window
+  menu's `Stick` item, which is meaningless without this: there's nothing
+  to exempt a "stuck" window from yet. Real per-workspace show/hide in
+  olcore is a prerequisite for `Stick` and naturally pairs with building
+  the workspace switcher strip (see the panel bullet below).
 - The desktop-wide panel's toplevel-title list (`shell/src/main.rs`'s
   `draw_panel`) predates the OPEN LOOK reference research and is now both
   redundant (window decorations show titles per-window) and itself the
