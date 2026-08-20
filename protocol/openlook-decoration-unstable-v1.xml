@@ -160,11 +160,15 @@
       <description summary="toggle whether the toplevel is visible on every workspace">
         A sticky toplevel stays visible regardless of which workspace is
         active, exempt from the hiding switching workspaces normally
-        causes. Toggles current state rather than taking an explicit
-        target, since olcore doesn't report sticky state back to olshell
-        -- there's no need for olshell to track it itself, only to ask for
-        the opposite of whatever it currently is. The window menu's Stick
-        item is the only caller.
+        causes. Un-sticking commits the toplevel to whichever workspace is
+        active at that moment, rather than reverting to wherever it was
+        before it was stuck (which could easily no longer be the active
+        one, making the toplevel appear to vanish). Toggles current state
+        rather than taking an explicit target; olcore reports the result
+        via sticky_changed, so olshell doesn't need to track which
+        direction to ask for -- it can always just ask for the opposite of
+        whatever it was last told. The window menu's Stick item is the
+        only caller.
       </description>
     </request>
 
@@ -201,6 +205,16 @@
         may destroy or recycle the underlying wl_surface) in response;
         olcore has already dropped its own reference to it.
       </description>
+    </event>
+
+    <event name="sticky_changed">
+      <description summary="report the result of a toggle_sticky request">
+        Sent once, right after processing a toggle_sticky request, with
+        the toplevel's new sticky state -- there's no separate query
+        request, since the only way this ever changes is toggle_sticky
+        itself, so olshell already knows a response is coming.
+      </description>
+      <arg name="sticky" type="uint" summary="1 if now sticky, 0 otherwise"/>
     </event>
   </interface>
 </protocol>

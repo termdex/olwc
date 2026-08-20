@@ -1440,7 +1440,17 @@ static void decoration_handle_toggle_sticky(struct wl_client *client, struct wl_
 	}
 	struct olc_toplevel *toplevel = decoration->toplevel;
 	toplevel->sticky = !toplevel->sticky;
+	if (!toplevel->sticky) {
+		// Un-sticking commits the toplevel to wherever the user currently
+		// is, rather than snapping back to whatever workspace_index
+		// happened to be from before it was stuck -- likely long
+		// forgotten, and surprising to have the window suddenly vanish to
+		// (confirmed live: it is).
+		toplevel->workspace_index = toplevel->server->active_workspace;
+		broadcast_toplevel_workspace(toplevel->server, toplevel->foreign_handle, toplevel->workspace_index);
+	}
 	update_toplevel_visibility(toplevel);
+	zopenlook_decoration_v1_send_sticky_changed(decoration->resource, toplevel->sticky);
 }
 
 // Quit's "same application instance" grouping is by wl_client, not app_id:

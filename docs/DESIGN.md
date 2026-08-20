@@ -121,8 +121,9 @@ with wlroots compositors generally, not just this project.
   `docs/OPENLOOK-REFERENCE.md` -- it exists to work around a class of X11
   repaint bug Wayland's damage tracking makes structurally impossible, so
   there's nothing to wire it to; dropped rather than kept as a dead entry).
-  `Close`, `Full Size`, `Move`, `Resize`, `Back`, and `Quit` are wired to
-  real actions: close/set_maximized via wlr-foreign-toplevel-management,
+  `Close`, `Full Size`, `Move`, `Resize`, `Back`, `Quit`, and `Stick` are
+  wired to real actions (`Stick` described separately below);
+  close/set_maximized via wlr-foreign-toplevel-management,
   `move`/`resize` requests on the decoration protocol mirroring
   xdg_toplevel's own move/resize (each takes a `held` argument since olcore
   can't reliably infer whether the triggering button is still down --
@@ -136,14 +137,25 @@ with wlroots compositors generally, not just this project.
   connection, i.e. running app instance -- deliberately not matching by
   `app_id`, which two separately-launched instances of the same app would
   share despite needing to stay independent; only olcore can see the real
-  grouping), and a `toggle_sticky` request for `Stick` (a sticky toplevel
-  is exempt from the per-workspace hiding the workspace switcher strip
-  below causes; toggles rather than taking a target state, since olcore
-  doesn't report sticky state back to olshell, mirroring how `Full Size`
-  toggles maximize). `Properties` (shown disabled) logs a placeholder on
-  click too, same as
-  the root menu's non-interactive submenus. No keyboard focus on the
-  window menu yet, so only click-elsewhere closes it, not Escape --
+  grouping). `Properties` (shown disabled) logs a placeholder on click
+  too, same as the root menu's non-interactive submenus.
+
+  `Stick` (a `toggle_sticky` request) exempts a toplevel from the
+  per-workspace hiding the workspace switcher strip below causes.
+  Un-sticking commits the toplevel to whichever workspace is active at
+  that moment, rather than reverting to wherever it was before it was
+  stuck -- confirmed live that snapping back is surprising, since the
+  window can appear to vanish if you've switched workspaces since. Unlike
+  the other toggle (`Full Size`, whose maximized state comes for free
+  from wlr-foreign-toplevel-management), olcore has to explicitly report
+  sticky state back via a `sticky_changed` event, since two things need
+  to know it: the window menu shows `Unstick` instead of `Stick` once
+  toggled on, and the header draws a small pushpin while sticky (reusing
+  the same glyph the root menu's pin-to-persist gesture uses, since both
+  mean "stays put").
+
+  No keyboard focus on the window menu yet, so only click-elsewhere
+  closes it, not Escape --
   follow-up, same as Escape support was for the root menu. Still no footer
   or resize-corner chrome.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible

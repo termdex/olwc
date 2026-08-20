@@ -243,6 +243,9 @@ struct Decoration {
     width: u32,
     height: u32,
     button_hovered: bool,
+    /// Mirrors olcore's state, kept in sync via the sticky_changed event --
+    /// olshell never decides this itself, only asks to toggle it.
+    sticky: bool,
 }
 
 impl Decoration {
@@ -250,6 +253,16 @@ impl Decoration {
         let x0 = DECORATION_BUTTON_MARGIN;
         let y0 = (self.height as i32 - DECORATION_BUTTON_SIZE) / 2;
         (x0, y0, x0 + DECORATION_BUTTON_SIZE, y0 + DECORATION_BUTTON_SIZE)
+    }
+
+    /// Sticky indicator, at the header's right edge -- purely a passive
+    /// indicator (not clickable), reusing the same pushpin glyph the root
+    /// menu's pin-to-persist gesture uses, since both mean "stays put".
+    fn sticky_pushpin_rect(&self) -> (i32, i32, i32, i32) {
+        let x1 = self.width as i32 - DECORATION_BUTTON_MARGIN;
+        let x0 = x1 - PUSHPIN_SIZE;
+        let y0 = (self.height as i32 - PUSHPIN_SIZE) / 2;
+        (x0, y0, x1, y0 + PUSHPIN_SIZE)
     }
 
     fn is_on_button(&self, x: f64, y: f64) -> bool {
@@ -597,6 +610,7 @@ impl Olshell {
             width: 0,
             height: DECORATION_HEIGHT,
             button_hovered: false,
+            sticky: false,
         });
     }
 
@@ -648,6 +662,11 @@ impl Olshell {
             );
         }
 
+        if dec.sticky {
+            let (px0, py0, px1, py1) = dec.sticky_pushpin_rect();
+            draw_pushpin(canvas, width, height, px0, py0, px1, py1, true, PUSHPIN_PINNED_COLOR);
+        }
+
         let wl_surface = &dec.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
@@ -676,7 +695,16 @@ impl Olshell {
                 .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
                 .sum()
         };
-        let max_width = WINDOW_MENU_ITEMS.iter().map(|item| label_width(item.label)).max().unwrap_or(0);
+        // "Unstick" (Stick's other label, see draw_window_menu) is wider
+        // than "Stick" -- included here unconditionally so the popup is
+        // wide enough for it regardless of current sticky state, since
+        // that's decided once, here, before it's known.
+        let max_width = WINDOW_MENU_ITEMS
+            .iter()
+            .map(|item| label_width(item.label))
+            .chain(std::iter::once(label_width("Unstick")))
+            .max()
+            .unwrap_or(0);
         let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
         let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
@@ -729,6 +757,15 @@ impl Olshell {
             pixel[3] = 0xFF;
         }
 
+        // Only Stick's label depends on current state -- olcore doesn't
+        // expose per-item state generally, just this one via sticky on
+        // Decoration (kept in sync by the sticky_changed event).
+        let sticky = self
+            .toplevels
+            .get(&wm.toplevel_id)
+            .and_then(|info| info.decoration.as_ref())
+            .is_some_and(|dec| dec.sticky);
+
         for (i, item) in WINDOW_MENU_ITEMS.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
             if !item.disabled && wm.hovered == Some(i) {
@@ -744,9 +781,14 @@ impl Olshell {
                 }
             }
             let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
+            let label = if matches!(item.action, WindowMenuAction::ToggleSticky) && sticky {
+                "Unstick"
+            } else {
+                item.label
+            };
             draw_text_row_centered(
                 canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
-                item.label, &self.font, MENU_FONT_SIZE, color,
+                label, &self.font, MENU_FONT_SIZE, color,
             );
         }
 
@@ -1757,6 +1799,14 @@ impl Dispatch<ZopenlookDecorationV1, ObjectId> for Olshell {
                     dec.object.destroy();
                     dec.surface.destroy();
                 }
+            }
+            Event::StickyChanged { sticky } => {
+                if let Some(dec) =
+                    state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.as_mut())
+                {
+                    dec.sticky = sticky != 0;
+                }
+                state.draw_decoration(toplevel_id);
             }
         }
     }
