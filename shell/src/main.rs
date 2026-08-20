@@ -167,6 +167,7 @@ enum WindowMenuAction {
     Move,
     Resize,
     Lower,
+    Quit,
     /// Not wired up yet -- logs a placeholder, same as the root menu's
     /// non-interactive submenus.
     Unimplemented,
@@ -183,11 +184,14 @@ struct WindowMenuItem {
 // window, a class of bug Wayland's damage-tracking model makes
 // structurally impossible, so there's nothing for it to do here -- dropped
 // rather than kept as a dead placeholder. Close, Full Size, Move, Resize,
-// and Back are wired to real actions; Move/Resize reuse the same
+// Back, and Quit are wired to real actions; Move/Resize reuse the same
 // interactive grabs the header drag gesture and (eventually) resize-corner
-// handles trigger, and Back reuses the same "lower to bottom" olcore
-// exposes. Properties is disabled to match the reference screenshot (shown
-// grayed out there too).
+// handles trigger, Back reuses the same "lower to bottom" olcore exposes,
+// and Quit closes every toplevel sharing this one's client connection
+// (see the decoration protocol's quit request) rather than just this
+// window, the same Close-window/Quit-application distinction most desktop
+// environments still draw. Properties is disabled to match the reference
+// screenshot (shown grayed out there too).
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Close", action: WindowMenuAction::Close, disabled: false },
     WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
@@ -196,7 +200,7 @@ const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
     WindowMenuItem { label: "Back", action: WindowMenuAction::Lower, disabled: false },
     WindowMenuItem { label: "Stick", action: WindowMenuAction::Unimplemented, disabled: false },
-    WindowMenuItem { label: "Quit", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Quit", action: WindowMenuAction::Quit, disabled: false },
 ];
 
 // SIL Open Font License 1.1, see assets/fonts/OFL.txt.
@@ -1395,6 +1399,15 @@ impl PointerHandler for Olshell {
                                         .and_then(|i| i.decoration.as_ref())
                                     {
                                         dec.object.lower();
+                                    }
+                                }
+                                WindowMenuAction::Quit => {
+                                    if let Some(dec) = self
+                                        .toplevels
+                                        .get(&toplevel_id)
+                                        .and_then(|i| i.decoration.as_ref())
+                                    {
+                                        dec.object.quit();
                                     }
                                 }
                                 WindowMenuAction::Unimplemented => {

@@ -144,6 +144,18 @@
       </description>
     </request>
 
+    <request name="quit">
+      <description summary="close every toplevel belonging to the same client as this one">
+        Like xdg_toplevel's own close, sent to the decorated toplevel and
+        every other mapped toplevel that shares its client connection --
+        i.e. the same running application instance, not just a matching
+        app_id (two separately-launched instances of the same app must
+        stay independent). Still a polite request, same as a single
+        close; the client(s) decide how to respond. The window menu's
+        Quit item is the only caller.
+      </description>
+    </request>
+
     <enum name="edge">
       <entry name="top" value="1"/>
       <entry name="bottom" value="2"/>

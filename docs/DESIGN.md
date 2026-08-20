@@ -121,20 +121,26 @@ with wlroots compositors generally, not just this project.
   `docs/OPENLOOK-REFERENCE.md` -- it exists to work around a class of X11
   repaint bug Wayland's damage tracking makes structurally impossible, so
   there's nothing to wire it to; dropped rather than kept as a dead entry).
-  `Close`, `Full Size`, `Move`, `Resize`, and `Back` are wired to real
-  actions: close/set_maximized via wlr-foreign-toplevel-management,
+  `Close`, `Full Size`, `Move`, `Resize`, `Back`, and `Quit` are wired to
+  real actions: close/set_maximized via wlr-foreign-toplevel-management,
   `move`/`resize` requests on the decoration protocol mirroring
   xdg_toplevel's own move/resize (each takes a `held` argument since olcore
   can't reliably infer whether the triggering button is still down --
   confirmed live it can't -- so olshell states it explicitly; `resize`
   additionally always passes bottom|right since there's no resize-corner
-  chrome yet to pick a different edge from), and a `lower` request for
-  `Back` (instant, not a grab -- opposite of the raise-on-focus that
-  already existed). `Stick` is deliberately still a placeholder -- see the
+  chrome yet to pick a different edge from), a `lower` request for `Back`
+  (instant, not a grab -- opposite of the raise-on-focus that already
+  existed), and a `quit` request for `Quit` -- unlike `Close` (which only
+  closes this one toplevel), `quit` sends the same polite xdg_toplevel
+  close to every toplevel sharing this one's `wl_client` (the actual live
+  connection, i.e. running app instance -- deliberately not matching by
+  `app_id`, which two separately-launched instances of the same app would
+  share despite needing to stay independent; only olcore can see the real
+  grouping). `Stick` is deliberately still a placeholder -- see the
   workspace-switching bullet below, it has nothing to opt out of yet.
-  `Properties` (shown disabled) and `Quit` log a placeholder on click too,
-  same as the root menu's non-interactive submenus. No keyboard focus on
-  the window menu yet, so only click-elsewhere closes it, not Escape --
+  `Properties` (shown disabled) logs a placeholder on click too, same as
+  the root menu's non-interactive submenus. No keyboard focus on the
+  window menu yet, so only click-elsewhere closes it, not Escape --
   follow-up, same as Escape support was for the root menu. Still no footer
   or resize-corner chrome.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible

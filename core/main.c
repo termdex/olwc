@@ -1341,12 +1341,40 @@ static void decoration_handle_lower(struct wl_client *client, struct wl_resource
 	wl_list_insert(toplevel->server->toplevels.prev, &toplevel->link);
 }
 
+// Quit's "same application instance" grouping is by wl_client, not app_id:
+// app_id only identifies *which app*, not *which running copy of it* --
+// two separately-launched instances of the same app share an app_id but
+// are different processes/connections, and only one should be affected.
+// wl_client is the precise notion of "the same running instance" and,
+// unlike app_id, isn't something a client even gets to report -- it's
+// however the wire connection this toplevel's surface actually arrived
+// on, visible only to olcore.
+static void decoration_handle_quit(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
+	if (decoration == NULL || decoration->toplevel == NULL) {
+		return;
+	}
+	struct wl_client *target_client =
+		wl_resource_get_client(decoration->toplevel->xdg_toplevel->base->surface->resource);
+
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &decoration->toplevel->server->toplevels, link) {
+		struct wl_client *toplevel_client =
+			wl_resource_get_client(toplevel->xdg_toplevel->base->surface->resource);
+		if (toplevel_client == target_client) {
+			wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
+		}
+	}
+}
+
 static const struct zopenlook_decoration_v1_interface decoration_impl = {
 	.ack_configure = decoration_handle_ack_configure,
 	.destroy = decoration_handle_destroy,
 	.move = decoration_handle_move,
 	.resize = decoration_handle_resize,
 	.lower = decoration_handle_lower,
+	.quit = decoration_handle_quit,
 };
 
 static void decoration_teardown(struct olc_decoration *decoration) {
