@@ -1349,9 +1349,12 @@ static void decoration_manager_handle_get_decoration(
 	decoration->height = height;
 	toplevel->decoration = decoration;
 
-	decoration->scene_tree = wlr_scene_tree_create(toplevel->scene_tree);
+	// subsurface_tree (not plain scene_surface_create) so any subsurfaces
+	// olshell attaches to the header -- the window menu popup -- are
+	// composited and hit-tested too. olshell owns both surfaces, so a
+	// regular wl_subsurface works fine here; no protocol extension needed.
+	decoration->scene_tree = wlr_scene_subsurface_tree_create(toplevel->scene_tree, decoration->surface);
 	wlr_scene_node_set_position(&decoration->scene_tree->node, 0, -(int)height);
-	wlr_scene_surface_create(decoration->scene_tree, decoration->surface);
 
 	// Push the toplevel itself down by the header height so the header
 	// (positioned just above the toplevel's origin, above) lands where the

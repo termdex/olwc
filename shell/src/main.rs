@@ -7,7 +7,7 @@
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_layer, delegate_output, delegate_pointer,
-    delegate_registry, delegate_seat, delegate_shm,
+    delegate_registry, delegate_seat, delegate_shm, delegate_subcompositor,
     output::{OutputHandler, OutputState},
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -24,11 +24,12 @@ use smithay_client_toolkit::{
         WaylandSurface,
     },
     shm::{slot::SlotPool, Shm, ShmHandler},
+    subcompositor::SubcompositorState,
 };
 use wayland_client::{
     backend::ObjectId,
     globals::registry_queue_init,
-    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_shm, wl_subsurface, wl_surface},
     Connection, Dispatch, Proxy, QueueHandle,
 };
 
@@ -143,6 +144,44 @@ const DECORATION_BUTTON_MARGIN: i32 = 4;
 const DECORATION_BUTTON_HOVER_COLOR: (u8, u8, u8) = MENU_HOVER_COLOR;
 const DECORATION_FONT_SIZE: f32 = 15.0;
 
+// Window menu: the popup the decoration header's button opens. Reuses the
+// root menu's palette (MENU_BG_COLOR etc.) -- both are menus and should
+// look the same per OPEN LOOK's visual language -- plus one addition for
+// the "Properties" item, which the reference screenshot shows grayed out.
+const WINDOW_MENU_DISABLED_COLOR: (u8, u8, u8) = (0x90, 0x90, 0x88);
+
+enum WindowMenuAction {
+    Close,
+    ToggleMaximize,
+    Move,
+    /// Not wired up yet -- logs a placeholder, same as the root menu's
+    /// non-interactive submenus.
+    Unimplemented,
+}
+
+struct WindowMenuItem {
+    label: &'static str,
+    action: WindowMenuAction,
+    disabled: bool,
+}
+
+// The full 9-item list from docs/OPENLOOK-REFERENCE.md's window menu
+// section. Only Close, Full Size, and Move are wired to real actions so
+// far -- Move reuses the same interactive-move grab the header drag
+// gesture already triggers. Properties is disabled to match the
+// reference screenshot (shown grayed out there too).
+const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
+    WindowMenuItem { label: "Close", action: WindowMenuAction::Close, disabled: false },
+    WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
+    WindowMenuItem { label: "Move", action: WindowMenuAction::Move, disabled: false },
+    WindowMenuItem { label: "Resize", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
+    WindowMenuItem { label: "Back", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Refresh", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Stick", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Quit", action: WindowMenuAction::Unimplemented, disabled: false },
+];
+
 // SIL Open Font License 1.1, see assets/fonts/OFL.txt.
 static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
 
@@ -181,6 +220,31 @@ impl Decoration {
         let (x0, y0, x1, y1) = self.button_rect();
         let (x, y) = (x as i32, y as i32);
         x >= x0 && x < x1 && y >= y0 && y < y1
+    }
+}
+
+/// The window menu popup for one toplevel, opened by clicking its
+/// decoration's button. A wl_subsurface of the decoration's own surface --
+/// both are olshell-owned, so this needs no protocol extension, unlike the
+/// decoration itself -- positioned just below the header, extending down
+/// over the window's content like the reference screenshots show. No
+/// pushpin (the reference doesn't show one on window menus, only on root
+/// menu-style pinnable menus) and no keyboard focus yet, so Escape doesn't
+/// close it -- click elsewhere does. Follow-up work, same as Escape support
+/// was for the root menu.
+struct WindowMenu {
+    toplevel_id: ObjectId,
+    subsurface: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
+    width: u32,
+    height: u32,
+    hovered: Option<usize>,
+}
+
+impl WindowMenu {
+    fn item_at(&self, y: f64) -> Option<usize> {
+        let row = (y / MENU_ROW_HEIGHT as f64) as usize;
+        (row < WINDOW_MENU_ITEMS.len()).then_some(row)
     }
 }
 
@@ -254,6 +318,11 @@ fn main() {
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell not available");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm not available");
+    // Used for the window menu popup: a subsurface of the decoration
+    // header's surface, both olshell-owned, so no protocol extension
+    // needed beyond this standard global.
+    let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
+        .expect("wl_subcompositor not available");
 
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(
@@ -318,6 +387,7 @@ fn main() {
         compositor,
         layer_shell,
         shm,
+        subcompositor,
         pool,
         layer,
         width: 0,
@@ -337,6 +407,7 @@ fn main() {
         pointer: None,
         keyboard: None,
         popup: None,
+        window_menu: None,
     };
 
     while !state.exit {
@@ -351,6 +422,7 @@ struct Olshell {
     compositor: CompositorState,
     layer_shell: LayerShell,
     shm: Shm,
+    subcompositor: SubcompositorState,
     pool: SlotPool,
     layer: LayerSurface,
     width: u32,
@@ -374,6 +446,7 @@ struct Olshell {
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     popup: Option<MenuPopup>,
+    window_menu: Option<WindowMenu>,
 }
 
 impl Olshell {
@@ -539,6 +612,98 @@ impl Olshell {
         wl_surface.damage_buffer(0, 0, width, height);
         wl_surface.commit();
         log::info!("decoration: drew {toplevel_id:?} at {width}x{height}");
+    }
+
+    /// Opens the window menu for `toplevel_id`'s decoration, replacing any
+    /// other one already open. A subsurface of the decoration's own
+    /// surface, positioned just below the header.
+    fn open_window_menu(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId) {
+        self.close_window_menu();
+
+        let Some(dec_surface) = self
+            .toplevels
+            .get(toplevel_id)
+            .and_then(|info| info.decoration.as_ref())
+            .map(|dec| dec.surface.clone())
+        else {
+            return;
+        };
+
+        let label_width = |label: &str| -> i32 {
+            label
+                .chars()
+                .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
+                .sum()
+        };
+        let max_width = WINDOW_MENU_ITEMS.iter().map(|item| label_width(item.label)).max().unwrap_or(0);
+        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
+
+        let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface, qh);
+        subsurface.set_position(0, DECORATION_HEIGHT as i32);
+        // Desync so the menu's own commits apply immediately rather than
+        // waiting on the header's next commit -- every other surface here
+        // behaves that way too, and there's no reason this one shouldn't.
+        subsurface.set_desync();
+
+        self.window_menu =
+            Some(WindowMenu { toplevel_id: toplevel_id.clone(), subsurface, surface, width, height, hovered: None });
+        self.draw_window_menu();
+    }
+
+    fn close_window_menu(&mut self) {
+        if let Some(wm) = self.window_menu.take() {
+            wm.subsurface.destroy();
+            wm.surface.destroy();
+        }
+    }
+
+    fn draw_window_menu(&mut self) {
+        let Some(wm) = self.window_menu.as_ref() else {
+            return;
+        };
+        let width = wm.width as i32;
+        let height = wm.height as i32;
+        let stride = width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+
+        let (r, g, b) = MENU_BG_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+
+        for (i, item) in WINDOW_MENU_ITEMS.iter().enumerate() {
+            let row_y0 = i as i32 * MENU_ROW_HEIGHT;
+            if !item.disabled && wm.hovered == Some(i) {
+                let (hr, hg, hb) = MENU_HOVER_COLOR;
+                for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
+                    for x in 0..width {
+                        let idx = ((y * width + x) * 4) as usize;
+                        canvas[idx] = hb;
+                        canvas[idx + 1] = hg;
+                        canvas[idx + 2] = hr;
+                        canvas[idx + 3] = 0xFF;
+                    }
+                }
+            }
+            let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
+            draw_text_row_centered(
+                canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                item.label, &self.font, MENU_FONT_SIZE, color,
+            );
+        }
+
+        let wl_surface = &wm.surface;
+        buffer.attach_to(wl_surface).expect("failed to attach buffer");
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
     }
 
     /// Opens the root menu at `(x, y)` (surface-local coordinates on the
@@ -1046,6 +1211,18 @@ impl PointerHandler for Olshell {
                 .as_ref()
                 .is_some_and(|p| event.surface == *p.layer.wl_surface());
             let decoration_toplevel = self.decoration_toplevel_id(&event.surface);
+            let on_window_menu =
+                self.window_menu.as_ref().is_some_and(|wm| event.surface == wm.surface);
+
+            // No keyboard focus on the window menu yet (see WindowMenu's
+            // doc comment), so a press anywhere else is how it closes --
+            // handled up front so it applies regardless of what else that
+            // press goes on to do below (e.g. opening a different one).
+            if let PointerEventKind::Press { .. } = event.kind {
+                if self.window_menu.is_some() && !on_window_menu {
+                    self.close_window_menu();
+                }
+            }
 
             match event.kind {
                 PointerEventKind::Press { button, .. } if on_background && button == BTN_RIGHT => {
@@ -1084,11 +1261,7 @@ impl PointerHandler for Olshell {
                         .and_then(|info| info.decoration.as_ref())
                         .is_some_and(|dec| dec.is_on_button(event.position.0, event.position.1));
                     if on_button {
-                        // The window menu (Close, Full Size, Move, Resize,
-                        // ...) this button is meant to open isn't
-                        // interactive yet -- follow-up work, same as the
-                        // root menu's submenus.
-                        log::info!("window menu: not yet interactive");
+                        self.open_window_menu(qh, &id);
                     } else if let Some(dec) =
                         self.toplevels.get(&id).and_then(|info| info.decoration.as_ref())
                     {
@@ -1096,6 +1269,76 @@ impl PointerHandler for Olshell {
                         // window, same as a real title bar.
                         dec.object._move();
                     }
+                }
+                PointerEventKind::Motion { .. } if on_window_menu => {
+                    let changed = if let Some(wm) = self.window_menu.as_mut() {
+                        let hovered = wm
+                            .item_at(event.position.1)
+                            .filter(|&i| !WINDOW_MENU_ITEMS[i].disabled);
+                        if wm.hovered != hovered {
+                            wm.hovered = hovered;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if changed {
+                        self.draw_window_menu();
+                    }
+                }
+                PointerEventKind::Leave { .. } if on_window_menu => {
+                    let had_hover = self.window_menu.as_ref().is_some_and(|wm| wm.hovered.is_some());
+                    if had_hover {
+                        if let Some(wm) = self.window_menu.as_mut() {
+                            wm.hovered = None;
+                        }
+                        self.draw_window_menu();
+                    }
+                }
+                PointerEventKind::Press { button, .. } if on_window_menu && button == BTN_LEFT => {
+                    let selection = self.window_menu.as_ref().and_then(|wm| {
+                        wm.item_at(event.position.1).map(|index| (wm.toplevel_id.clone(), index))
+                    });
+                    if let Some((toplevel_id, index)) = selection {
+                        let item = &WINDOW_MENU_ITEMS[index];
+                        if !item.disabled {
+                            match item.action {
+                                WindowMenuAction::Close => {
+                                    if let Some(handle) =
+                                        self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref())
+                                    {
+                                        handle.close();
+                                    }
+                                }
+                                WindowMenuAction::ToggleMaximize => {
+                                    if let Some(info) = self.toplevels.get(&toplevel_id) {
+                                        if let Some(handle) = info.handle.as_ref() {
+                                            if info.states.contains(&0) {
+                                                handle.unset_maximized();
+                                            } else {
+                                                handle.set_maximized();
+                                            }
+                                        }
+                                    }
+                                }
+                                WindowMenuAction::Move => {
+                                    if let Some(dec) = self
+                                        .toplevels
+                                        .get(&toplevel_id)
+                                        .and_then(|i| i.decoration.as_ref())
+                                    {
+                                        dec.object._move();
+                                    }
+                                }
+                                WindowMenuAction::Unimplemented => {
+                                    log::info!("window menu: {} not yet implemented", item.label);
+                                }
+                            }
+                        }
+                    }
+                    self.close_window_menu();
                 }
                 PointerEventKind::Motion { .. } if on_popup => {
                     let popup = self.popup.as_mut().unwrap();
@@ -1235,6 +1478,7 @@ delegate_pointer!(Olshell);
 delegate_keyboard!(Olshell);
 delegate_layer!(Olshell);
 delegate_registry!(Olshell);
+delegate_subcompositor!(Olshell);
 
 // Neither wlr-foreign-toplevel-management nor openlook-workspaces are
 // sctk-integrated protocols, so these are plain wayland-client Dispatch
@@ -1301,6 +1545,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                 state.draw_decoration(&proxy.id());
             }
             Event::Closed => {
+                if state.window_menu.as_ref().is_some_and(|wm| wm.toplevel_id == proxy.id()) {
+                    state.close_window_menu();
+                }
                 if let Some(mut info) = state.toplevels.remove(&proxy.id()) {
                     if let Some(dec) = info.decoration.take() {
                         dec.object.destroy();
@@ -1353,6 +1600,9 @@ impl Dispatch<ZopenlookDecorationV1, ObjectId> for Olshell {
                 state.draw_decoration(toplevel_id);
             }
             Event::Closed => {
+                if state.window_menu.as_ref().is_some_and(|wm| &wm.toplevel_id == toplevel_id) {
+                    state.close_window_menu();
+                }
                 if let Some(dec) =
                     state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.take())
                 {

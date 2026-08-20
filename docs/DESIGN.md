@@ -112,11 +112,20 @@ with wlroots compositors generally, not just this project.
   olshell attach a header (title bar) surface to any toplevel it can see
   via wlr-foreign-toplevel-management, positioned/stacked by olcore so it
   moves and raises with the window it belongs to. olshell draws a header
-  with a window-menu button and centered title for every toplevel. Not yet
-  done: the window menu the button is meant to open (Close, Full Size,
-  Move, Resize, ...) isn't interactive yet -- clicking it just logs, same
-  as the root menu's non-interactive submenus -- and there's no footer or
-  resize-corner chrome yet either.
+  with a window-menu button and centered title for every toplevel, and
+  dragging the header (outside the button) moves the window via a `move`
+  request on the decoration protocol. Clicking the button now opens the
+  window menu too -- a `wl_subsurface` of the header (both are
+  olshell-owned surfaces, so this needed no protocol extension, unlike the
+  header itself) listing the full 9-item reference set. `Close`, `Full
+  Size`, and `Move` are wired to real actions (close/set_maximized via
+  wlr-foreign-toplevel-management, and the same move request the header
+  drag uses); the rest (`Resize`, `Properties` -- shown disabled, `Back`,
+  `Refresh`, `Stick`, `Quit`) log a placeholder on click, same as the root
+  menu's non-interactive submenus. No keyboard focus on the window menu
+  yet, so only click-elsewhere closes it, not Escape -- follow-up, same as
+  Escape support was for the root menu. Still no footer or resize-corner
+  chrome.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
