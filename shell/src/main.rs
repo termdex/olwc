@@ -109,10 +109,23 @@ use menu::{Menu, MenuNode};
 
 const PANEL_HEIGHT: u32 = 28;
 const PANEL_FONT_SIZE: f32 = 20.0;
-const PANEL_ENTRY_GAP: i32 = 20;
 const PANEL_TEXT_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
+const PANEL_BG_COLOR: (u8, u8, u8) = (0xBE, 0xBE, 0xBE);
 
 const BACKGROUND_COLOR: (u8, u8, u8) = (0x5A, 0x76, 0x8C);
+
+// Workspace switcher strip, drawn at the panel's left edge. No OPEN LOOK
+// reference exists for this specifically -- docs/DESIGN.md's non-goals
+// deliberately replace olvwm's pannable Virtual Desktop Manager with
+// discrete, linear workspaces instead of reproducing it, so there's no
+// authentic look to match here, just a plain numbered segmented strip.
+// The active segment is filled with BACKGROUND_COLOR -- the same color as
+// the desktop it represents, a deliberate visual tie-in rather than a new
+// color pick.
+const WORKSPACE_SEGMENT_WIDTH: i32 = 32;
+const WORKSPACE_STRIP_MARGIN: i32 = 6;
+const WORKSPACE_SEGMENT_GAP: i32 = 2;
+const WORKSPACE_ACTIVE_TEXT_COLOR: (u8, u8, u8) = (0xF0, 0xF0, 0xF0);
 
 const MENU_FONT_SIZE: f32 = 18.0;
 const MENU_ROW_HEIGHT: i32 = 26;
@@ -429,6 +442,7 @@ fn main() {
         keyboard: None,
         popup: None,
         window_menu: None,
+        hovered_workspace: None,
     };
 
     while !state.exit {
@@ -452,11 +466,10 @@ struct Olshell {
     bg_width: u32,
     bg_height: u32,
     exit: bool,
-    // Kept only to hold the binding alive; requests aren't sent yet, so
-    // nothing reads these beyond the Option check at startup.
+    // Kept only to hold the binding alive; no requests are sent on this
+    // one, so nothing reads it beyond the Option check at startup.
     #[allow(dead_code)]
     foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
-    #[allow(dead_code)]
     workspaces_manager: Option<ZopenlookWorkspacesManagerV1>,
     decoration_manager: Option<ZopenlookDecorationManagerV1>,
     toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
@@ -468,6 +481,7 @@ struct Olshell {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     popup: Option<MenuPopup>,
     window_menu: Option<WindowMenu>,
+    hovered_workspace: Option<u32>,
 }
 
 impl Olshell {
@@ -487,31 +501,35 @@ impl Olshell {
             .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
-        // OpenLook-style neutral slate panel fill, opaque.
+        let (r, g, b) = PANEL_BG_COLOR;
         for pixel in canvas.chunks_exact_mut(4) {
-            pixel[0] = 0xBE; // B
-            pixel[1] = 0xBE; // G
-            pixel[2] = 0xBE; // R
-            pixel[3] = 0xFF; // A
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
         }
 
-        // Flat list of every mapped toplevel's title, left to right. No
-        // workspace filtering, wrapping, or scrolling yet -- entries past
-        // the panel's width are simply clipped.
-        let mut x = 8;
-        let mut titles: Vec<&str> = self
-            .toplevels
-            .values()
-            .map(|info| info.title.as_str())
-            .filter(|title| !title.is_empty())
-            .collect();
-        titles.sort_unstable();
-        for title in titles {
-            if x >= width {
+        for i in 0..self.workspace_count {
+            let (x0, x1) = workspace_segment_x(i);
+            if x0 >= width {
                 break;
             }
-            x = draw_text(canvas, width, height, x, title, &self.font, PANEL_FONT_SIZE, PANEL_TEXT_COLOR);
-            x += PANEL_ENTRY_GAP;
+            let active = i == self.active_workspace;
+            let hovered = self.hovered_workspace == Some(i);
+            let (fill, text_color) = if active {
+                (BACKGROUND_COLOR, WORKSPACE_ACTIVE_TEXT_COLOR)
+            } else if hovered {
+                (MENU_HOVER_COLOR, PANEL_TEXT_COLOR)
+            } else {
+                ((0xAA, 0xAA, 0xA2), PANEL_TEXT_COLOR)
+            };
+            fill_rect(canvas, width, height, x0, 2, x1.min(width), height - 2, fill);
+
+            let label = (i + 1).to_string();
+            let label_width: i32 =
+                label.chars().map(|c| self.font.metrics(c, PANEL_FONT_SIZE).advance_width.round() as i32).sum();
+            let label_x = x0 + ((x1 - x0) - label_width) / 2;
+            draw_text_row_centered(canvas, width, 0, height, label_x, &label, &self.font, PANEL_FONT_SIZE, text_color);
         }
 
         let wl_surface = self.layer.wl_surface();
@@ -798,6 +816,15 @@ impl Olshell {
         })
     }
 
+    /// Workspace index (0-based) the panel-local `x` falls on, if any.
+    fn workspace_at(&self, x: f64) -> Option<u32> {
+        let x = x as i32;
+        (0..self.workspace_count).find(|&i| {
+            let (x0, x1) = workspace_segment_x(i);
+            x >= x0 && x < x1
+        })
+    }
+
     /// Runs a popup menu item's command via `sh -c`, detached. The spawned
     /// child is reaped on a background thread so it doesn't linger as a
     /// zombie for the rest of olshell's (long) lifetime.
@@ -874,23 +901,6 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
     popup.layer.commit();
 }
 
-/// Rasterizes `text` starting at `start_x`, vertically centered in a canvas
-/// of the given height, alpha-blended over whatever's already there.
-/// Returns the x position just past the last glyph drawn.
-fn draw_text(
-    canvas: &mut [u8],
-    canvas_width: i32,
-    canvas_height: i32,
-    start_x: i32,
-    text: &str,
-    font: &fontdue::Font,
-    size: f32,
-    color: (u8, u8, u8),
-) -> i32 {
-    let baseline_y = canvas_height / 2 + (size as i32) / 3;
-    draw_text_at(canvas, canvas_width, canvas_height, start_x, baseline_y, text, font, size, color)
-}
-
 /// Draws `text` with its baseline at `baseline_y`, rather than centered in
 /// the whole canvas -- e.g. for centering within a single menu row.
 fn draw_text_row_centered(
@@ -959,6 +969,14 @@ fn paint_row(canvas: &mut [u8], canvas_width: i32, y: i32, color: (u8, u8, u8)) 
         canvas[idx + 2] = r;
         canvas[idx + 3] = 0xFF;
     }
+}
+
+/// Panel-local (x0, x1) span of workspace segment `index` (0-based). Shared
+/// by drawing and hit-testing so they can never disagree about where a
+/// segment actually is.
+fn workspace_segment_x(index: u32) -> (i32, i32) {
+    let x0 = WORKSPACE_STRIP_MARGIN + index as i32 * WORKSPACE_SEGMENT_WIDTH;
+    (x0, x0 + WORKSPACE_SEGMENT_WIDTH - WORKSPACE_SEGMENT_GAP)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1236,6 +1254,7 @@ impl PointerHandler for Olshell {
     ) {
         for event in events {
             let on_background = event.surface == *self.background.wl_surface();
+            let on_panel = event.surface == *self.layer.wl_surface();
             let on_popup = self
                 .popup
                 .as_ref()
@@ -1264,6 +1283,25 @@ impl PointerHandler for Olshell {
             match event.kind {
                 PointerEventKind::Press { button, .. } if on_background && button == BTN_RIGHT => {
                     self.open_menu(qh, event.position.0, event.position.1);
+                }
+                PointerEventKind::Motion { .. } if on_panel => {
+                    let hovered = self.workspace_at(event.position.0);
+                    if self.hovered_workspace != hovered {
+                        self.hovered_workspace = hovered;
+                        self.draw_panel();
+                    }
+                }
+                PointerEventKind::Leave { .. } if on_panel => {
+                    if self.hovered_workspace.take().is_some() {
+                        self.draw_panel();
+                    }
+                }
+                PointerEventKind::Press { button, .. } if on_panel && button == BTN_LEFT => {
+                    if let Some(index) = self.workspace_at(event.position.0) {
+                        if let Some(manager) = self.workspaces_manager.as_ref() {
+                            manager.switch_to(index);
+                        }
+                    }
                 }
                 PointerEventKind::Motion { .. } if decoration_toplevel.is_some() => {
                     let id = decoration_toplevel.unwrap();
@@ -1707,10 +1745,12 @@ impl Dispatch<ZopenlookWorkspacesManagerV1, ()> for Olshell {
             Event::WorkspaceCount { count } => {
                 state.workspace_count = count;
                 log::info!("workspaces: {count} available");
+                state.draw_panel();
             }
             Event::ActiveChanged { index } => {
                 state.active_workspace = index;
                 log::info!("workspaces: active = {index}");
+                state.draw_panel();
             }
             Event::ToplevelWorkspace { toplevel, index } => {
                 let title = state.toplevels.get(&toplevel.id()).map(|i| i.title.clone());

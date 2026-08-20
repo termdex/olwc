@@ -171,6 +171,12 @@ struct olc_toplevel {
 	struct wl_listener foreign_request_fullscreen;
 	struct wl_listener foreign_request_close;
 	uint32_t workspace_index;
+	// Tracked so update_toplevel_visibility() can combine it with workspace
+	// membership -- minimize and workspace-switching are two independent
+	// reasons a toplevel might need to be hidden, and applying one must
+	// not clobber the other (e.g. switching to a minimized window's
+	// workspace shouldn't un-minimize it).
+	bool minimized;
 
 	// openlook-decoration: at most one header decoration, requested by
 	// olshell. NULL until olshell asks for one; see get_decoration.
@@ -238,6 +244,17 @@ struct olc_keyboard {
 static struct olc_toplevel *olc_toplevel_from_xdg_toplevel(struct wlr_xdg_toplevel *xdg_toplevel) {
 	struct wlr_scene_tree *tree = xdg_toplevel->base->data;
 	return tree->node.data;
+}
+
+// A toplevel is visible iff it's not minimized AND it's on the active
+// workspace -- two independent reasons to be hidden, combined here so
+// setting one doesn't accidentally clobber the other. The decoration
+// header is a child of scene_tree, so disabling the toplevel already
+// takes it along for free.
+static void update_toplevel_visibility(struct olc_toplevel *toplevel) {
+	bool visible = !toplevel->minimized &&
+		toplevel->workspace_index == toplevel->server->active_workspace;
+	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, visible);
 }
 
 static void focus_toplevel(struct olc_toplevel *toplevel) {
@@ -822,7 +839,8 @@ static void toplevel_handle_request_minimize(struct wl_listener *listener, void 
 	struct olc_toplevel *toplevel =
 		wl_container_of(listener, toplevel, foreign_request_minimize);
 	struct wlr_foreign_toplevel_handle_v1_minimized_event *event = data;
-	wlr_scene_node_set_enabled(&toplevel->scene_tree->node, !event->minimized);
+	toplevel->minimized = event->minimized;
+	update_toplevel_visibility(toplevel);
 	wlr_foreign_toplevel_handle_v1_set_minimized(toplevel->foreign_handle, event->minimized);
 }
 
@@ -1169,6 +1187,37 @@ static void workspaces_manager_handle_switch_to(
 		return;
 	}
 	server->active_workspace = index;
+
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		update_toplevel_visibility(toplevel);
+	}
+
+	// If whatever had keyboard focus just got hidden, it shouldn't keep
+	// receiving keystrokes for a window the user can no longer see.
+	// server->toplevels is kept most-recently-focused-first (see
+	// focus_toplevel), so the first visible entry on the new workspace is
+	// a reasonable "return to where you left off" choice; if there isn't
+	// one, just drop focus instead of leaving it on a hidden window.
+	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
+	struct wlr_xdg_toplevel *focused_xdg_toplevel =
+		focused ? wlr_xdg_toplevel_try_from_wlr_surface(focused) : NULL;
+	struct olc_toplevel *focused_toplevel =
+		focused_xdg_toplevel ? olc_toplevel_from_xdg_toplevel(focused_xdg_toplevel) : NULL;
+	if (focused_toplevel == NULL || focused_toplevel->workspace_index != server->active_workspace ||
+			focused_toplevel->minimized) {
+		bool refocused = false;
+		wl_list_for_each(toplevel, &server->toplevels, link) {
+			if (toplevel->workspace_index == server->active_workspace && !toplevel->minimized) {
+				focus_toplevel(toplevel);
+				refocused = true;
+				break;
+			}
+		}
+		if (!refocused) {
+			wlr_seat_keyboard_notify_clear_focus(server->seat);
+		}
+	}
 
 	struct olc_workspaces_resource *other;
 	wl_list_for_each(other, &server->workspace_resources, link) {

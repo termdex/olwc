@@ -147,22 +147,23 @@ with wlroots compositors generally, not just this project.
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
   workspaces vs. shared).
-- Workspace switching has no visual effect yet: `workspaces_manager_
-  handle_switch_to` (`core/main.c`) only updates `active_workspace` and
-  notifies clients -- nothing hides or shows toplevels based on which
-  workspace they're assigned to, so every window is currently visible
-  regardless of the active workspace. Discovered while scoping the window
-  menu's `Stick` item, which is meaningless without this: there's nothing
-  to exempt a "stuck" window from yet. Real per-workspace show/hide in
-  olcore is a prerequisite for `Stick` and naturally pairs with building
-  the workspace switcher strip (see the panel bullet below).
-- The desktop-wide panel's toplevel-title list (`shell/src/main.rs`'s
-  `draw_panel`) predates the OPEN LOOK reference research and is now both
-  redundant (window decorations show titles per-window) and itself the
-  kind of taskbar convention `docs/OPENLOOK-REFERENCE.md` flags as *not*
-  authentic OPEN LOOK. Decided: leave it as-is for now and revisit
-  together with building the workspace switcher strip the panel was
-  originally meant to host, rather than changing it twice.
+- ~~Workspace switching has no visual effect~~ / ~~panel toplevel-title
+  list~~ resolved together, as planned: `workspaces_manager_handle_switch_to`
+  (`core/main.c`) now actually hides/shows toplevels via a shared
+  `update_toplevel_visibility()` helper (a toplevel is visible iff it's
+  on the active workspace *and* not minimized -- the two are independent
+  reasons to be hidden and must combine rather than clobber each other),
+  and refocuses to the most-recently-used visible toplevel on the new
+  workspace (or clears focus if none) so keystrokes don't keep going to a
+  window that just disappeared. The panel's old toplevel-title list is
+  replaced with a workspace switcher strip (`draw_panel` in
+  `shell/src/main.rs`): one numbered segment per workspace, active one
+  filled with `BACKGROUND_COLOR` as a visual tie to the desktop it
+  represents, SELECT-click switches. No reference exists for this
+  specifically -- the non-goals above already replace olvwm's VDM pager
+  with plain discrete workspaces, so there's nothing authentic to match,
+  just a plain segmented strip. `Stick` (the window menu's remaining
+  placeholder) can now be implemented for real against this.
 - Theming flexibility: later on, users may want to choose between a
   "pure" original-OPEN-LOOK visual style and the more Sun-ified look
   seen in later desktops built on it (see the taskbar/icon convention
