@@ -1302,8 +1302,10 @@ impl PointerHandler for Olshell {
                         self.toplevels.get(&id).and_then(|info| info.decoration.as_ref())
                     {
                         // A press anywhere else on the header drags the
-                        // window, same as a real title bar.
-                        dec.object._move();
+                        // window, same as a real title bar. held=1: this
+                        // fires from the press itself, so the button is
+                        // still down -- the move ends when it's released.
+                        dec.object._move(1);
                     }
                 }
                 PointerEventKind::Motion { .. } if on_window_menu => {
@@ -1365,7 +1367,12 @@ impl PointerHandler for Olshell {
                                         .get(&toplevel_id)
                                         .and_then(|i| i.decoration.as_ref())
                                     {
-                                        dec.object._move();
+                                        // held=0: this is a discrete menu
+                                        // click, not a held drag -- see
+                                        // the protocol doc comment on why
+                                        // that has to be asserted rather
+                                        // than inferred by olcore.
+                                        dec.object._move(0);
                                     }
                                 }
                                 WindowMenuAction::Resize => {
@@ -1374,7 +1381,7 @@ impl PointerHandler for Olshell {
                                         .get(&toplevel_id)
                                         .and_then(|i| i.decoration.as_ref())
                                     {
-                                        dec.object.resize(EDGE_BOTTOM | EDGE_RIGHT);
+                                        dec.object.resize(EDGE_BOTTOM | EDGE_RIGHT, 0);
                                     }
                                 }
                                 WindowMenuAction::Unimplemented => {

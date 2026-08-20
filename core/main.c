@@ -1004,21 +1004,33 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 // case, and decoration_handle_move for the header-drag case, which can't
 // use that guard since the pointer is focused on the header's own surface,
 // not the toplevel's).
-static void start_move_grab(struct olc_toplevel *toplevel) {
+//
+// held: whether the grab's triggering button is still down, so the grab
+// should end when it's released (a drag) -- vs. already gone by the time
+// this runs, so the grab should instead end on the next fresh press
+// (click-to-arm/click-to-confirm; see decoration_handle_move/resize).
+// Deliberately a caller-supplied fact, not inferred from current input
+// state here: checking seat->pointer_state.button_count at this point
+// turned out to unconditionally read "held", live-tested, regardless of
+// which gesture actually happened -- the IPC round-trip for a
+// menu-triggered request is evidently not reliably slower than a human
+// click's press-to-release gap, so that signal doesn't distinguish the
+// two cases it needs to.
+static void start_move_grab(struct olc_toplevel *toplevel, bool held) {
 	struct olc_server *server = toplevel->server;
 	server->grabbed_toplevel = toplevel;
 	server->cursor_mode = OLC_CURSOR_MOVE;
-	server->cursor_end_on_press = server->seat->pointer_state.button_count == 0;
+	server->cursor_end_on_press = !held;
 	server->grab_x = server->cursor->x - toplevel->scene_tree->node.x;
 	server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
 }
 
 // Mirrors start_move_grab above, for the resize case -- see its comment.
-static void start_resize_grab(struct olc_toplevel *toplevel, uint32_t edges) {
+static void start_resize_grab(struct olc_toplevel *toplevel, uint32_t edges, bool held) {
 	struct olc_server *server = toplevel->server;
 	server->grabbed_toplevel = toplevel;
 	server->cursor_mode = OLC_CURSOR_RESIZE;
-	server->cursor_end_on_press = server->seat->pointer_state.button_count == 0;
+	server->cursor_end_on_press = !held;
 	struct wlr_box geo_box = toplevel->xdg_toplevel->base->geometry;
 
 	double border_x = (toplevel->scene_tree->node.x + geo_box.x) +
@@ -1044,10 +1056,13 @@ static void begin_interactive(struct olc_toplevel *toplevel,
 		return;
 	}
 
+	// This path is always client-initiated (the client's own xdg_toplevel
+	// requested it), which per xdg-shell only makes sense in response to a
+	// still-held button -- there's no click-to-arm concept here.
 	if (mode == OLC_CURSOR_MOVE) {
-		start_move_grab(toplevel);
+		start_move_grab(toplevel, true);
 	} else {
-		start_resize_grab(toplevel, edges);
+		start_resize_grab(toplevel, edges, true);
 	}
 }
 
@@ -1288,23 +1303,24 @@ static void decoration_handle_destroy(struct wl_client *client, struct wl_resour
 	wl_resource_destroy(resource);
 }
 
-static void decoration_handle_move(struct wl_client *client, struct wl_resource *resource) {
+static void decoration_handle_move(
+		struct wl_client *client, struct wl_resource *resource, uint32_t held) {
 	(void)client;
 	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
 	if (decoration == NULL || decoration->toplevel == NULL) {
 		return;
 	}
-	start_move_grab(decoration->toplevel);
+	start_move_grab(decoration->toplevel, held != 0);
 }
 
-static void decoration_handle_resize(
-		struct wl_client *client, struct wl_resource *resource, uint32_t edges) {
+static void decoration_handle_resize(struct wl_client *client, struct wl_resource *resource,
+		uint32_t edges, uint32_t held) {
 	(void)client;
 	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
 	if (decoration == NULL || decoration->toplevel == NULL) {
 		return;
 	}
-	start_resize_grab(decoration->toplevel, edges);
+	start_resize_grab(decoration->toplevel, edges, held != 0);
 }
 
 static const struct zopenlook_decoration_v1_interface decoration_impl = {

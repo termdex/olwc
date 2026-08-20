@@ -100,25 +100,41 @@
     <request name="move">
       <description summary="begin an interactive move of the decorated toplevel">
         Tells olcore to start moving the decorated toplevel, following the
-        pointer until release -- the same interactive move a client can
-        normally only trigger on its own xdg_toplevel, exposed here so
-        dragging the header (which belongs to olshell, not the toplevel's
-        own client) can trigger it too. Expected to be sent right after a
-        pointer press on the header outside the window-menu button.
+        pointer -- the same interactive move a client can normally only
+        trigger on its own xdg_toplevel, exposed here so olshell can
+        trigger it too (on behalf of a toplevel it doesn't own) from two
+        different gestures: dragging the header directly, and the window
+        menu's Move item.
+
+        Those two gestures end differently, which held says which: a
+        header drag is still holding its triggering button down when this
+        is sent, so the move should end when that button is released,
+        like a normal drag (held = 1). The window menu's Move item is a
+        discrete click -- by the time olshell has processed the click and
+        sent this request, that button is already gone, so there's
+        nothing to release; the move instead ends on the *next* fresh
+        press anywhere, click-to-arm/click-to-confirm style (held = 0).
+
+        olcore can't reliably infer this itself: whether the triggering
+        button still reads as held by the time this request is processed
+        depends on IPC scheduling, not on which gesture actually happened
+        (confirmed live -- it read "held" for both).
       </description>
+      <arg name="held" type="uint" summary="1 if the triggering button is still held, 0 otherwise"/>
     </request>
 
     <request name="resize">
       <description summary="begin an interactive resize of the decorated toplevel">
         Tells olcore to start resizing the decorated toplevel from the
-        given edge or corner, following the pointer until release -- the
-        same interactive resize a client can normally only trigger on its
-        own xdg_toplevel, exposed here for the same reason move is. edges
-        is a bitmask of the edge enum below; olshell has no resize-corner
-        chrome yet, so its only caller (the window menu's Resize item)
-        always passes bottom|right.
+        given edge or corner -- the same interactive resize a client can
+        normally only trigger on its own xdg_toplevel, exposed here for
+        the same reason move is. edges is a bitmask of the edge enum
+        below; olshell has no resize-corner chrome yet, so its only
+        caller (the window menu's Resize item) always passes bottom|right.
+        held has the same meaning and rationale as move's held argument.
       </description>
       <arg name="edges" type="uint" summary="bitmask of edge.{top,bottom,left,right}"/>
+      <arg name="held" type="uint" summary="1 if the triggering button is still held, 0 otherwise"/>
     </request>
 
     <enum name="edge">
