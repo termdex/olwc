@@ -994,6 +994,8 @@ static void xdg_toplevel_destroy(struct wl_listener *listener, void *data) {
 	wl_list_remove(&toplevel->request_resize.link);
 	wl_list_remove(&toplevel->request_maximize.link);
 	wl_list_remove(&toplevel->request_fullscreen.link);
+	wl_list_remove(&toplevel->set_title.link);
+	wl_list_remove(&toplevel->set_app_id.link);
 	free(toplevel);
 }
 
