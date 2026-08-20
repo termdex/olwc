@@ -639,7 +639,7 @@ impl Olshell {
         let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
         let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
-        let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface, qh);
+        let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface.clone(), qh);
         subsurface.set_position(0, DECORATION_HEIGHT as i32);
         // Desync so the menu's own commits apply immediately rather than
         // waiting on the header's next commit -- every other surface here
@@ -649,6 +649,15 @@ impl Olshell {
         self.window_menu =
             Some(WindowMenu { toplevel_id: toplevel_id.clone(), subsurface, surface, width, height, hovered: None });
         self.draw_window_menu();
+
+        // A newly-created subsurface doesn't actually show up until its
+        // parent commits at least once *after* the subsurface relationship
+        // is established, even in desync mode -- confirmed live: the menu
+        // was positioned and hit-testable immediately (a second button
+        // click toggled it closed correctly) but stayed invisible until
+        // something else, e.g. pointer motion over it, indirectly caused a
+        // repaint. No new content, just the nudge.
+        dec_surface.commit();
     }
 
     fn close_window_menu(&mut self) {
