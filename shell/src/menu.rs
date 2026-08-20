@@ -42,10 +42,23 @@ pub struct Menu {
 
 impl Menu {
     fn default_menu() -> Menu {
+        // konsole, not xterm: olwc has no Xwayland support, so an X11 app
+        // like xterm can never launch here regardless of whether it's
+        // installed -- it would just fail silently inside the spawned
+        // shell, with nothing to show for it. This is only a fallback for
+        // when no .openwin-menu config exists; real setups should have one
+        // pointing at whatever terminal is actually installed.
+        //
+        // --separate: without it, KDE's single-instance activation can
+        // hand off to an *existing* Konsole process (e.g. one on a host
+        // desktop olcore is nested inside for testing) instead of opening
+        // a window here -- but a window manager's "launch a terminal"
+        // action should always open a fresh window regardless of
+        // environment, so this is the right default even outside testing.
         Menu {
             title: Some("olwc".to_string()),
             items: vec![
-                MenuNode::Item { label: "Terminal".into(), command: "xterm".into() },
+                MenuNode::Item { label: "Terminal".into(), command: "konsole --separate".into() },
                 MenuNode::Item { label: "Refresh".into(), command: "true".into() },
             ],
         }
