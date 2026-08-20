@@ -166,6 +166,7 @@ enum WindowMenuAction {
     ToggleMaximize,
     Move,
     Resize,
+    Lower,
     /// Not wired up yet -- logs a placeholder, same as the root menu's
     /// non-interactive submenus.
     Unimplemented,
@@ -177,20 +178,23 @@ struct WindowMenuItem {
     disabled: bool,
 }
 
-// The full 9-item list from docs/OPENLOOK-REFERENCE.md's window menu
-// section. Only Close, Full Size, Move, and Resize are wired to real
-// actions so far -- Move and Resize reuse the same interactive grabs the
-// header drag gesture and (eventually) resize-corner handles trigger.
-// Properties is disabled to match the reference screenshot (shown grayed
-// out there too).
+// Reference list from docs/OPENLOOK-REFERENCE.md's window menu section,
+// minus Refresh: that item exists to force a repaint of a stale X11
+// window, a class of bug Wayland's damage-tracking model makes
+// structurally impossible, so there's nothing for it to do here -- dropped
+// rather than kept as a dead placeholder. Close, Full Size, Move, Resize,
+// and Back are wired to real actions; Move/Resize reuse the same
+// interactive grabs the header drag gesture and (eventually) resize-corner
+// handles trigger, and Back reuses the same "lower to bottom" olcore
+// exposes. Properties is disabled to match the reference screenshot (shown
+// grayed out there too).
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Close", action: WindowMenuAction::Close, disabled: false },
     WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
     WindowMenuItem { label: "Move", action: WindowMenuAction::Move, disabled: false },
     WindowMenuItem { label: "Resize", action: WindowMenuAction::Resize, disabled: false },
     WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
-    WindowMenuItem { label: "Back", action: WindowMenuAction::Unimplemented, disabled: false },
-    WindowMenuItem { label: "Refresh", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Back", action: WindowMenuAction::Lower, disabled: false },
     WindowMenuItem { label: "Stick", action: WindowMenuAction::Unimplemented, disabled: false },
     WindowMenuItem { label: "Quit", action: WindowMenuAction::Unimplemented, disabled: false },
 ];
@@ -1382,6 +1386,15 @@ impl PointerHandler for Olshell {
                                         .and_then(|i| i.decoration.as_ref())
                                     {
                                         dec.object.resize(EDGE_BOTTOM | EDGE_RIGHT, 0);
+                                    }
+                                }
+                                WindowMenuAction::Lower => {
+                                    if let Some(dec) = self
+                                        .toplevels
+                                        .get(&toplevel_id)
+                                        .and_then(|i| i.decoration.as_ref())
+                                    {
+                                        dec.object.lower();
                                     }
                                 }
                                 WindowMenuAction::Unimplemented => {

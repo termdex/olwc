@@ -117,15 +117,23 @@ with wlroots compositors generally, not just this project.
   request on the decoration protocol. Clicking the button now opens the
   window menu too -- a `wl_subsurface` of the header (both are
   olshell-owned surfaces, so this needed no protocol extension, unlike the
-  header itself) listing the full 9-item reference set. `Close`, `Full
-  Size`, `Move`, and `Resize` are wired to real actions (close/set_maximized
-  via wlr-foreign-toplevel-management, and a `move`/`resize` request pair on
-  the decoration protocol mirroring xdg_toplevel's own move/resize --
-  `resize` always passes bottom|right since there's no resize-corner chrome
-  yet to pick a different edge from); the rest (`Properties` -- shown
-  disabled, `Back`, `Refresh`, `Stick`, `Quit`) log a placeholder on click,
-  same as the root menu's non-interactive submenus. No keyboard focus on
-  the window menu yet, so only click-elsewhere closes it, not Escape --
+  header itself) listing the reference set minus `Refresh` (see
+  `docs/OPENLOOK-REFERENCE.md` -- it exists to work around a class of X11
+  repaint bug Wayland's damage tracking makes structurally impossible, so
+  there's nothing to wire it to; dropped rather than kept as a dead entry).
+  `Close`, `Full Size`, `Move`, `Resize`, and `Back` are wired to real
+  actions: close/set_maximized via wlr-foreign-toplevel-management,
+  `move`/`resize` requests on the decoration protocol mirroring
+  xdg_toplevel's own move/resize (each takes a `held` argument since olcore
+  can't reliably infer whether the triggering button is still down --
+  confirmed live it can't -- so olshell states it explicitly; `resize`
+  additionally always passes bottom|right since there's no resize-corner
+  chrome yet to pick a different edge from), and a `lower` request for
+  `Back` (instant, not a grab -- opposite of the raise-on-focus that
+  already existed). The rest (`Properties` -- shown disabled, `Stick`,
+  `Quit`) log a placeholder on click, same as the root menu's
+  non-interactive submenus. No keyboard focus on the window menu yet, so
+  only click-elsewhere closes it, not Escape --
   follow-up, same as Escape support was for the root menu. Still no footer
   or resize-corner chrome.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible

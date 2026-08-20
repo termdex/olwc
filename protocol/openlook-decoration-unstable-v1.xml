@@ -137,6 +137,13 @@
       <arg name="held" type="uint" summary="1 if the triggering button is still held, 0 otherwise"/>
     </request>
 
+    <request name="lower">
+      <description summary="lower the decorated toplevel to the bottom of the stack">
+        Instant, not a grab -- unlike move/resize there's no pointer
+        tracking involved. The window menu's Back item is the only caller.
+      </description>
+    </request>
+
     <enum name="edge">
       <entry name="top" value="1"/>
       <entry name="bottom" value="2"/>

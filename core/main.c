@@ -1323,11 +1323,30 @@ static void decoration_handle_resize(struct wl_client *client, struct wl_resourc
 	start_resize_grab(decoration->toplevel, edges, held != 0);
 }
 
+// Opposite of focus_toplevel's raise: bottom of the scene stack, and moved
+// to the tail of server->toplevels (focus_toplevel inserts new front) so
+// list-order-dependent fallbacks (e.g. layer_surface_destroy picking a
+// toplevel to refocus) also treat it as least-preferred. Doesn't touch
+// keyboard focus -- lowering a window you're still typing into shouldn't
+// yank focus away from it.
+static void decoration_handle_lower(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
+	if (decoration == NULL || decoration->toplevel == NULL) {
+		return;
+	}
+	struct olc_toplevel *toplevel = decoration->toplevel;
+	wlr_scene_node_lower_to_bottom(&toplevel->scene_tree->node);
+	wl_list_remove(&toplevel->link);
+	wl_list_insert(toplevel->server->toplevels.prev, &toplevel->link);
+}
+
 static const struct zopenlook_decoration_v1_interface decoration_impl = {
 	.ack_configure = decoration_handle_ack_configure,
 	.destroy = decoration_handle_destroy,
 	.move = decoration_handle_move,
 	.resize = decoration_handle_resize,
+	.lower = decoration_handle_lower,
 };
 
 static void decoration_teardown(struct olc_decoration *decoration) {

@@ -99,7 +99,14 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
   dependent), `Back`, `Refresh`, `Stick`, `Quit`. Single column,
   left-aligned labels, no icons except accelerator-key hints
   right-aligned on some entries (e.g. `Close` paired with a `W`-style
-  hint, `Quit` paired with a `⇧Q`-style hint).
+  hint, `Quit` paired with a `⇧Q`-style hint). `olshell`'s
+  implementation drops `Refresh`: it exists to force a repaint of a
+  stale X11 window (a common issue in that era, especially over the
+  network-transparent X11 setups OpenWindows was often used with),
+  which Wayland's damage-tracking model makes structurally impossible
+  -- there's nothing left for it to do, so unlike the still-placeholder
+  items it's omitted rather than kept as a dead menu entry. `Back`
+  (lower the window to the bottom of the stack) is implemented.
 - The item under the pointer (`Close`, in the screenshot) is drawn
   with a distinct pill/oblong outline around it — the same "obround"
   shape language the Visual language section below calls out for
