@@ -215,8 +215,10 @@ impl MenuPopup {
 
     /// Bounding box of the pushpin hit/paint target, within the header row.
     fn pushpin_rect(&self) -> (i32, i32, i32, i32) {
-        let x1 = self.width as i32 - MENU_H_PADDING;
-        let x0 = x1 - PUSHPIN_SIZE;
+        // Top-left, per reference screenshots (screenshots/sunos551-ow1-scr-01.png
+        // and -02.png): the pushpin sits before the title text, not after it.
+        let x0 = MENU_H_PADDING;
+        let x1 = x0 + PUSHPIN_SIZE;
         let y0 = (MENU_ROW_HEIGHT - PUSHPIN_SIZE) / 2;
         (x0, y0, x1, y0 + PUSHPIN_SIZE)
     }
@@ -636,17 +638,17 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
 
     // Header row: always present (the pushpin needs somewhere to live even
     // for a title-less menu), title text drawn only if there is one.
+    let (px0, py0, px1, py1) = popup.pushpin_rect();
     if let Some(title) = &popup.title {
         // draw_text centers in the *whole* canvas height, not just this
         // row -- for a multi-row popup that puts the title text down in
         // the first item's row instead of its own, leaving row 0 blank
         // and garbling whatever's hovered in row 1. Row-centered instead.
         draw_text_row_centered(
-            canvas, width, 0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+            canvas, width, 0, MENU_ROW_HEIGHT, px1 + MENU_H_PADDING,
             title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
         );
     }
-    let (px0, py0, px1, py1) = popup.pushpin_rect();
     let pushpin_color = if popup.pinned { PUSHPIN_PINNED_COLOR } else { PUSHPIN_UNPINNED_COLOR };
     draw_pushpin(canvas, width, height, px0, py0, px1, py1, popup.pinned, pushpin_color);
     let row = popup.header_rows();

@@ -54,6 +54,18 @@ This pairing (transient-by-default, pin-to-persist) is one of the
 most recognizable and reusable OPEN LOOK interaction ideas — a good
 candidate to preserve even under the "spirit, not fidelity" goal.
 
+Three genuine SunOS/OpenWindows screenshots confirm the pushpin's exact
+placement: `screenshots/sunos551-ow1-scr-01.png`, `-02.png`, and
+`OpenWindows-Augmented-Compatibility-Environment_1.png` (a later,
+more-beveled build, useful as a cross-check that the convention held
+across versions). In all three, the pushpin sits in the header row's
+**top-left corner**, immediately before the menu's title text (e.g. the
+"Workspace" and "Programs" menus) -- not top-right. Window title bars in
+the same screenshots carry no pushpin at all; only menus get one.
+`shell/src/main.rs`'s `MenuPopup::pushpin_rect()` originally placed it
+top-right, since it predated having a real reference for this -- fixed to
+match.
+
 ## Window gadgets (decoration chrome)
 
 Terminology and components olvwm's window frames used, worth
