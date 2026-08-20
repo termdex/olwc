@@ -158,27 +158,37 @@ with wlroots compositors generally, not just this project.
   closes it, not Escape --
   follow-up, same as Escape support was for the root menu.
 
-  Bottom resize-corner handles (v1: bottom-left and bottom-right only --
-  top corners and a footer strip are still open) are subsurfaces of the
-  header, same trick as the window menu, positioned at the toplevel's
-  actual bottom edge via a new `toplevel_height` argument on the
-  `configure` event -- olshell has no other way to learn this, since
-  wlr-foreign-toplevel-management deliberately carries no geometry.
-  Dragging one sends `resize` with `held: 1` (a real press-hold-drag
-  gesture, unlike the window menu's Resize item, which is a discrete
-  click and needs `held: 0`) and the corresponding edge bitmask. Drawn as
-  a filled circle on an otherwise fully transparent buffer so it floats
-  over the toplevel's own corner rather than sitting in an opaque box;
-  getting that transparency to actually render correctly needed two
-  separate fixes found live -- the corner surfaces' first real content
-  needed the same "parent must commit again after the subsurface
-  relationship is established" nudge the window menu needed (sent too
-  early the first time, before either corner had any content to make
-  visible), and the "transparent" pixels needed their RGB zeroed too, not
-  just alpha -- wl_shm Argb8888 buffers are expected premultiplied, and
-  stale RGB (SlotPool buffers are reused memory) with zero alpha isn't
-  validly premultiplied, so it rendered as a faint ghost of whatever was
-  drawn in that memory before instead of true transparency.
+  Resize chrome is now complete: all four corners plus a footer strip
+  between the two bottom ones, unified under one `ResizeRegion` enum
+  (`shell/src/main.rs`) rather than bolted on separately, since the
+  reference groups the footer with the corners, not the header ("a bottom
+  strip dedicated to resize, separate from the header"). All five are
+  subsurfaces of the header, same trick as the window menu; bottom
+  corners and the footer are positioned at the toplevel's actual bottom
+  edge via a `toplevel_height` argument on the `configure` event --
+  olshell has no other way to learn this, since
+  wlr-foreign-toplevel-management deliberately carries no geometry. Top
+  corners needed the header's own button and sticky indicator shifted
+  inward to make room, rather than overlapping them. Dragging any of the
+  five sends `resize` with `held: 1` (a real press-hold-drag gesture,
+  unlike the window menu's Resize item, which is a discrete click and
+  needs `held: 0`) and the region's corresponding edge bitmask. The
+  corners are drawn as filled circles (an explicit placeholder for OPEN
+  LOOK's true obround shape -- not visible at usable resolution in either
+  reference screenshot) and the footer as a thin bar, both on otherwise
+  fully transparent buffers so they float over the toplevel's own content
+  rather than sitting in a visible box; getting that transparency to
+  actually render correctly needed two separate fixes found live -- each
+  handle's first real content needs a fresh parent commit after the
+  subsurface relationship is established (same gotcha the window menu
+  hit, just timed differently: the early "nudge" commit in
+  `ensure_decoration` fires before any of them have content yet, so it
+  doesn't count on its own), and "transparent" pixels need their RGB
+  zeroed along with alpha -- wl_shm Argb8888 buffers are expected
+  premultiplied, and stale RGB (SlotPool buffers are reused memory) with
+  zero alpha isn't validly premultiplied, so it rendered as a faint ghost
+  of whatever was drawn in that memory before instead of true
+  transparency.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor

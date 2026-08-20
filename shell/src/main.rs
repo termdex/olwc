@@ -251,7 +251,7 @@ struct Decoration {
     height: u32,
     /// The decorated toplevel's own current content height -- not this
     /// header's, which is always `height`. Needed to position the bottom
-    /// corner handles, which have to reach the toplevel's bottom edge;
+    /// resize handles, which have to reach the toplevel's bottom edge;
     /// see the protocol's configure event doc comment for why olcore has
     /// to tell us this rather than us computing it some other way.
     toplevel_height: u32,
@@ -259,47 +259,120 @@ struct Decoration {
     /// Mirrors olcore's state, kept in sync via the sticky_changed event --
     /// olshell never decides this itself, only asks to toggle it.
     sticky: bool,
-    bottom_left: CornerHandle,
-    bottom_right: CornerHandle,
+    top_left: ResizeHandle,
+    top_right: ResizeHandle,
+    bottom_left: ResizeHandle,
+    bottom_right: ResizeHandle,
+    footer: ResizeHandle,
 }
 
-/// A resize-corner handle: a small subsurface of the header (same trick as
-/// the window menu -- both are olshell-owned surfaces, so no protocol
-/// extension needed) positioned at one of the toplevel's bottom corners.
-/// Top corners aren't implemented yet -- this is a first pass covering the
-/// two most commonly expected resize handles.
-struct CornerHandle {
+/// A resize handle: a small subsurface of the header (same trick as the
+/// window menu -- both are olshell-owned surfaces, so no protocol
+/// extension needed) positioned at one edge or corner of the toplevel.
+/// Corners are drawn as circles (draw_corner_handle); the footer, a wide
+/// strip spanning the two bottom corners, is drawn as a thin bar
+/// (draw_footer) -- see ResizeRegion for which is which and what edges
+/// each one resizes from.
+struct ResizeHandle {
     subsurface: wl_subsurface::WlSubsurface,
     surface: wl_surface::WlSurface,
     hovered: bool,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum ResizeRegion {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Footer,
+}
+
+impl ResizeRegion {
+    const ALL: [ResizeRegion; 5] = [
+        ResizeRegion::TopLeft,
+        ResizeRegion::TopRight,
+        ResizeRegion::BottomLeft,
+        ResizeRegion::BottomRight,
+        ResizeRegion::Footer,
+    ];
+
+    /// Edge bitmask to pass to the decoration protocol's resize request.
+    fn edges(self) -> u32 {
+        match self {
+            ResizeRegion::TopLeft => EDGE_TOP | EDGE_LEFT,
+            ResizeRegion::TopRight => EDGE_TOP | EDGE_RIGHT,
+            ResizeRegion::BottomLeft => EDGE_BOTTOM | EDGE_LEFT,
+            ResizeRegion::BottomRight => EDGE_BOTTOM | EDGE_RIGHT,
+            ResizeRegion::Footer => EDGE_BOTTOM,
+        }
+    }
+}
+
 impl Decoration {
+    fn resize_handle(&self, region: ResizeRegion) -> &ResizeHandle {
+        match region {
+            ResizeRegion::TopLeft => &self.top_left,
+            ResizeRegion::TopRight => &self.top_right,
+            ResizeRegion::BottomLeft => &self.bottom_left,
+            ResizeRegion::BottomRight => &self.bottom_right,
+            ResizeRegion::Footer => &self.footer,
+        }
+    }
+
+    fn resize_handle_mut(&mut self, region: ResizeRegion) -> &mut ResizeHandle {
+        match region {
+            ResizeRegion::TopLeft => &mut self.top_left,
+            ResizeRegion::TopRight => &mut self.top_right,
+            ResizeRegion::BottomLeft => &mut self.bottom_left,
+            ResizeRegion::BottomRight => &mut self.bottom_right,
+            ResizeRegion::Footer => &mut self.footer,
+        }
+    }
+
+    // Top corner handles need room made for them at the header's far left
+    // and right edges, so the button and sticky indicator both shift in
+    // by CORNER_HANDLE_SIZE from where they'd otherwise sit.
     fn button_rect(&self) -> (i32, i32, i32, i32) {
-        let x0 = DECORATION_BUTTON_MARGIN;
+        let x0 = CORNER_HANDLE_SIZE + DECORATION_BUTTON_MARGIN;
         let y0 = (self.height as i32 - DECORATION_BUTTON_SIZE) / 2;
         (x0, y0, x0 + DECORATION_BUTTON_SIZE, y0 + DECORATION_BUTTON_SIZE)
     }
 
-    /// Sticky indicator, at the header's right edge -- purely a passive
+    /// Sticky indicator, near the header's right edge -- purely a passive
     /// indicator (not clickable), reusing the same pushpin glyph the root
     /// menu's pin-to-persist gesture uses, since both mean "stays put".
     fn sticky_pushpin_rect(&self) -> (i32, i32, i32, i32) {
-        let x1 = self.width as i32 - DECORATION_BUTTON_MARGIN;
+        let x1 = self.width as i32 - CORNER_HANDLE_SIZE - DECORATION_BUTTON_MARGIN;
         let x0 = x1 - PUSHPIN_SIZE;
         let y0 = (self.height as i32 - PUSHPIN_SIZE) / 2;
         (x0, y0, x1, y0 + PUSHPIN_SIZE)
     }
 
-    /// Header-local position for a bottom corner handle -- header-local
-    /// because both handles are subsurfaces of the header (see
-    /// CornerHandle's doc comment), positioned far enough below it
+    /// Header-local position for a corner handle -- header-local because
+    /// all of these are subsurfaces of the header (see ResizeHandle's doc
+    /// comment). Top corners sit at the header's own top edge, i.e. no Y
+    /// offset; bottom corners are positioned far enough below the header
     /// (`self.height` + the toplevel's own content height) to reach the
     /// toplevel's actual bottom edge.
-    fn corner_handle_position(&self, right: bool) -> (i32, i32) {
+    fn corner_handle_position(&self, region: ResizeRegion) -> (i32, i32) {
+        let right = matches!(region, ResizeRegion::TopRight | ResizeRegion::BottomRight);
+        let bottom = matches!(region, ResizeRegion::BottomLeft | ResizeRegion::BottomRight);
         let x = if right { self.width as i32 - CORNER_HANDLE_SIZE } else { 0 };
-        let y = self.height as i32 + self.toplevel_height as i32 - CORNER_HANDLE_SIZE;
+        let y = if bottom { self.height as i32 + self.toplevel_height as i32 - CORNER_HANDLE_SIZE } else { 0 };
         (x, y)
+    }
+
+    /// Header-local (x, y, width) for the footer strip -- spans the full
+    /// width minus the two bottom corner handles at its ends, at the same
+    /// Y as they are. width can come out non-positive for a toplevel
+    /// narrower than both corners combined; callers must check before
+    /// drawing.
+    fn footer_rect(&self) -> (i32, i32, i32) {
+        let x0 = CORNER_HANDLE_SIZE;
+        let y0 = self.height as i32 + self.toplevel_height as i32 - CORNER_HANDLE_SIZE;
+        let width = self.width as i32 - 2 * CORNER_HANDLE_SIZE;
+        (x0, y0, width)
     }
 
     fn is_on_button(&self, x: f64, y: f64) -> bool {
@@ -640,13 +713,20 @@ impl Olshell {
         let object =
             manager.get_decoration(&surface, &handle, DECORATION_HEIGHT, qh, toplevel_id.clone());
 
-        // Bottom corner handles: subsurfaces of the header, same as the
-        // window menu. Positioned once real dimensions are known, in
-        // draw_decoration (via the next configure), not here.
-        let (bl_subsurface, bl_surface) = self.subcompositor.create_subsurface(surface.clone(), qh);
-        bl_subsurface.set_desync();
-        let (br_subsurface, br_surface) = self.subcompositor.create_subsurface(surface.clone(), qh);
-        br_subsurface.set_desync();
+        // Resize handles (2 top corners, 2 bottom corners, footer): all
+        // subsurfaces of the header, same trick as the window menu.
+        // Positioned once real dimensions are known, in draw_decoration
+        // (via the next configure), not here.
+        let new_handle = || {
+            let (subsurface, handle_surface) = self.subcompositor.create_subsurface(surface.clone(), qh);
+            subsurface.set_desync();
+            ResizeHandle { subsurface, surface: handle_surface, hovered: false }
+        };
+        let top_left = new_handle();
+        let top_right = new_handle();
+        let bottom_left = new_handle();
+        let bottom_right = new_handle();
+        let footer = new_handle();
         // Newly-created subsurfaces don't actually composite until the
         // parent commits at least once after the relationship is
         // established -- see open_window_menu's identical follow-up
@@ -662,12 +742,11 @@ impl Olshell {
             toplevel_height: 0,
             button_hovered: false,
             sticky: false,
-            bottom_left: CornerHandle { subsurface: bl_subsurface, surface: bl_surface, hovered: false },
-            bottom_right: CornerHandle {
-                subsurface: br_subsurface,
-                surface: br_surface,
-                hovered: false,
-            },
+            top_left,
+            top_right,
+            bottom_left,
+            bottom_right,
+            footer,
         });
     }
 
@@ -730,23 +809,41 @@ impl Olshell {
         wl_surface.commit();
         log::info!("decoration: drew {toplevel_id:?} at {width}x{height}");
 
+        // Top corners only need the header's own width, already known;
+        // bottom corners and the footer also need toplevel_height, from
+        // the toplevel's own first commit, which can lag behind the
+        // header's.
+        let (tl_x, tl_y) = dec.corner_handle_position(ResizeRegion::TopLeft);
+        dec.top_left.subsurface.set_position(tl_x, tl_y);
+        draw_corner_handle(&mut self.pool, &dec.top_left.surface, dec.top_left.hovered);
+
+        let (tr_x, tr_y) = dec.corner_handle_position(ResizeRegion::TopRight);
+        dec.top_right.subsurface.set_position(tr_x, tr_y);
+        draw_corner_handle(&mut self.pool, &dec.top_right.surface, dec.top_right.hovered);
+
         if dec.toplevel_height > 0 {
-            let (bl_x, bl_y) = dec.corner_handle_position(false);
+            let (bl_x, bl_y) = dec.corner_handle_position(ResizeRegion::BottomLeft);
             dec.bottom_left.subsurface.set_position(bl_x, bl_y);
             draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, dec.bottom_left.hovered);
 
-            let (br_x, br_y) = dec.corner_handle_position(true);
+            let (br_x, br_y) = dec.corner_handle_position(ResizeRegion::BottomRight);
             dec.bottom_right.subsurface.set_position(br_x, br_y);
             draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, dec.bottom_right.hovered);
 
-            // The corner handles' very first content commit (above) needs
-            // a fresh parent commit to actually become visible, same
-            // subsurface gotcha as the window menu -- confirmed live: the
-            // early "nudge" commit in ensure_decoration, sent before
-            // either corner had any content yet, wasn't enough on its
-            // own. No new header content, just the nudge.
-            dec.surface.commit();
+            let (f_x, f_y, f_width) = dec.footer_rect();
+            if f_width > 0 {
+                dec.footer.subsurface.set_position(f_x, f_y);
+                draw_footer(&mut self.pool, &dec.footer.surface, f_width as u32, dec.footer.hovered);
+            }
         }
+
+        // All the resize handles' very first content commit (above) needs
+        // a fresh parent commit to actually become visible, same
+        // subsurface gotcha as the window menu -- confirmed live: the
+        // early "nudge" commit in ensure_decoration, sent before any of
+        // them had any content yet, wasn't enough on its own. No new
+        // header content, just the nudge.
+        dec.surface.commit();
     }
 
     /// Opens the window menu for `toplevel_id`'s decoration, replacing any
@@ -937,16 +1034,15 @@ impl Olshell {
 
     /// (toplevel, is_right) for whichever bottom corner handle `surface`
     /// is, if any.
-    fn corner_handle_at(&self, surface: &wl_surface::WlSurface) -> Option<(ObjectId, bool)> {
+    /// (toplevel, which region) for whichever resize handle `surface` is,
+    /// if any.
+    fn resize_region_at(&self, surface: &wl_surface::WlSurface) -> Option<(ObjectId, ResizeRegion)> {
         self.toplevels.iter().find_map(|(id, info)| {
             let dec = info.decoration.as_ref()?;
-            if dec.bottom_left.surface == *surface {
-                Some((id.clone(), false))
-            } else if dec.bottom_right.surface == *surface {
-                Some((id.clone(), true))
-            } else {
-                None
-            }
+            ResizeRegion::ALL
+                .into_iter()
+                .find(|&region| dec.resize_handle(region).surface == *surface)
+                .map(|region| (id.clone(), region))
         })
     }
 
@@ -1002,6 +1098,26 @@ fn draw_corner_handle(pool: &mut SlotPool, surface: &wl_surface::WlSurface, hove
     draw_pushpin(canvas, size, size, 0, 0, size, size, true, color);
     buffer.attach_to(surface).expect("failed to attach buffer");
     surface.damage_buffer(0, 0, size, size);
+    surface.commit();
+}
+
+/// Draws the footer strip: a thin horizontal bar, vertically centered in
+/// an otherwise fully transparent buffer -- same reasoning as
+/// draw_corner_handle (floats over the toplevel's own content, and needs
+/// RGB zeroed along with alpha for the same premultiplication reason).
+fn draw_footer(pool: &mut SlotPool, surface: &wl_surface::WlSurface, width: u32, hovered: bool) {
+    let width = width as i32;
+    let height = CORNER_HANDLE_SIZE;
+    let stride = width * 4;
+    let (buffer, canvas) =
+        pool.create_buffer(width, height, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
+    canvas.fill(0);
+    let color = if hovered { DECORATION_BUTTON_HOVER_COLOR } else { DECORATION_TEXT_COLOR };
+    let bar_y0 = height / 2 - 1;
+    let bar_y1 = height / 2 + 1;
+    fill_rect(canvas, width, height, 0, bar_y0, width, bar_y1, color);
+    buffer.attach_to(surface).expect("failed to attach buffer");
+    surface.damage_buffer(0, 0, width, height);
     surface.commit();
 }
 
@@ -1424,7 +1540,7 @@ impl PointerHandler for Olshell {
                 .as_ref()
                 .is_some_and(|p| event.surface == *p.layer.wl_surface());
             let decoration_toplevel = self.decoration_toplevel_id(&event.surface);
-            let corner_handle = self.corner_handle_at(&event.surface);
+            let resize_region = self.resize_region_at(&event.surface);
             let on_window_menu =
                 self.window_menu.as_ref().is_some_and(|wm| event.surface == wm.surface);
             // Captured before the "click elsewhere closes it" step below
@@ -1533,38 +1649,37 @@ impl PointerHandler for Olshell {
                         dec.object._move(1);
                     }
                 }
-                PointerEventKind::Motion { .. } if corner_handle.is_some() => {
-                    let (id, right) = corner_handle.clone().unwrap();
+                PointerEventKind::Motion { .. } if resize_region.is_some() => {
+                    let (id, region) = resize_region.unwrap();
                     if let Some(dec) =
                         self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
                     {
-                        let handle = if right { &mut dec.bottom_right } else { &mut dec.bottom_left };
+                        let handle = dec.resize_handle_mut(region);
                         if !handle.hovered {
                             handle.hovered = true;
                             self.draw_decoration(&id);
                         }
                     }
                 }
-                PointerEventKind::Leave { .. } if corner_handle.is_some() => {
-                    let (id, right) = corner_handle.clone().unwrap();
+                PointerEventKind::Leave { .. } if resize_region.is_some() => {
+                    let (id, region) = resize_region.unwrap();
                     if let Some(dec) =
                         self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
                     {
-                        let handle = if right { &mut dec.bottom_right } else { &mut dec.bottom_left };
+                        let handle = dec.resize_handle_mut(region);
                         if handle.hovered {
                             handle.hovered = false;
                             self.draw_decoration(&id);
                         }
                     }
                 }
-                PointerEventKind::Press { button, .. } if corner_handle.is_some() && button == BTN_LEFT => {
-                    let (id, right) = corner_handle.clone().unwrap();
+                PointerEventKind::Press { button, .. } if resize_region.is_some() && button == BTN_LEFT => {
+                    let (id, region) = resize_region.unwrap();
                     if let Some(dec) = self.toplevels.get(&id).and_then(|info| info.decoration.as_ref()) {
-                        let edges = EDGE_BOTTOM | if right { EDGE_RIGHT } else { EDGE_LEFT };
                         // held=1: this fires from the press itself, same
                         // reasoning as the header drag above -- a real
                         // press-hold-drag gesture, not a discrete click.
-                        dec.object.resize(edges, 1);
+                        dec.object.resize(region.edges(), 1);
                     }
                 }
                 PointerEventKind::Motion { .. } if on_window_menu => {
@@ -1945,10 +2060,11 @@ impl Dispatch<ZopenlookDecorationV1, ObjectId> for Olshell {
                 if let Some(dec) =
                     state.toplevels.get_mut(toplevel_id).and_then(|info| info.decoration.take())
                 {
-                    dec.bottom_left.subsurface.destroy();
-                    dec.bottom_left.surface.destroy();
-                    dec.bottom_right.subsurface.destroy();
-                    dec.bottom_right.surface.destroy();
+                    for region in ResizeRegion::ALL {
+                        let handle = dec.resize_handle(region);
+                        handle.subsurface.destroy();
+                        handle.surface.destroy();
+                    }
                     dec.object.destroy();
                     dec.surface.destroy();
                 }
