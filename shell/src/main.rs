@@ -150,10 +150,22 @@ const DECORATION_FONT_SIZE: f32 = 15.0;
 // the "Properties" item, which the reference screenshot shows grayed out.
 const WINDOW_MENU_DISABLED_COLOR: (u8, u8, u8) = (0x90, 0x90, 0x88);
 
+// Edge bitmask matching wlroots' WLR_EDGE_* / xdg_toplevel's resize_edge
+// encoding, which openlook-decoration's resize request also uses (see its
+// doc comment in the protocol XML). Only bottom|right is used for now --
+// there's no resize-corner chrome yet to pick a different corner from.
+#[allow(dead_code)]
+const EDGE_TOP: u32 = 1;
+const EDGE_BOTTOM: u32 = 2;
+#[allow(dead_code)]
+const EDGE_LEFT: u32 = 4;
+const EDGE_RIGHT: u32 = 8;
+
 enum WindowMenuAction {
     Close,
     ToggleMaximize,
     Move,
+    Resize,
     /// Not wired up yet -- logs a placeholder, same as the root menu's
     /// non-interactive submenus.
     Unimplemented,
@@ -166,15 +178,16 @@ struct WindowMenuItem {
 }
 
 // The full 9-item list from docs/OPENLOOK-REFERENCE.md's window menu
-// section. Only Close, Full Size, and Move are wired to real actions so
-// far -- Move reuses the same interactive-move grab the header drag
-// gesture already triggers. Properties is disabled to match the
-// reference screenshot (shown grayed out there too).
+// section. Only Close, Full Size, Move, and Resize are wired to real
+// actions so far -- Move and Resize reuse the same interactive grabs the
+// header drag gesture and (eventually) resize-corner handles trigger.
+// Properties is disabled to match the reference screenshot (shown grayed
+// out there too).
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Close", action: WindowMenuAction::Close, disabled: false },
     WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
     WindowMenuItem { label: "Move", action: WindowMenuAction::Move, disabled: false },
-    WindowMenuItem { label: "Resize", action: WindowMenuAction::Unimplemented, disabled: false },
+    WindowMenuItem { label: "Resize", action: WindowMenuAction::Resize, disabled: false },
     WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
     WindowMenuItem { label: "Back", action: WindowMenuAction::Unimplemented, disabled: false },
     WindowMenuItem { label: "Refresh", action: WindowMenuAction::Unimplemented, disabled: false },
@@ -1353,6 +1366,15 @@ impl PointerHandler for Olshell {
                                         .and_then(|i| i.decoration.as_ref())
                                     {
                                         dec.object._move();
+                                    }
+                                }
+                                WindowMenuAction::Resize => {
+                                    if let Some(dec) = self
+                                        .toplevels
+                                        .get(&toplevel_id)
+                                        .and_then(|i| i.decoration.as_ref())
+                                    {
+                                        dec.object.resize(EDGE_BOTTOM | EDGE_RIGHT);
                                     }
                                 }
                                 WindowMenuAction::Unimplemented => {

@@ -108,6 +108,26 @@
       </description>
     </request>
 
+    <request name="resize">
+      <description summary="begin an interactive resize of the decorated toplevel">
+        Tells olcore to start resizing the decorated toplevel from the
+        given edge or corner, following the pointer until release -- the
+        same interactive resize a client can normally only trigger on its
+        own xdg_toplevel, exposed here for the same reason move is. edges
+        is a bitmask of the edge enum below; olshell has no resize-corner
+        chrome yet, so its only caller (the window menu's Resize item)
+        always passes bottom|right.
+      </description>
+      <arg name="edges" type="uint" summary="bitmask of edge.{top,bottom,left,right}"/>
+    </request>
+
+    <enum name="edge">
+      <entry name="top" value="1"/>
+      <entry name="bottom" value="2"/>
+      <entry name="left" value="4"/>
+      <entry name="right" value="8"/>
+    </enum>
+
     <request name="destroy" type="destructor">
       <description summary="destroy this decoration">
         The header disappears immediately. The underlying wl_surface is

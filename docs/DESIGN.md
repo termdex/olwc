@@ -118,14 +118,16 @@ with wlroots compositors generally, not just this project.
   window menu too -- a `wl_subsurface` of the header (both are
   olshell-owned surfaces, so this needed no protocol extension, unlike the
   header itself) listing the full 9-item reference set. `Close`, `Full
-  Size`, and `Move` are wired to real actions (close/set_maximized via
-  wlr-foreign-toplevel-management, and the same move request the header
-  drag uses); the rest (`Resize`, `Properties` -- shown disabled, `Back`,
-  `Refresh`, `Stick`, `Quit`) log a placeholder on click, same as the root
-  menu's non-interactive submenus. No keyboard focus on the window menu
-  yet, so only click-elsewhere closes it, not Escape -- follow-up, same as
-  Escape support was for the root menu. Still no footer or resize-corner
-  chrome.
+  Size`, `Move`, and `Resize` are wired to real actions (close/set_maximized
+  via wlr-foreign-toplevel-management, and a `move`/`resize` request pair on
+  the decoration protocol mirroring xdg_toplevel's own move/resize --
+  `resize` always passes bottom|right since there's no resize-corner chrome
+  yet to pick a different edge from); the rest (`Properties` -- shown
+  disabled, `Back`, `Refresh`, `Stick`, `Quit`) log a placeholder on click,
+  same as the root menu's non-interactive submenus. No keyboard focus on
+  the window menu yet, so only click-elsewhere closes it, not Escape --
+  follow-up, same as Escape support was for the root menu. Still no footer
+  or resize-corner chrome.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor

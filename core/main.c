@@ -998,6 +998,27 @@ static void start_move_grab(struct olc_toplevel *toplevel) {
 	server->grab_y = server->cursor->y - toplevel->scene_tree->node.y;
 }
 
+// Mirrors start_move_grab above, for the resize case -- see its comment.
+static void start_resize_grab(struct olc_toplevel *toplevel, uint32_t edges) {
+	struct olc_server *server = toplevel->server;
+	server->grabbed_toplevel = toplevel;
+	server->cursor_mode = OLC_CURSOR_RESIZE;
+	struct wlr_box geo_box = toplevel->xdg_toplevel->base->geometry;
+
+	double border_x = (toplevel->scene_tree->node.x + geo_box.x) +
+		((edges & WLR_EDGE_RIGHT) ? geo_box.width : 0);
+	double border_y = (toplevel->scene_tree->node.y + geo_box.y) +
+		((edges & WLR_EDGE_BOTTOM) ? geo_box.height : 0);
+	server->grab_x = server->cursor->x - border_x;
+	server->grab_y = server->cursor->y - border_y;
+
+	server->grab_geobox = geo_box;
+	server->grab_geobox.x += toplevel->scene_tree->node.x;
+	server->grab_geobox.y += toplevel->scene_tree->node.y;
+
+	server->resize_edges = edges;
+}
+
 static void begin_interactive(struct olc_toplevel *toplevel,
 		enum olc_cursor_mode mode, uint32_t edges) {
 	struct olc_server *server = toplevel->server;
@@ -1010,22 +1031,7 @@ static void begin_interactive(struct olc_toplevel *toplevel,
 	if (mode == OLC_CURSOR_MOVE) {
 		start_move_grab(toplevel);
 	} else {
-		server->grabbed_toplevel = toplevel;
-		server->cursor_mode = mode;
-		struct wlr_box geo_box = toplevel->xdg_toplevel->base->geometry;
-
-		double border_x = (toplevel->scene_tree->node.x + geo_box.x) +
-			((edges & WLR_EDGE_RIGHT) ? geo_box.width : 0);
-		double border_y = (toplevel->scene_tree->node.y + geo_box.y) +
-			((edges & WLR_EDGE_BOTTOM) ? geo_box.height : 0);
-		server->grab_x = server->cursor->x - border_x;
-		server->grab_y = server->cursor->y - border_y;
-
-		server->grab_geobox = geo_box;
-		server->grab_geobox.x += toplevel->scene_tree->node.x;
-		server->grab_geobox.y += toplevel->scene_tree->node.y;
-
-		server->resize_edges = edges;
+		start_resize_grab(toplevel, edges);
 	}
 }
 
@@ -1275,10 +1281,21 @@ static void decoration_handle_move(struct wl_client *client, struct wl_resource 
 	start_move_grab(decoration->toplevel);
 }
 
+static void decoration_handle_resize(
+		struct wl_client *client, struct wl_resource *resource, uint32_t edges) {
+	(void)client;
+	struct olc_decoration *decoration = wl_resource_get_user_data(resource);
+	if (decoration == NULL || decoration->toplevel == NULL) {
+		return;
+	}
+	start_resize_grab(decoration->toplevel, edges);
+}
+
 static const struct zopenlook_decoration_v1_interface decoration_impl = {
 	.ack_configure = decoration_handle_ack_configure,
 	.destroy = decoration_handle_destroy,
 	.move = decoration_handle_move,
+	.resize = decoration_handle_resize,
 };
 
 static void decoration_teardown(struct olc_decoration *decoration) {
