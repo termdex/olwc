@@ -1213,6 +1213,13 @@ impl PointerHandler for Olshell {
             let decoration_toplevel = self.decoration_toplevel_id(&event.surface);
             let on_window_menu =
                 self.window_menu.as_ref().is_some_and(|wm| event.surface == wm.surface);
+            // Captured before the "click elsewhere closes it" step below
+            // clears it, so the button-click handler can tell a second
+            // click on the button that opened this exact menu (which
+            // should toggle it closed) apart from a click that should
+            // open one (a different toplevel's button, or this one after
+            // the menu was already closed some other way).
+            let window_menu_toplevel = self.window_menu.as_ref().map(|wm| wm.toplevel_id.clone());
 
             // No keyboard focus on the window menu yet (see WindowMenu's
             // doc comment), so a press anywhere else is how it closes --
@@ -1261,7 +1268,14 @@ impl PointerHandler for Olshell {
                         .and_then(|info| info.decoration.as_ref())
                         .is_some_and(|dec| dec.is_on_button(event.position.0, event.position.1));
                     if on_button {
-                        self.open_window_menu(qh, &id);
+                        // A second click on the button that opened the
+                        // currently-showing menu toggles it closed instead
+                        // of reopening it -- the pre-step above already
+                        // closed it since this press isn't on the menu
+                        // itself, so there's nothing more to do here.
+                        if window_menu_toplevel.as_ref() != Some(&id) {
+                            self.open_window_menu(qh, &id);
+                        }
                     } else if let Some(dec) =
                         self.toplevels.get(&id).and_then(|info| info.decoration.as_ref())
                     {
