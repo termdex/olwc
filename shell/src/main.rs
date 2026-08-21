@@ -150,6 +150,12 @@ const DECORATION_HEIGHT: u32 = 22;
 // "clean thin border separating it from the content area" cue rather than
 // blending into the desktop panel above it.
 const DECORATION_BG_COLOR: (u8, u8, u8) = (0xA8, 0xA8, 0xA8);
+// The focused header's fill and bevel direction, per the reference
+// screenshots: the active window's title bar is a darkened, recessed
+// rectangle where unfocused ones are the uniform light gray above --
+// the same "inset = pressed" bevel language OPENLOOK-REFERENCE.md
+// already calls out for buttons, applied here to focus instead.
+const DECORATION_FOCUSED_BG_COLOR: (u8, u8, u8) = (0x80, 0x80, 0x80);
 const DECORATION_BEVEL_LIGHT: (u8, u8, u8) = (0xE8, 0xE8, 0xE8);
 const DECORATION_BEVEL_DARK: (u8, u8, u8) = (0x70, 0x70, 0x70);
 const DECORATION_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
@@ -158,12 +164,16 @@ const DECORATION_BUTTON_MARGIN: i32 = 4;
 const DECORATION_BUTTON_HOVER_COLOR: (u8, u8, u8) = MENU_HOVER_COLOR;
 const DECORATION_FONT_SIZE: f32 = 15.0;
 
-// Bottom resize-corner handles, per docs/OPENLOOK-REFERENCE.md's "obround/
-// pill-shaped resize handles at frame corners" -- approximated here as a
-// filled circle (same drawing code as the pushpin, just always filled)
-// rather than true obround, same placeholder-glyph caveat draw_chevron
-// already carries.
+// Resize-corner handles: right-angle brackets per
+// docs/OPENLOOK-REFERENCE.md, confirmed against
+// screenshots/sunos551-ow1-scr-01.png (see draw_corner_handle).
 const CORNER_HANDLE_SIZE: i32 = 14;
+
+// The plain black frame running around the rest of the window's straight
+// edges -- confirmed against the same screenshot: 3px thick on all four
+// sides, present everywhere except where a corner bracket sits instead.
+const DECORATION_BORDER_COLOR: (u8, u8, u8) = (0, 0, 0);
+const DECORATION_BORDER_WIDTH: i32 = 3;
 
 // Window menu: the popup the decoration header's button opens. Reuses the
 // root menu's palette (MENU_BG_COLOR etc.) -- both are menus and should
@@ -264,19 +274,33 @@ struct Decoration {
     bottom_left: ResizeHandle,
     bottom_right: ResizeHandle,
     footer: ResizeHandle,
+    left_border: BorderStrip,
+    right_border: BorderStrip,
 }
 
 /// A resize handle: a small subsurface of the header (same trick as the
 /// window menu -- both are olshell-owned surfaces, so no protocol
 /// extension needed) positioned at one edge or corner of the toplevel.
-/// Corners are drawn as circles (draw_corner_handle); the footer, a wide
-/// strip spanning the two bottom corners, is drawn as a thin bar
-/// (draw_footer) -- see ResizeRegion for which is which and what edges
-/// each one resizes from.
+/// Corners are drawn as right-angle brackets (draw_corner_handle); the
+/// footer, a wide strip spanning the two bottom corners, is drawn as a
+/// thin bar (draw_footer) -- see ResizeRegion for which is which and
+/// what edges each one resizes from.
 struct ResizeHandle {
     subsurface: wl_subsurface::WlSubsurface,
     surface: wl_surface::WlSurface,
     hovered: bool,
+}
+
+/// A plain black border strip along the window's left or right edge --
+/// see Decoration::border_side_rect(). Unlike ResizeHandle, this isn't
+/// interactive (no hover, not in ResizeRegion), so it doesn't need
+/// ResizeHandle's extra state: it's the same corner-to-corner black
+/// frame confirmed in `screenshots/sunos551-ow1-scr-01.png`, just drawn
+/// as its own subsurface since it spans both the header and the
+/// toplevel's own content below it.
+struct BorderStrip {
+    subsurface: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -305,6 +329,21 @@ impl ResizeRegion {
             ResizeRegion::BottomLeft => EDGE_BOTTOM | EDGE_LEFT,
             ResizeRegion::BottomRight => EDGE_BOTTOM | EDGE_RIGHT,
             ResizeRegion::Footer => EDGE_BOTTOM,
+        }
+    }
+
+    /// Which edge of the handle's own square the bracket's elbow sits
+    /// against -- (flip_x, flip_y) true means the elbow is on the
+    /// left/top rather than the right/bottom. Only meaningful for the
+    /// four corner variants; draw_corner_handle is never called for
+    /// Footer.
+    fn corner_flip(self) -> (bool, bool) {
+        match self {
+            ResizeRegion::TopLeft => (true, true),
+            ResizeRegion::TopRight => (false, true),
+            ResizeRegion::BottomLeft => (true, false),
+            ResizeRegion::BottomRight => (false, false),
+            ResizeRegion::Footer => unreachable!("footer has no corner glyph"),
         }
     }
 }
@@ -373,6 +412,21 @@ impl Decoration {
         let y0 = self.height as i32 + self.toplevel_height as i32 - CORNER_HANDLE_SIZE;
         let width = self.width as i32 - 2 * CORNER_HANDLE_SIZE;
         (x0, y0, width)
+    }
+
+    /// Header-local (x, y0, y1) for the left (`right = false`) or right
+    /// border strip -- runs the straight stretch of that side from just
+    /// below the top corner handle to just above the bottom one, the
+    /// same way footer_rect leaves room for the two bottom corners.
+    /// Never drawn underneath a corner bracket's own transparent notch,
+    /// matching the reference: the border simply stops where each
+    /// bracket begins. y1 can come out non-positive before
+    /// toplevel_height is known; callers must check before drawing.
+    fn border_side_rect(&self, right: bool) -> (i32, i32, i32) {
+        let x = if right { self.width as i32 - DECORATION_BORDER_WIDTH } else { 0 };
+        let y0 = CORNER_HANDLE_SIZE;
+        let y1 = self.height as i32 + self.toplevel_height as i32 - CORNER_HANDLE_SIZE;
+        (x, y0, y1)
     }
 
     fn is_on_button(&self, x: f64, y: f64) -> bool {
@@ -727,6 +781,18 @@ impl Olshell {
         let bottom_left = new_handle();
         let bottom_right = new_handle();
         let footer = new_handle();
+
+        // The two side border strips: also subsurfaces of the header, not
+        // resize handles (no hover, not in ResizeRegion) since they're
+        // purely decorative -- see BorderStrip's doc comment.
+        let new_border = || {
+            let (subsurface, border_surface) = self.subcompositor.create_subsurface(surface.clone(), qh);
+            subsurface.set_desync();
+            BorderStrip { subsurface, surface: border_surface }
+        };
+        let left_border = new_border();
+        let right_border = new_border();
+
         // Newly-created subsurfaces don't actually composite until the
         // parent commits at least once after the relationship is
         // established -- see open_window_menu's identical follow-up
@@ -747,6 +813,8 @@ impl Olshell {
             bottom_left,
             bottom_right,
             footer,
+            left_border,
+            right_border,
         });
     }
 
@@ -771,23 +839,41 @@ impl Olshell {
             .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
-        let (r, g, b) = DECORATION_BG_COLOR;
+        // state code 2 is "activated" -- see focused_toplevel_handle().
+        let focused = info.states.contains(&2);
+        let header_bg = if focused { DECORATION_FOCUSED_BG_COLOR } else { DECORATION_BG_COLOR };
+
+        let (r, g, b) = header_bg;
         for pixel in canvas.chunks_exact_mut(4) {
             pixel[0] = b;
             pixel[1] = g;
             pixel[2] = r;
             pixel[3] = 0xFF;
         }
-        // 3D beveled shading: a light edge along the top, a dark edge along
-        // the bottom, raised-unpressed per docs/OPENLOOK-REFERENCE.md.
-        paint_row(canvas, width, 0, DECORATION_BEVEL_LIGHT);
+        // 3D beveled shading: raised-unpressed (light top, dark bottom) when
+        // unfocused, per docs/OPENLOOK-REFERENCE.md; flipped to inset when
+        // focused, to match the recessed look of the active window's header
+        // in the reference screenshots.
+        let (bevel_top, bevel_bottom) =
+            if focused { (DECORATION_BEVEL_DARK, DECORATION_BEVEL_LIGHT) } else { (DECORATION_BEVEL_LIGHT, DECORATION_BEVEL_DARK) };
+        // Just inside the top border below -- the bevel row's the focus
+        // indicator, the border's the window edge, and they're not the
+        // same thing (docs/DESIGN.md has the reasoning for each).
+        paint_row(canvas, width, DECORATION_BORDER_WIDTH, bevel_top);
         if height > 1 {
-            paint_row(canvas, width, height - 1, DECORATION_BEVEL_DARK);
+            paint_row(canvas, width, height - 1, bevel_bottom);
         }
 
+        // The plain black frame's top stretch, skipping the two top
+        // corners -- their own bracket subsurfaces sit right on top of
+        // this and are partly transparent (the bracket's notch), so
+        // anything drawn underneath them must stop exactly at their
+        // edges, not bleed into the gap. See border_side_rect for the
+        // matching left/right stretches.
+        fill_rect(canvas, width, height, CORNER_HANDLE_SIZE, 0, width - CORNER_HANDLE_SIZE, DECORATION_BORDER_WIDTH, DECORATION_BORDER_COLOR);
+
         let (bx0, by0, bx1, by1) = dec.button_rect();
-        let button_color =
-            if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { DECORATION_BG_COLOR };
+        let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { header_bg };
         fill_rect(canvas, width, height, bx0, by0, bx1, by1, button_color);
         draw_chevron(canvas, width, height, bx0, by0, bx1, by1, DECORATION_TEXT_COLOR);
 
@@ -815,25 +901,37 @@ impl Olshell {
         // header's.
         let (tl_x, tl_y) = dec.corner_handle_position(ResizeRegion::TopLeft);
         dec.top_left.subsurface.set_position(tl_x, tl_y);
-        draw_corner_handle(&mut self.pool, &dec.top_left.surface, dec.top_left.hovered);
+        draw_corner_handle(&mut self.pool, &dec.top_left.surface, dec.top_left.hovered, ResizeRegion::TopLeft, header_bg);
 
         let (tr_x, tr_y) = dec.corner_handle_position(ResizeRegion::TopRight);
         dec.top_right.subsurface.set_position(tr_x, tr_y);
-        draw_corner_handle(&mut self.pool, &dec.top_right.surface, dec.top_right.hovered);
+        draw_corner_handle(&mut self.pool, &dec.top_right.surface, dec.top_right.hovered, ResizeRegion::TopRight, header_bg);
 
         if dec.toplevel_height > 0 {
             let (bl_x, bl_y) = dec.corner_handle_position(ResizeRegion::BottomLeft);
             dec.bottom_left.subsurface.set_position(bl_x, bl_y);
-            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, dec.bottom_left.hovered);
+            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, dec.bottom_left.hovered, ResizeRegion::BottomLeft, header_bg);
 
             let (br_x, br_y) = dec.corner_handle_position(ResizeRegion::BottomRight);
             dec.bottom_right.subsurface.set_position(br_x, br_y);
-            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, dec.bottom_right.hovered);
+            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, dec.bottom_right.hovered, ResizeRegion::BottomRight, header_bg);
 
             let (f_x, f_y, f_width) = dec.footer_rect();
             if f_width > 0 {
                 dec.footer.subsurface.set_position(f_x, f_y);
                 draw_footer(&mut self.pool, &dec.footer.surface, f_width as u32, dec.footer.hovered);
+            }
+
+            let (lb_x, lb_y0, lb_y1) = dec.border_side_rect(false);
+            if lb_y1 > lb_y0 {
+                dec.left_border.subsurface.set_position(lb_x, lb_y0);
+                draw_border_strip(&mut self.pool, &dec.left_border.surface, (lb_y1 - lb_y0) as u32);
+            }
+
+            let (rb_x, rb_y0, rb_y1) = dec.border_side_rect(true);
+            if rb_y1 > rb_y0 {
+                dec.right_border.subsurface.set_position(rb_x, rb_y0);
+                draw_border_strip(&mut self.pool, &dec.right_border.surface, (rb_y1 - rb_y0) as u32);
             }
         }
 
@@ -1082,7 +1180,27 @@ impl Olshell {
 /// draw_pushpin's shape) on an otherwise fully transparent buffer, so it
 /// reads as a small floating marker over the toplevel's own corner rather
 /// than a rectangle sitting on top of it.
-fn draw_corner_handle(pool: &mut SlotPool, surface: &wl_surface::WlSurface, hovered: bool) {
+///
+/// The glyph itself is an L-shaped bracket -- a "framing square" -- rather
+/// than the obround/pill placeholder used before: confirmed against
+/// `screenshots/sunos551-ow1-scr-01.png`'s Text Editor window at all four
+/// corners (cross-checked pixel-by-pixel, not just visually), which
+/// consistently show a right-angle bracket hugging each corner rather than
+/// a rounded shape. Each corner's bracket elbow sits at that corner, with
+/// its two arms reaching along the two edges away from it; region picks
+/// which corner via corner_flip(). The bevel direction is the same
+/// absolute top-left-light/bottom-right-dark convention used everywhere
+/// else in the header, not one that rotates with the bracket -- confirmed
+/// against the same screenshot: e.g. the top-right corner's bracket still
+/// has its top and left-facing surfaces lit and its right-facing surface
+/// shadowed, same as bottom-right's.
+fn draw_corner_handle(
+    pool: &mut SlotPool,
+    surface: &wl_surface::WlSurface,
+    hovered: bool,
+    region: ResizeRegion,
+    fill_color: (u8, u8, u8),
+) {
     let size = CORNER_HANDLE_SIZE;
     let stride = size * 4;
     let (buffer, canvas) =
@@ -1094,8 +1212,40 @@ fn draw_corner_handle(pool: &mut SlotPool, surface: &wl_surface::WlSurface, hove
     // live, it rendered as a faint ghost of whatever was drawn here before
     // instead of true transparency.
     canvas.fill(0);
-    let color = if hovered { DECORATION_BUTTON_HOVER_COLOR } else { DECORATION_TEXT_COLOR };
-    draw_pushpin(canvas, size, size, 0, 0, size, size, true, color);
+
+    let (flip_x, flip_y) = region.corner_flip();
+    let thickness = size * 3 / 7;
+    let in_bracket = |x: i32, y: i32| -> bool {
+        let ax = if flip_x { size - 1 - x } else { x };
+        let ay = if flip_y { size - 1 - y } else { y };
+        ax >= size - thickness || ay >= size - thickness
+    };
+    for y in 0..size {
+        for x in 0..size {
+            if !in_bracket(x, y) {
+                continue;
+            }
+            let top_facing = y == 0 || !in_bracket(x, y - 1);
+            let left_facing = x == 0 || !in_bracket(x - 1, y);
+            let bottom_facing = y == size - 1 || !in_bracket(x, y + 1);
+            let right_facing = x == size - 1 || !in_bracket(x + 1, y);
+            let color = if hovered {
+                DECORATION_BUTTON_HOVER_COLOR
+            } else if top_facing || left_facing {
+                DECORATION_BEVEL_LIGHT
+            } else if bottom_facing || right_facing {
+                DECORATION_BEVEL_DARK
+            } else {
+                fill_color
+            };
+            let (r, g, b) = color;
+            let idx = ((y * size + x) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
     buffer.attach_to(surface).expect("failed to attach buffer");
     surface.damage_buffer(0, 0, size, size);
     surface.commit();
@@ -1116,6 +1266,31 @@ fn draw_footer(pool: &mut SlotPool, surface: &wl_surface::WlSurface, width: u32,
     let bar_y0 = height / 2 - 1;
     let bar_y1 = height / 2 + 1;
     fill_rect(canvas, width, height, 0, bar_y0, width, bar_y1, color);
+    // The plain black frame's bottom stretch, at the toplevel's actual
+    // bottom edge -- same border the left/right strips and the header's
+    // own top stretch draw, completing the frame around all four sides.
+    fill_rect(canvas, width, height, 0, height - DECORATION_BORDER_WIDTH, width, height, DECORATION_BORDER_COLOR);
+    buffer.attach_to(surface).expect("failed to attach buffer");
+    surface.damage_buffer(0, 0, width, height);
+    surface.commit();
+}
+
+/// Draws a solid black border strip -- see Decoration::border_side_rect().
+/// Unlike the corner handles and footer, every pixel here is opaque, so
+/// there's no transparency/premultiplication gotcha to work around.
+fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, height: u32) {
+    let width = DECORATION_BORDER_WIDTH;
+    let height = height as i32;
+    let stride = width * 4;
+    let (buffer, canvas) =
+        pool.create_buffer(width, height, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
+    let (r, g, b) = DECORATION_BORDER_COLOR;
+    for pixel in canvas.chunks_exact_mut(4) {
+        pixel[0] = b;
+        pixel[1] = g;
+        pixel[2] = r;
+        pixel[3] = 0xFF;
+    }
     buffer.attach_to(surface).expect("failed to attach buffer");
     surface.damage_buffer(0, 0, width, height);
     surface.commit();

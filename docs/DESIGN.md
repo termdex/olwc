@@ -189,6 +189,58 @@ with wlroots compositors generally, not just this project.
   zero alpha isn't validly premultiplied, so it rendered as a faint ghost
   of whatever was drawn in that memory before instead of true
   transparency.
+
+  Focus is now indicated on the header itself, matching the reference
+  screenshots: the focused window's header fills with a darker gray
+  (`DECORATION_FOCUSED_BG_COLOR`) and its bevel flips from raised
+  (light top edge, dark bottom edge -- the unfocused, "unpressed"
+  look) to inset (dark top, light bottom), reusing the same
+  raised/inset bevel language `OPENLOOK-REFERENCE.md` already
+  describes for buttons, applied here to focus rather than a press.
+  Driven by state code 2 ("activated") on
+  wlr-foreign-toplevel-management, which `draw_decoration` already
+  had access to; no new protocol needed. The button's unhovered fill
+  now tracks the header's own background color instead of always
+  being the unfocused shade, so it doesn't look mismatched against a
+  focused header.
+
+  The resize-corner glyphs are no longer filled circles. Cross-checking
+  `screenshots/sunos551-ow1-scr-01.png`'s Text Editor window at all
+  four corners (pixel-sampled, not just eyeballed) showed OPEN LOOK's
+  actual resize-corner shape is a right-angle bracket hugging the
+  corner -- a "framing square," not the obround/pill shape assumed
+  earlier (that guess predated having a screenshot where the corners
+  were legible at all). `draw_corner_handle` now draws that: each
+  corner's bracket elbow sits at the corner itself, with its two arms
+  reaching along the two edges away from it, via a generic
+  flip-and-scan routine driven by `ResizeRegion::corner_flip()` rather
+  than four hand-written cases. Bevel direction is the same absolute
+  top-left-light/bottom-right-dark convention used everywhere else in
+  the chrome (not one that rotates with the bracket) -- confirmed
+  against the same screenshot, where the top-right corner's bracket
+  still has its top- and left-facing surfaces lit and its right-facing
+  surface shadowed, same as bottom-right's.
+
+  Every window now also has a plain black border, 3px thick, running
+  around the whole frame -- header top and sides, then continuing down
+  the toplevel's own left/right edges and across its bottom -- confirmed
+  against the same screenshot (pixel-measured, not estimated: exactly
+  3px on all four sides). It's a separate visual element from the
+  header's own focus bevel, not a replacement for it: the border marks
+  the window's actual edge and sits outermost, with the existing
+  light/dark bevel row drawn just inside it. The border stops exactly
+  at each corner bracket's own footprint rather than running underneath
+  it, matching the reference -- a corner bracket's fill is only partly
+  opaque (the notch is transparent, revealing the header underneath), so
+  anything drawn under it has to stop at its edges or it bleeds through.
+  Implementation: the header's own top stretch is drawn directly into
+  its existing buffer (`draw_decoration`); the two side stretches are a
+  new `BorderStrip` subsurface pair (like the resize handles, but
+  non-interactive -- no hover, not part of `ResizeRegion`) spanning from
+  below the top corner to above the bottom one on each side, since they
+  have to cover both the header and the toplevel's content below it;
+  the bottom stretch is one more `fill_rect` inside the existing footer
+  buffer.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
