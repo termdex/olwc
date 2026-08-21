@@ -140,6 +140,10 @@ const PUSHPIN_SIZE: i32 = 10;
 const PUSHPIN_UNPINNED_COLOR: (u8, u8, u8) = MENU_TITLE_COLOR;
 const PUSHPIN_PINNED_COLOR: (u8, u8, u8) = (0xA8, 0x30, 0x28);
 
+// Rightward wedge marking a window-menu item that opens a submenu
+// (currently just Move to Workspace) rather than acting immediately.
+const SUBMENU_ARROW_SIZE: i32 = 8;
+
 // Window decoration (header/title bar). See docs/OPENLOOK-REFERENCE.md's
 // "Window menu" section -- this is the title bar these constants describe;
 // the window-menu popup that its button is meant to open is follow-up work
@@ -200,6 +204,9 @@ enum WindowMenuAction {
     Lower,
     Quit,
     ToggleSticky,
+    /// Opens the "Move to Workspace" submenu (WorkspaceSubmenu) instead
+    /// of acting immediately -- see its handling in pointer_frame.
+    MoveToWorkspace,
     /// Not wired up yet -- logs a placeholder, same as the root menu's
     /// non-interactive submenus.
     Unimplemented,
@@ -224,6 +231,11 @@ struct WindowMenuItem {
 // window, the same Close-window/Quit-application distinction most desktop
 // environments still draw. Properties is disabled to match the reference
 // screenshot (shown grayed out there too).
+//
+// Move to Workspace has no reference precedent -- see the workspace strip's
+// ADJUST-click, which it complements now that submenus exist: this is the
+// discoverable menu path for the same action, grouped next to Stick since
+// both are about a window's relationship to workspaces.
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Close", action: WindowMenuAction::Close, disabled: false },
     WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
@@ -232,6 +244,7 @@ const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
     WindowMenuItem { label: "Back", action: WindowMenuAction::Lower, disabled: false },
     WindowMenuItem { label: "Stick", action: WindowMenuAction::ToggleSticky, disabled: false },
+    WindowMenuItem { label: "Move to Workspace", action: WindowMenuAction::MoveToWorkspace, disabled: false },
     WindowMenuItem { label: "Quit", action: WindowMenuAction::Quit, disabled: false },
 ];
 
@@ -249,6 +262,10 @@ struct ToplevelInfo {
     // practice always Some by the time anything else reads this struct.
     handle: Option<ZwlrForeignToplevelHandleV1>,
     decoration: Option<Decoration>,
+    // Kept in sync via the workspaces protocol's toplevel_workspace event.
+    // None only until the first such event arrives; used to gray out the
+    // window menu's own workspace in its Move to Workspace submenu.
+    workspace_index: Option<u32>,
 }
 
 /// The header (title bar) chrome olshell draws for one toplevel it doesn't
@@ -452,12 +469,50 @@ struct WindowMenu {
     width: u32,
     height: u32,
     hovered: Option<usize>,
+    /// The "Move to Workspace" submenu, if currently open -- see
+    /// WorkspaceSubmenu's doc comment.
+    workspace_submenu: Option<WorkspaceSubmenu>,
 }
 
 impl WindowMenu {
     fn item_at(&self, y: f64) -> Option<usize> {
         let row = (y / MENU_ROW_HEIGHT as f64) as usize;
         (row < WINDOW_MENU_ITEMS.len()).then_some(row)
+    }
+}
+
+/// The window menu's "Move to Workspace" submenu: lists every workspace
+/// directly rather than nesting further, so one can be picked in a single
+/// click. A subsurface of the window menu's own surface (itself a
+/// subsurface of the header) -- Wayland subsurface trees nest arbitrarily
+/// deep, and every surface in this chain is olshell's own, so this needed
+/// no protocol extension either, same as the window menu itself.
+/// Positioned to the window menu's right, top-aligned with the row that
+/// opened it (see open_workspace_submenu). Opened and closed by clicking
+/// that row, which toggles it exactly like the header button toggles the
+/// window menu itself.
+struct WorkspaceSubmenu {
+    subsurface: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
+    width: u32,
+    height: u32,
+    hovered: Option<usize>,
+    // Workspace count when this was opened. Doesn't react to the count
+    // changing while open -- a rare enough reconfiguration that
+    // re-deriving row layout live isn't worth the complexity; closing and
+    // reopening picks up the change like everything else here already
+    // does.
+    count: u32,
+    /// The decorated toplevel's own current workspace, if known -- shown
+    /// disabled in the list, same convention as Properties, since moving
+    /// a window to the workspace it's already on is a no-op.
+    current: Option<u32>,
+}
+
+impl WorkspaceSubmenu {
+    fn item_at(&self, y: f64) -> Option<usize> {
+        let row = (y / MENU_ROW_HEIGHT as f64) as usize;
+        (row < self.count as usize).then_some(row)
     }
 }
 
@@ -975,7 +1030,11 @@ impl Olshell {
             .chain(std::iter::once(label_width("Unstick")))
             .max()
             .unwrap_or(0);
-        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        // The extra MENU_H_PADDING + SUBMENU_ARROW_SIZE is Move to
+        // Workspace's submenu-indicator arrow (see draw_window_menu) --
+        // reserved on every row, not just that one, so the popup doesn't
+        // need a different width depending on which item has it.
+        let width = (max_width + MENU_H_PADDING * 3 + SUBMENU_ARROW_SIZE).max(80) as u32;
         let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface.clone(), qh);
@@ -985,8 +1044,15 @@ impl Olshell {
         // behaves that way too, and there's no reason this one shouldn't.
         subsurface.set_desync();
 
-        self.window_menu =
-            Some(WindowMenu { toplevel_id: toplevel_id.clone(), subsurface, surface, width, height, hovered: None });
+        self.window_menu = Some(WindowMenu {
+            toplevel_id: toplevel_id.clone(),
+            subsurface,
+            surface,
+            width,
+            height,
+            hovered: None,
+            workspace_submenu: None,
+        });
         self.draw_window_menu();
 
         // A newly-created subsurface doesn't actually show up until its
@@ -1001,6 +1067,10 @@ impl Olshell {
 
     fn close_window_menu(&mut self) {
         if let Some(wm) = self.window_menu.take() {
+            if let Some(sm) = wm.workspace_submenu {
+                sm.subsurface.destroy();
+                sm.surface.destroy();
+            }
             wm.subsurface.destroy();
             wm.surface.destroy();
         }
@@ -1027,8 +1097,9 @@ impl Olshell {
             pixel[3] = 0xFF;
         }
 
-        // Only Stick's label depends on current state -- olcore doesn't
-        // expose per-item state generally, just this one via sticky on
+        // Drives Stick's label ("Unstick" once toggled on) and Move to
+        // Workspace's disabled state below -- olcore doesn't expose
+        // per-item state generally, just this one via sticky on
         // Decoration (kept in sync by the sticky_changed event).
         let sticky = self
             .toplevels
@@ -1038,7 +1109,17 @@ impl Olshell {
 
         for (i, item) in WINDOW_MENU_ITEMS.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
-            if !item.disabled && wm.hovered == Some(i) {
+            // A sticky window is visible on every workspace regardless of
+            // workspace_index, and un-sticking always commits to whatever
+            // workspace is active *then* (see toggle_sticky's protocol
+            // doc comment) rather than to whatever assign_toplevel might
+            // have set it to -- so moving a sticky window's target
+            // workspace can't actually do anything right now, and the
+            // item is disabled while sticky rather than opening a
+            // submenu with nothing meaningful in it.
+            let disabled =
+                item.disabled || (matches!(item.action, WindowMenuAction::MoveToWorkspace) && sticky);
+            if !disabled && wm.hovered == Some(i) {
                 let (hr, hg, hb) = MENU_HOVER_COLOR;
                 for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
                     for x in 0..width {
@@ -1050,7 +1131,7 @@ impl Olshell {
                     }
                 }
             }
-            let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
+            let color = if disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             let label = if matches!(item.action, WindowMenuAction::ToggleSticky) && sticky {
                 "Unstick"
             } else {
@@ -1060,9 +1141,134 @@ impl Olshell {
                 canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
                 label, &self.font, MENU_FONT_SIZE, color,
             );
+            if matches!(item.action, WindowMenuAction::MoveToWorkspace) {
+                let ax1 = width - MENU_H_PADDING;
+                let ax0 = ax1 - SUBMENU_ARROW_SIZE;
+                let ay0 = row_y0 + (MENU_ROW_HEIGHT - SUBMENU_ARROW_SIZE) / 2;
+                let ay1 = ay0 + SUBMENU_ARROW_SIZE;
+                draw_submenu_arrow(canvas, width, height, ax0, ay0, ax1, ay1, color);
+            }
         }
 
         let wl_surface = &wm.surface;
+        buffer.attach_to(wl_surface).expect("failed to attach buffer");
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
+    }
+
+    /// Opens the window menu's "Move to Workspace" submenu -- a no-op if
+    /// it's already open (the MoveToWorkspace click handler calls
+    /// close_workspace_submenu instead in that case, same toggle pattern
+    /// the header button uses for the window menu itself) or if there's
+    /// only one workspace (nowhere else to move to).
+    fn open_workspace_submenu(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId) {
+        if self.workspace_count <= 1 {
+            return;
+        }
+        // Belt-and-suspenders: draw_window_menu already disables this
+        // item's row while sticky (see its doc comment on why moving a
+        // sticky window's target workspace can't do anything), so a
+        // pointer press shouldn't be able to reach here in the first
+        // place -- but this guard keeps that true regardless.
+        let sticky = self
+            .toplevels
+            .get(toplevel_id)
+            .and_then(|info| info.decoration.as_ref())
+            .is_some_and(|dec| dec.sticky);
+        if sticky {
+            return;
+        }
+        let Some(wm) = self.window_menu.as_ref() else {
+            return;
+        };
+        let wm_surface = wm.surface.clone();
+        let wm_width = wm.width as i32;
+        let row = WINDOW_MENU_ITEMS
+            .iter()
+            .position(|item| matches!(item.action, WindowMenuAction::MoveToWorkspace))
+            .expect("Move to Workspace is always in WINDOW_MENU_ITEMS");
+        let row_y = row as i32 * MENU_ROW_HEIGHT;
+
+        let label_width = |label: &str| -> i32 {
+            label
+                .chars()
+                .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
+                .sum()
+        };
+        let count = self.workspace_count;
+        let max_width = (0..count).map(|i| label_width(&format!("Workspace {}", i + 1))).max().unwrap_or(0);
+        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        let height = (count as i32 * MENU_ROW_HEIGHT) as u32;
+        let current = self.toplevels.get(toplevel_id).and_then(|info| info.workspace_index);
+
+        let (subsurface, surface) = self.subcompositor.create_subsurface(wm_surface.clone(), qh);
+        subsurface.set_position(wm_width, row_y);
+        subsurface.set_desync();
+
+        if let Some(wm) = self.window_menu.as_mut() {
+            wm.workspace_submenu =
+                Some(WorkspaceSubmenu { subsurface, surface, width, height, hovered: None, count, current });
+        }
+        self.draw_workspace_submenu();
+
+        // Same subsurface-visibility nudge every other handle in this
+        // chain needs -- see open_window_menu's identical comment.
+        wm_surface.commit();
+    }
+
+    fn close_workspace_submenu(&mut self) {
+        if let Some(wm) = self.window_menu.as_mut() {
+            if let Some(sm) = wm.workspace_submenu.take() {
+                sm.subsurface.destroy();
+                sm.surface.destroy();
+            }
+        }
+    }
+
+    fn draw_workspace_submenu(&mut self) {
+        let Some(sm) = self.window_menu.as_ref().and_then(|wm| wm.workspace_submenu.as_ref()) else {
+            return;
+        };
+        let width = sm.width as i32;
+        let height = sm.height as i32;
+        let stride = width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+
+        let (r, g, b) = MENU_BG_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+
+        for i in 0..sm.count {
+            let row_y0 = i as i32 * MENU_ROW_HEIGHT;
+            let is_current = Some(i) == sm.current;
+            if !is_current && sm.hovered == Some(i as usize) {
+                let (hr, hg, hb) = MENU_HOVER_COLOR;
+                for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
+                    for x in 0..width {
+                        let idx = ((y * width + x) * 4) as usize;
+                        canvas[idx] = hb;
+                        canvas[idx + 1] = hg;
+                        canvas[idx + 2] = hr;
+                        canvas[idx + 3] = 0xFF;
+                    }
+                }
+            }
+            let color = if is_current { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
+            draw_text_row_centered(
+                canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                &format!("Workspace {}", i + 1), &self.font, MENU_FONT_SIZE, color,
+            );
+        }
+
+        let wl_surface = &sm.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
         wl_surface.commit();
@@ -1502,6 +1708,49 @@ fn draw_chevron(
     }
 }
 
+/// Draws a small rightward-pointing wedge -- the window menu's indicator
+/// that an item opens a submenu rather than acting immediately. Same
+/// placeholder-geometry reasoning as draw_chevron (which this mirrors,
+/// x/y swapped): an approximation, not an asset-accurate glyph.
+#[allow(clippy::too_many_arguments)]
+fn draw_submenu_arrow(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    color: (u8, u8, u8),
+) {
+    let (r, g, b) = color;
+    let w = x1 - x0;
+    let h = y1 - y0;
+    let inset = (w.min(h) / 4).max(1);
+    let left = x0 + inset;
+    let right = x1 - inset;
+    let mid_y = (y0 + y1) / 2;
+    for x in left..right {
+        if right == left {
+            break;
+        }
+        // Narrows linearly from the full inset height at `left` down to a
+        // point at `right`, forming a rightward-pointing "wedge".
+        let t = 1.0 - (x - left) as f64 / (right - left) as f64;
+        let half = ((mid_y - y0 - inset) as f64 * t) as i32;
+        for y in (mid_y - half)..=(mid_y + half) {
+            if x < 0 || y < 0 || x >= canvas_width || y >= canvas_height {
+                continue;
+            }
+            let idx = ((y * canvas_width + x) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_text_at(
     canvas: &mut [u8],
@@ -1718,6 +1967,11 @@ impl PointerHandler for Olshell {
             let resize_region = self.resize_region_at(&event.surface);
             let on_window_menu =
                 self.window_menu.as_ref().is_some_and(|wm| event.surface == wm.surface);
+            let on_workspace_submenu = self
+                .window_menu
+                .as_ref()
+                .and_then(|wm| wm.workspace_submenu.as_ref())
+                .is_some_and(|sm| event.surface == sm.surface);
             // Captured before the "click elsewhere closes it" step below
             // clears it, so the button-click handler can tell a second
             // click on the button that opened this exact menu (which
@@ -1730,8 +1984,12 @@ impl PointerHandler for Olshell {
             // doc comment), so a press anywhere else is how it closes --
             // handled up front so it applies regardless of what else that
             // press goes on to do below (e.g. opening a different one).
+            // A press on the workspace submenu doesn't count as "elsewhere"
+            // either, even though it's a different surface than the window
+            // menu itself -- it's still part of the same menu from the
+            // user's perspective.
             if let PointerEventKind::Press { .. } = event.kind {
-                if self.window_menu.is_some() && !on_window_menu {
+                if self.window_menu.is_some() && !on_window_menu && !on_workspace_submenu {
                     self.close_window_menu();
                 }
             }
@@ -1858,10 +2116,21 @@ impl PointerHandler for Olshell {
                     }
                 }
                 PointerEventKind::Motion { .. } if on_window_menu => {
+                    // Computed before the mutable borrow below, same
+                    // reasoning as draw_window_menu's identically-named
+                    // local -- Move to Workspace is disabled while sticky.
+                    let sticky = window_menu_toplevel.as_ref().is_some_and(|id| {
+                        self.toplevels
+                            .get(id)
+                            .and_then(|info| info.decoration.as_ref())
+                            .is_some_and(|dec| dec.sticky)
+                    });
                     let changed = if let Some(wm) = self.window_menu.as_mut() {
-                        let hovered = wm
-                            .item_at(event.position.1)
-                            .filter(|&i| !WINDOW_MENU_ITEMS[i].disabled);
+                        let hovered = wm.item_at(event.position.1).filter(|&i| {
+                            let item = &WINDOW_MENU_ITEMS[i];
+                            !item.disabled
+                                && !(sticky && matches!(item.action, WindowMenuAction::MoveToWorkspace))
+                        });
                         if wm.hovered != hovered {
                             wm.hovered = hovered;
                             true
@@ -1888,9 +2157,22 @@ impl PointerHandler for Olshell {
                     let selection = self.window_menu.as_ref().and_then(|wm| {
                         wm.item_at(event.position.1).map(|index| (wm.toplevel_id.clone(), index))
                     });
+                    // Everything else closes the whole window menu once
+                    // handled; Move to Workspace instead opens (or closes)
+                    // its submenu and leaves the window menu itself open,
+                    // same as clicking the header button toggles the
+                    // window menu without touching anything else.
+                    let mut close_menu = true;
                     if let Some((toplevel_id, index)) = selection {
                         let item = &WINDOW_MENU_ITEMS[index];
-                        if !item.disabled {
+                        let sticky = self
+                            .toplevels
+                            .get(&toplevel_id)
+                            .and_then(|info| info.decoration.as_ref())
+                            .is_some_and(|dec| dec.sticky);
+                        let disabled = item.disabled
+                            || (matches!(item.action, WindowMenuAction::MoveToWorkspace) && sticky);
+                        if !disabled {
                             match item.action {
                                 WindowMenuAction::Close => {
                                     if let Some(handle) =
@@ -1960,12 +2242,79 @@ impl PointerHandler for Olshell {
                                         dec.object.toggle_sticky();
                                     }
                                 }
+                                WindowMenuAction::MoveToWorkspace => {
+                                    if self
+                                        .window_menu
+                                        .as_ref()
+                                        .is_some_and(|wm| wm.workspace_submenu.is_some())
+                                    {
+                                        self.close_workspace_submenu();
+                                    } else {
+                                        self.open_workspace_submenu(qh, &toplevel_id);
+                                    }
+                                    close_menu = false;
+                                }
                                 WindowMenuAction::Unimplemented => {
                                     log::info!("window menu: {} not yet implemented", item.label);
                                 }
                             }
                         }
                     }
+                    if close_menu {
+                        self.close_window_menu();
+                    }
+                }
+                PointerEventKind::Motion { .. } if on_workspace_submenu => {
+                    let changed = if let Some(sm) =
+                        self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
+                    {
+                        let hovered =
+                            sm.item_at(event.position.1).filter(|&i| Some(i as u32) != sm.current);
+                        if sm.hovered != hovered {
+                            sm.hovered = hovered;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if changed {
+                        self.draw_workspace_submenu();
+                    }
+                }
+                PointerEventKind::Leave { .. } if on_workspace_submenu => {
+                    let had_hover = self
+                        .window_menu
+                        .as_ref()
+                        .and_then(|wm| wm.workspace_submenu.as_ref())
+                        .is_some_and(|sm| sm.hovered.is_some());
+                    if had_hover {
+                        if let Some(sm) =
+                            self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
+                        {
+                            sm.hovered = None;
+                        }
+                        self.draw_workspace_submenu();
+                    }
+                }
+                PointerEventKind::Press { button, .. } if on_workspace_submenu && button == BTN_LEFT => {
+                    let selection = self.window_menu.as_ref().and_then(|wm| {
+                        let sm = wm.workspace_submenu.as_ref()?;
+                        let index = sm.item_at(event.position.1)?;
+                        (Some(index as u32) != sm.current).then_some((wm.toplevel_id.clone(), index as u32))
+                    });
+                    if let Some((toplevel_id, index)) = selection {
+                        if let (Some(manager), Some(handle)) = (
+                            self.workspaces_manager.as_ref(),
+                            self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref()),
+                        ) {
+                            manager.assign_toplevel(handle, index);
+                        }
+                    }
+                    // The whole point was picking a workspace -- done now,
+                    // regardless of whether the press landed on a real row
+                    // or the disabled current-workspace one.
                     self.close_window_menu();
                 }
                 PointerEventKind::Motion { .. } if on_popup => {
@@ -2281,6 +2630,9 @@ impl Dispatch<ZopenlookWorkspacesManagerV1, ()> for Olshell {
             Event::ToplevelWorkspace { toplevel, index } => {
                 let title = state.toplevels.get(&toplevel.id()).map(|i| i.title.clone());
                 log::info!("workspaces: toplevel {title:?} -> workspace {index}");
+                if let Some(info) = state.toplevels.get_mut(&toplevel.id()) {
+                    info.workspace_index = Some(index);
+                }
             }
         }
     }

@@ -241,6 +241,42 @@ with wlroots compositors generally, not just this project.
   have to cover both the header and the toplevel's content below it;
   the bottom stretch is one more `fill_rect` inside the existing footer
   buffer.
+
+  The window menu now has its first real submenu: `Move to Workspace`,
+  deferred earlier until submenu support existed (see the
+  workspace-switcher entry below). Clicking it opens a `WorkspaceSubmenu`
+  -- a subsurface of the window menu's own surface, positioned to its
+  right and top-aligned with that row, listing every workspace directly
+  (`Workspace 1`, `Workspace 2`, ...) rather than nesting further.
+  Clicking a workspace sends `assign_toplevel`, the same request
+  ADJUST-click on the panel already uses, and closes both menus; the
+  toplevel's own current workspace is shown disabled in the list (same
+  convention as `Properties`), since moving a window to where it already
+  is is a no-op -- tracked via a new `workspace_index` field on
+  `ToplevelInfo`, kept in sync by the workspaces protocol's
+  `toplevel_workspace` event, which olshell received but discarded
+  before this. Clicking `Move to Workspace` again while its submenu is
+  open closes just the submenu, the same toggle the header button
+  already uses for the window menu itself; clicking any other window-menu
+  item closes both, same as it always closed one. A small rightward
+  wedge (`draw_submenu_arrow`, mirroring `draw_chevron`) marks the row as
+  opening a submenu rather than acting immediately -- the only item with
+  one so far, but every row's width now reserves space for it, so a
+  future submenu item doesn't need a different-width popup.
+
+  Live testing surfaced a real gap: while a window is sticky, the
+  submenu's grayed-out "current" row reflected whatever workspace it was
+  on *before* being stuck, not where it actually is now (sticky windows
+  don't update `workspace_index` -- see the Stick entry above for why),
+  which read as wrong. But the deeper issue wasn't the display, it was
+  that the whole action is inert for a sticky window: `assign_toplevel`
+  would set `workspace_index`, but un-sticking always commits to
+  whichever workspace is active *at that moment* regardless of
+  `workspace_index` (the same fix that made un-sticking stop making
+  windows "disappear"), so nothing the submenu could do would have any
+  effect, now or later. Fixed by disabling the `Move to Workspace` item
+  itself while sticky, same convention as `Properties`, rather than
+  letting a submenu open with nothing meaningful in it.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - Multi-monitor behavior for the workspace strip (per-monitor
