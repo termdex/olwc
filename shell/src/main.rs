@@ -47,14 +47,18 @@ use wayland_protocols_wlr::foreign_toplevel::v1::client::{
 // openlook-workspaces isn't published anywhere -- it's olwc's own protocol,
 // generated straight from the XML in the repo the same way wlr-protocols
 // generates its own bindings (see wayland-scanner's docs). Cross-references
-// to zwlr_foreign_toplevel_handle_v1 resolve via the wlr crate's interfaces.
+// to zwlr_foreign_toplevel_handle_v1 resolve via the wlr crate's interfaces;
+// get_output_workspaces's wl_output argument needs wayland-client's own
+// core interfaces in scope too, same reasoning as openlook_decoration below.
 mod openlook_workspaces {
     pub mod v1 {
         pub mod client {
             use wayland_client;
+            use wayland_client::protocol::*;
             use wayland_protocols_wlr::foreign_toplevel::v1::client::*;
 
             pub mod __interfaces {
+                use wayland_client::protocol::__interfaces::*;
                 use wayland_protocols_wlr::foreign_toplevel::v1::client::__interfaces::*;
                 wayland_scanner::generate_interfaces!(
                     "../protocol/openlook-workspaces-unstable-v1.xml"
@@ -69,8 +73,9 @@ mod openlook_workspaces {
     }
 }
 
-use openlook_workspaces::v1::client::zopenlook_workspaces_manager_v1::{
-    self, ZopenlookWorkspacesManagerV1,
+use openlook_workspaces::v1::client::{
+    zopenlook_workspaces_manager_v1::{self, ZopenlookWorkspacesManagerV1},
+    zopenlook_workspaces_output_v1::{self, ZopenlookWorkspacesOutputV1},
 };
 
 // Same approach as openlook_workspaces above, but this protocol's
@@ -263,9 +268,12 @@ struct ToplevelInfo {
     handle: Option<ZwlrForeignToplevelHandleV1>,
     decoration: Option<Decoration>,
     // Kept in sync via the workspaces protocol's toplevel_workspace event.
-    // None only until the first such event arrives; used to gray out the
-    // window menu's own workspace in its Move to Workspace submenu.
+    // Both None only until the first such event arrives. workspace_index
+    // is used to gray out the window menu's own workspace in its Move to
+    // Workspace submenu; output says which WorkspacePanel that submenu
+    // should read/act through, now that workspaces are per-output.
     workspace_index: Option<u32>,
+    output: Option<wl_output::WlOutput>,
 }
 
 /// The header (title bar) chrome olshell draws for one toplevel it doesn't
@@ -497,6 +505,10 @@ struct WorkspaceSubmenu {
     width: u32,
     height: u32,
     hovered: Option<usize>,
+    // Which output's workspaces this lists -- resolved once at open time
+    // (the decorated toplevel's own current output) and used to find the
+    // right WorkspacePanel to read/act through when a row is picked.
+    output: wl_output::WlOutput,
     // Workspace count when this was opened. Doesn't react to the count
     // changing while open -- a rare enough reconfiguration that
     // re-deriving row layout live isn't worth the complexity; closing and
@@ -592,19 +604,10 @@ fn main() {
     let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
         .expect("wl_subcompositor not available");
 
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(
-        &qh,
-        surface,
-        Layer::Top,
-        Some("olshell-panel"),
-        None,
-    );
-    layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-    layer.set_size(0, PANEL_HEIGHT);
-    layer.set_exclusive_zone(PANEL_HEIGHT as i32);
-    layer.set_keyboard_interactivity(KeyboardInteractivity::None);
-    layer.commit();
+    // Panels are created per-output, one each, as they're discovered via
+    // OutputHandler::new_output -- see WorkspacePanel's doc comment.
+    // Nothing to do here at startup; new_output fires for every output
+    // that already exists too, once the event loop starts dispatching.
 
     // The desktop background doubles as the OPEN LOOK "root window": MENU
     // (right-button) clicks on it open the root menu. Non-exclusive so it
@@ -657,9 +660,7 @@ fn main() {
         shm,
         subcompositor,
         pool,
-        layer,
-        width: 0,
-        height: PANEL_HEIGHT,
+        panels: Vec::new(),
         background,
         bg_width: 0,
         bg_height: 0,
@@ -668,20 +669,39 @@ fn main() {
         workspaces_manager,
         decoration_manager,
         toplevels: std::collections::HashMap::new(),
-        workspace_count: 0,
-        active_workspace: 0,
         font,
         menu,
         pointer: None,
         keyboard: None,
         popup: None,
         window_menu: None,
-        hovered_workspace: None,
     };
 
     while !state.exit {
         event_queue.blocking_dispatch(&mut state).expect("event dispatch failed");
     }
+}
+
+/// One monitor's workspace switcher strip. Workspaces are per-output --
+/// each monitor cycles its own independent sequence, following i3/Sway's
+/// convention rather than one desktop-wide sequence, since it's the
+/// closest architectural relative to olcore and avoids a secondary
+/// reference monitor getting yanked to a different workspace just
+/// because the primary switched. So each output olshell learns about
+/// (via OutputHandler::new_output) gets its own panel, its own
+/// zopenlook_workspaces_output_v1 object, and its own
+/// workspace_count/active_workspace/hovered_workspace -- all the state
+/// that used to be flat fields on Olshell itself back when there was
+/// only ever one panel.
+struct WorkspacePanel {
+    output: wl_output::WlOutput,
+    layer: LayerSurface,
+    workspaces: ZopenlookWorkspacesOutputV1,
+    width: u32,
+    height: u32,
+    workspace_count: u32,
+    active_workspace: u32,
+    hovered_workspace: Option<u32>,
 }
 
 struct Olshell {
@@ -693,9 +713,7 @@ struct Olshell {
     shm: Shm,
     subcompositor: SubcompositorState,
     pool: SlotPool,
-    layer: LayerSurface,
-    width: u32,
-    height: u32,
+    panels: Vec<WorkspacePanel>,
     background: LayerSurface,
     bg_width: u32,
     bg_height: u32,
@@ -707,27 +725,30 @@ struct Olshell {
     workspaces_manager: Option<ZopenlookWorkspacesManagerV1>,
     decoration_manager: Option<ZopenlookDecorationManagerV1>,
     toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
-    workspace_count: u32,
-    active_workspace: u32,
     font: fontdue::Font,
     menu: Menu,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     popup: Option<MenuPopup>,
     window_menu: Option<WindowMenu>,
-    hovered_workspace: Option<u32>,
 }
 
 impl Olshell {
-    fn draw_panel(&mut self) {
-        // Nothing to paint into yet -- the compositor hasn't sent our first
-        // configure. A toplevel update arriving before then would otherwise
-        // draw into a degenerate 1px-wide buffer for no reason.
-        if self.width == 0 {
+    /// Draws one output's panel -- see WorkspacePanel's doc comment on why
+    /// there's one of these per output rather than a single shared one.
+    fn draw_panel(&mut self, panel_index: usize) {
+        let Some(panel) = self.panels.get(panel_index) else {
+            return;
+        };
+        // Nothing to paint into yet -- the compositor hasn't sent this
+        // panel's first configure. A workspace_count/active_changed event
+        // arriving before then would otherwise draw into a degenerate
+        // 1px-wide buffer for no reason.
+        if panel.width == 0 {
             return;
         }
-        let width = self.width as i32;
-        let height = self.height.max(1) as i32;
+        let width = panel.width as i32;
+        let height = panel.height.max(1) as i32;
         let stride = width * 4;
 
         let (buffer, canvas) = self
@@ -743,13 +764,14 @@ impl Olshell {
             pixel[3] = 0xFF;
         }
 
-        for i in 0..self.workspace_count {
+        let panel = &self.panels[panel_index];
+        for i in 0..panel.workspace_count {
             let (x0, x1) = workspace_segment_x(i);
             if x0 >= width {
                 break;
             }
-            let active = i == self.active_workspace;
-            let hovered = self.hovered_workspace == Some(i);
+            let active = i == panel.active_workspace;
+            let hovered = panel.hovered_workspace == Some(i);
             let (fill, text_color) = if active {
                 (BACKGROUND_COLOR, WORKSPACE_ACTIVE_TEXT_COLOR)
             } else if hovered {
@@ -766,10 +788,11 @@ impl Olshell {
             draw_text_row_centered(canvas, width, 0, height, label_x, &label, &self.font, PANEL_FONT_SIZE, text_color);
         }
 
-        let wl_surface = self.layer.wl_surface();
+        let panel = &self.panels[panel_index];
+        let wl_surface = panel.layer.wl_surface();
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
-        self.layer.commit();
+        panel.layer.commit();
     }
 
     fn draw_background(&mut self) {
@@ -1162,7 +1185,19 @@ impl Olshell {
     /// the header button uses for the window menu itself) or if there's
     /// only one workspace (nowhere else to move to).
     fn open_workspace_submenu(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId) {
-        if self.workspace_count <= 1 {
+        // Scoped to the toplevel's own current output -- listing every
+        // other monitor's workspaces too is real follow-up work, not
+        // built yet (see docs/DESIGN.md). Same output_workspaces_output
+        // is what ADJUST-click already used before Move to Workspace
+        // existed, just resolved here instead of from a click position.
+        let Some(output) = self.toplevels.get(toplevel_id).and_then(|info| info.output.clone()) else {
+            return;
+        };
+        let Some(panel_index) = self.panels.iter().position(|p| p.output == output) else {
+            return;
+        };
+        let count = self.panels[panel_index].workspace_count;
+        if count <= 1 {
             return;
         }
         // Belt-and-suspenders: draw_window_menu already disables this
@@ -1195,7 +1230,6 @@ impl Olshell {
                 .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
                 .sum()
         };
-        let count = self.workspace_count;
         let max_width = (0..count).map(|i| label_width(&format!("Workspace {}", i + 1))).max().unwrap_or(0);
         let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
         let height = (count as i32 * MENU_ROW_HEIGHT) as u32;
@@ -1206,8 +1240,16 @@ impl Olshell {
         subsurface.set_desync();
 
         if let Some(wm) = self.window_menu.as_mut() {
-            wm.workspace_submenu =
-                Some(WorkspaceSubmenu { subsurface, surface, width, height, hovered: None, count, current });
+            wm.workspace_submenu = Some(WorkspaceSubmenu {
+                subsurface,
+                surface,
+                width,
+                height,
+                hovered: None,
+                output,
+                count,
+                current,
+            });
         }
         self.draw_workspace_submenu();
 
@@ -1350,10 +1392,18 @@ impl Olshell {
         })
     }
 
-    /// Workspace index (0-based) the panel-local `x` falls on, if any.
-    fn workspace_at(&self, x: f64) -> Option<u32> {
+    /// Index into self.panels of whichever panel `surface` is, if any.
+    fn panel_at(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.panels.iter().position(|p| p.layer.wl_surface() == surface)
+    }
+
+    /// Workspace index (0-based) the panel-local `x` falls on, if any,
+    /// out of `workspace_count` total on that panel. Takes the count
+    /// explicitly (rather than being a method reading it off self) since
+    /// it's per-panel now, not a single global.
+    fn workspace_at(x: f64, workspace_count: u32) -> Option<u32> {
         let x = x as i32;
-        (0..self.workspace_count).find(|&i| {
+        (0..workspace_count).find(|&i| {
             let (x0, x1) = workspace_segment_x(i);
             x >= x0 && x < x1
         })
@@ -1848,16 +1898,71 @@ impl OutputHandler for Olshell {
         &mut self.output_state
     }
 
-    fn new_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
+    /// Creates this output's panel (see WorkspacePanel's doc comment) --
+    /// fires for every output that exists at startup too, once the event
+    /// loop starts dispatching, not just ones that appear later. If
+    /// openlook-workspaces isn't available there's no per-output object
+    /// to drive a panel with, so no panel gets created at all for any
+    /// output -- same degrade-gracefully spirit as the other optional
+    /// protocols, just at the whole-panel granularity instead of finer.
+    fn new_output(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let Some(manager) = self.workspaces_manager.as_ref() else {
+            return;
+        };
+
+        let surface = self.compositor.create_surface(qh);
+        let layer = self.layer_shell.create_layer_surface(
+            qh,
+            surface,
+            Layer::Top,
+            Some("olshell-panel"),
+            Some(&output),
+        );
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
+        layer.set_size(0, PANEL_HEIGHT);
+        layer.set_exclusive_zone(PANEL_HEIGHT as i32);
+        layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        layer.commit();
+
+        let workspaces = manager.get_output_workspaces(&output, qh, ());
+
+        self.panels.push(WorkspacePanel {
+            output,
+            layer,
+            workspaces,
+            width: 0,
+            height: PANEL_HEIGHT,
+            workspace_count: 0,
+            active_workspace: 0,
+            hovered_workspace: None,
+        });
+    }
+
     fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
-    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
+
+    /// The client-side half of tearing a panel down when its monitor goes
+    /// away -- olcore doesn't send anything new for this (see
+    /// output_destroy's doc comment in core/main.c): the ordinary
+    /// wl_output global going away is already the standard signal, and
+    /// sctk surfaces it here.
+    fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        if let Some(index) = self.panels.iter().position(|p| p.output == output) {
+            let panel = self.panels.remove(index);
+            panel.workspaces.destroy();
+            // panel.layer's own Drop impl destroys the layer surface and
+            // its underlying wl_surface -- same as elsewhere in olshell.
+        }
+    }
 }
 
 impl LayerShellHandler for Olshell {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        if layer.wl_surface() == self.layer.wl_surface()
-            || layer.wl_surface() == self.background.wl_surface()
-        {
+        // The background closing is the real "the compositor doesn't want
+        // us anymore" signal now -- a single panel closing (as opposed to
+        // its output being unplugged, which is output_destroyed's job)
+        // shouldn't take down the whole shell just because one monitor's
+        // strip went away.
+        if layer.wl_surface() == self.background.wl_surface() {
             self.exit = true;
         } else if self.popup.as_ref().is_some_and(|p| layer.wl_surface() == p.layer.wl_surface()) {
             self.popup = None;
@@ -1872,14 +1977,15 @@ impl LayerShellHandler for Olshell {
         configure: LayerSurfaceConfigure,
         _serial: u32,
     ) {
-        if layer.wl_surface() == self.layer.wl_surface() {
-            self.width = configure.new_size.0;
-            self.height = if configure.new_size.1 > 0 {
+        if let Some(index) = self.panels.iter().position(|p| layer.wl_surface() == p.layer.wl_surface()) {
+            let panel = &mut self.panels[index];
+            panel.width = configure.new_size.0;
+            panel.height = if configure.new_size.1 > 0 {
                 configure.new_size.1
             } else {
                 PANEL_HEIGHT
             };
-            self.draw_panel();
+            self.draw_panel(index);
         } else if layer.wl_surface() == self.background.wl_surface() {
             self.bg_width = configure.new_size.0;
             self.bg_height = configure.new_size.1;
@@ -1958,7 +2064,7 @@ impl PointerHandler for Olshell {
     ) {
         for event in events {
             let on_background = event.surface == *self.background.wl_surface();
-            let on_panel = event.surface == *self.layer.wl_surface();
+            let panel_index = self.panel_at(&event.surface);
             let on_popup = self
                 .popup
                 .as_ref()
@@ -1998,23 +2104,24 @@ impl PointerHandler for Olshell {
                 PointerEventKind::Press { button, .. } if on_background && button == BTN_RIGHT => {
                     self.open_menu(qh, event.position.0, event.position.1);
                 }
-                PointerEventKind::Motion { .. } if on_panel => {
-                    let hovered = self.workspace_at(event.position.0);
-                    if self.hovered_workspace != hovered {
-                        self.hovered_workspace = hovered;
-                        self.draw_panel();
+                PointerEventKind::Motion { .. } if panel_index.is_some() => {
+                    let i = panel_index.unwrap();
+                    let hovered = Olshell::workspace_at(event.position.0, self.panels[i].workspace_count);
+                    if self.panels[i].hovered_workspace != hovered {
+                        self.panels[i].hovered_workspace = hovered;
+                        self.draw_panel(i);
                     }
                 }
-                PointerEventKind::Leave { .. } if on_panel => {
-                    if self.hovered_workspace.take().is_some() {
-                        self.draw_panel();
+                PointerEventKind::Leave { .. } if panel_index.is_some() => {
+                    let i = panel_index.unwrap();
+                    if self.panels[i].hovered_workspace.take().is_some() {
+                        self.draw_panel(i);
                     }
                 }
-                PointerEventKind::Press { button, .. } if on_panel && button == BTN_LEFT => {
-                    if let Some(index) = self.workspace_at(event.position.0) {
-                        if let Some(manager) = self.workspaces_manager.as_ref() {
-                            manager.switch_to(index);
-                        }
+                PointerEventKind::Press { button, .. } if panel_index.is_some() && button == BTN_LEFT => {
+                    let panel = &self.panels[panel_index.unwrap()];
+                    if let Some(index) = Olshell::workspace_at(event.position.0, panel.workspace_count) {
+                        panel.workspaces.switch_to(index);
                     }
                 }
                 // ADJUST (middle-click) a segment to move the focused
@@ -2022,12 +2129,16 @@ impl PointerHandler for Olshell {
                 // from modern multi-workspace desktops; no OPEN LOOK
                 // precedent, but a fitting use for the ADJUST button
                 // (extend/modify an existing selection) all the same.
-                PointerEventKind::Press { button, .. } if on_panel && button == BTN_MIDDLE => {
-                    if let Some(index) = self.workspace_at(event.position.0) {
-                        if let (Some(manager), Some(handle)) =
-                            (self.workspaces_manager.as_ref(), self.focused_toplevel_handle())
-                        {
-                            manager.assign_toplevel(&handle, index);
+                // Acts through the *clicked* panel's own workspaces
+                // object, which is what makes this a real cross-monitor
+                // move when the focused window is on a different output
+                // than the one clicked -- see
+                // output_workspaces_handle_assign_toplevel in olcore.
+                PointerEventKind::Press { button, .. } if panel_index.is_some() && button == BTN_MIDDLE => {
+                    let panel = &self.panels[panel_index.unwrap()];
+                    if let Some(index) = Olshell::workspace_at(event.position.0, panel.workspace_count) {
+                        if let Some(handle) = self.focused_toplevel_handle() {
+                            panel.workspaces.assign_toplevel(&handle, index);
                         }
                     }
                 }
@@ -2302,14 +2413,15 @@ impl PointerHandler for Olshell {
                     let selection = self.window_menu.as_ref().and_then(|wm| {
                         let sm = wm.workspace_submenu.as_ref()?;
                         let index = sm.item_at(event.position.1)?;
-                        (Some(index as u32) != sm.current).then_some((wm.toplevel_id.clone(), index as u32))
+                        (Some(index as u32) != sm.current)
+                            .then_some((wm.toplevel_id.clone(), sm.output.clone(), index as u32))
                     });
-                    if let Some((toplevel_id, index)) = selection {
-                        if let (Some(manager), Some(handle)) = (
-                            self.workspaces_manager.as_ref(),
+                    if let Some((toplevel_id, output, index)) = selection {
+                        if let (Some(panel), Some(handle)) = (
+                            self.panels.iter().find(|p| p.output == output),
                             self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref()),
                         ) {
-                            manager.assign_toplevel(handle, index);
+                            panel.workspaces.assign_toplevel(handle, index);
                         }
                     }
                     // The whole point was picking a workspace -- done now,
@@ -2517,7 +2629,6 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                         info.title, info.app_id, info.states
                     );
                 }
-                state.draw_panel();
                 state.ensure_decoration(qh, &proxy.id());
                 state.draw_decoration(&proxy.id());
             }
@@ -2532,7 +2643,6 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                     }
                 }
                 proxy.destroy();
-                state.draw_panel();
             }
             Event::OutputEnter { .. } | Event::OutputLeave { .. } | Event::Parent { .. } => {}
             _ => {}
@@ -2617,22 +2727,46 @@ impl Dispatch<ZopenlookWorkspacesManagerV1, ()> for Olshell {
         use zopenlook_workspaces_manager_v1::Event;
 
         match event {
-            Event::WorkspaceCount { count } => {
-                state.workspace_count = count;
-                log::info!("workspaces: {count} available");
-                state.draw_panel();
-            }
-            Event::ActiveChanged { index } => {
-                state.active_workspace = index;
-                log::info!("workspaces: active = {index}");
-                state.draw_panel();
-            }
-            Event::ToplevelWorkspace { toplevel, index } => {
+            // WorkspaceCount/ActiveChanged moved to
+            // ZopenlookWorkspacesOutputV1 now that workspaces are
+            // per-output -- see that Dispatch impl below.
+            Event::ToplevelWorkspace { toplevel, output, index } => {
                 let title = state.toplevels.get(&toplevel.id()).map(|i| i.title.clone());
-                log::info!("workspaces: toplevel {title:?} -> workspace {index}");
+                log::info!("workspaces: toplevel {title:?} -> output {output:?} workspace {index}");
                 if let Some(info) = state.toplevels.get_mut(&toplevel.id()) {
+                    info.output = Some(output);
                     info.workspace_index = Some(index);
                 }
+            }
+        }
+    }
+}
+
+impl Dispatch<ZopenlookWorkspacesOutputV1, ()> for Olshell {
+    fn event(
+        state: &mut Self,
+        proxy: &ZopenlookWorkspacesOutputV1,
+        event: zopenlook_workspaces_output_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        use zopenlook_workspaces_output_v1::Event;
+
+        let Some(index) = state.panels.iter().position(|p| p.workspaces == *proxy) else {
+            return;
+        };
+
+        match event {
+            Event::WorkspaceCount { count } => {
+                state.panels[index].workspace_count = count;
+                log::info!("workspaces: panel {index}: {count} available");
+                state.draw_panel(index);
+            }
+            Event::ActiveChanged { index: active } => {
+                state.panels[index].active_workspace = active;
+                log::info!("workspaces: panel {index}: active = {active}");
+                state.draw_panel(index);
             }
         }
     }

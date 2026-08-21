@@ -26,17 +26,26 @@
   </copyright>
 
   <interface name="zopenlook_workspaces_manager_v1" version="1">
-    <description summary="linear workspace switching">
+    <description summary="per-output linear workspace switching">
       This protocol lets an unprivileged client (olshell) query and
-      change which OpenLook workspace is active, and learn which
-      workspace a given toplevel belongs to.
+      change which OpenLook workspace is active on a given output, and
+      learn which output and workspace a given toplevel belongs to.
+
+      Workspaces are per-output (each monitor cycles its own independent
+      sequence, following i3/Sway's convention rather than a single
+      desktop-wide sequence) -- see zopenlook_workspaces_output_v1 for
+      the request/event pair actually scoped to one. This manager is
+      just how a client obtains one of those per output, plus the one
+      thing that necessarily spans all of them: which output a toplevel
+      currently belongs to.
 
       olcore intentionally keeps no OpenLook-specific policy beyond
-      tracking a linear sequence of workspaces and, for each mapped
-      toplevel (as identified via wlr-foreign-toplevel-management),
-      which workspace it belongs to. All workspace UI -- switcher
-      strip, naming, animations -- is olshell's responsibility; this
-      protocol only carries the facts olshell needs to draw it.
+      tracking, per output, a linear sequence of workspaces and, for
+      each mapped toplevel (as identified via
+      wlr-foreign-toplevel-management), which output and workspace it
+      belongs to. All workspace UI -- switcher strip, naming,
+      animations -- is olshell's responsibility; this protocol only
+      carries the facts olshell needs to draw it.
 
       Warning! The protocol described in this file is currently in
       the testing phase. Backward compatible changes may be added
@@ -45,65 +54,102 @@
       major version number in the protocol and interface names.
     </description>
 
+    <request name="get_output_workspaces">
+      <description summary="obtain the workspace object for one output">
+        output must currently be a known output (one the compositor has
+        already advertised via wl_output); violating that sends the
+        no_such_output protocol error and leaves the new object inert
+        (any request on it is ignored).
+      </description>
+      <arg name="id" type="new_id" interface="zopenlook_workspaces_output_v1"/>
+      <arg name="output" type="object" interface="wl_output"/>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager object">
+        Destroys this manager object. Does not affect workspace state,
+        or any zopenlook_workspaces_output_v1 already obtained through
+        it.
+      </description>
+    </request>
+
+    <enum name="error">
+      <entry name="no_such_output" value="0" summary="the object does not name a currently-known output"/>
+    </enum>
+
+    <event name="toplevel_workspace">
+      <description summary="report a toplevel's output and workspace assignment">
+        Sent whenever a toplevel is assigned to, or reassigned to, an
+        output and workspace -- including being dragged across an
+        output boundary, which reassigns it to wherever it lands.
+        toplevel is a handle from wlr-foreign-toplevel-management-
+        unstable-v1, letting olshell correlate this assignment with the
+        toplevel metadata (title, app_id, ...) that protocol already
+        provides; index is relative to output's own workspace sequence,
+        not a desktop-wide one.
+      </description>
+      <arg name="toplevel" type="object" interface="zwlr_foreign_toplevel_handle_v1" summary="the toplevel"/>
+      <arg name="output" type="object" interface="wl_output" summary="the output index is relative to"/>
+      <arg name="index" type="uint" summary="workspace index the toplevel now belongs to, relative to output"/>
+    </event>
+  </interface>
+
+  <interface name="zopenlook_workspaces_output_v1" version="1">
+    <description summary="linear workspace switching for one output">
+      One output's independent workspace sequence -- switching here
+      never affects any other output's active workspace. Obtained via
+      zopenlook_workspaces_manager_v1.get_output_workspaces.
+    </description>
+
     <request name="switch_to">
-      <description summary="activate a workspace">
+      <description summary="activate a workspace on this output">
         Requests that the compositor make the workspace at the given
-        index the active one. index must be less than the count most
-        recently sent in a workspace_count event; out-of-range values
-        are ignored.
+        index the active one on this object's output. index must be
+        less than the count most recently sent in a workspace_count
+        event; out-of-range values are ignored.
       </description>
       <arg name="index" type="uint" summary="workspace index, 0-based"/>
     </request>
 
     <request name="assign_toplevel">
-      <description summary="move a toplevel to a different workspace">
+      <description summary="move a toplevel to a workspace on this output">
         Requests that toplevel (a handle from
-        wlr-foreign-toplevel-management-unstable-v1) be reassigned to the
-        workspace at index. index must be less than the count most
-        recently sent in a workspace_count event; out-of-range values are
-        ignored, as is a toplevel handle that doesn't currently name a
-        mapped toplevel. Reassigning a toplevel off the active workspace
-        hides it immediately (and moves focus elsewhere if it had it);
-        reassigning one onto the active workspace shows it.
+        wlr-foreign-toplevel-management-unstable-v1) be reassigned to
+        the workspace at index on this object's output -- moving it to
+        this output too, if it wasn't already here. index must be less
+        than the count most recently sent in a workspace_count event;
+        out-of-range values are ignored, as is a toplevel handle that
+        doesn't currently name a mapped toplevel. Reassigning a
+        toplevel off the active workspace hides it immediately (and
+        moves focus elsewhere if it had it); reassigning one onto the
+        active workspace shows it.
       </description>
       <arg name="toplevel" type="object" interface="zwlr_foreign_toplevel_handle_v1"/>
       <arg name="index" type="uint" summary="workspace index, 0-based"/>
     </request>
 
     <request name="destroy" type="destructor">
-      <description summary="destroy the manager object">
-        Destroys this manager object. Does not affect workspace state.
+      <description summary="destroy this object">
+        Destroys this object. Does not affect workspace state.
       </description>
     </request>
 
     <event name="workspace_count">
-      <description summary="advertise the number of workspaces">
-        Sent once immediately after binding, and again whenever the
-        number of workspaces changes.
+      <description summary="advertise the number of workspaces on this output">
+        Sent once immediately after creation, and again whenever the
+        number of workspaces on this output changes.
       </description>
-      <arg name="count" type="uint" summary="total number of workspaces"/>
+      <arg name="count" type="uint" summary="total number of workspaces on this output"/>
     </event>
 
     <event name="active_changed">
-      <description summary="advertise the active workspace">
-        Sent once immediately after binding, and again whenever the
-        active workspace changes, regardless of what caused the
-        change (this client's own switch_to request, another
-        client's, or a compositor-bound keybinding).
+      <description summary="advertise the active workspace on this output">
+        Sent once immediately after creation, and again whenever the
+        active workspace on this output changes, regardless of what
+        caused the change (this client's own switch_to request,
+        another client's, or a compositor-bound keybinding).
       </description>
       <arg name="index" type="uint" summary="index of the now-active workspace"/>
-    </event>
-
-    <event name="toplevel_workspace">
-      <description summary="report a toplevel's workspace assignment">
-        Sent whenever a toplevel is assigned to, or reassigned to, a
-        workspace. toplevel is a handle from
-        wlr-foreign-toplevel-management-unstable-v1, letting olshell
-        correlate this assignment with the toplevel metadata (title,
-        app_id, ...) that protocol already provides.
-      </description>
-      <arg name="toplevel" type="object" interface="zwlr_foreign_toplevel_handle_v1" summary="the toplevel"/>
-      <arg name="index" type="uint" summary="workspace index the toplevel now belongs to"/>
     </event>
   </interface>
 </protocol>

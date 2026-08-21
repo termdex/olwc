@@ -14,6 +14,7 @@
 #include <getopt.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <time.h>
 #include <unistd.h>
 #include <wayland-server-core.h>
@@ -93,10 +94,13 @@ struct olc_server {
 	struct wl_listener new_layer_surface;
 	struct wl_list layer_surfaces; // olc_layer_surface::link
 
+	// Workspaces are per-output (struct olc_output's own workspace_count/
+	// active_workspace) -- this global and its resources only carry
+	// per-output workspace object creation (get_output_workspaces) and
+	// toplevel_workspace, the one thing that necessarily spans all
+	// outputs. See protocol/openlook-workspaces-unstable-v1.xml.
 	struct wl_global *workspaces_manager_global;
 	struct wl_list workspace_resources; // olc_workspaces_resource::link
-	uint32_t workspace_count;
-	uint32_t active_workspace;
 
 	struct wlr_cursor *cursor;
 	struct wlr_xcursor_manager *cursor_mgr;
@@ -144,6 +148,24 @@ struct olc_output {
 	// surfaces (the panel, primarily). Updated by arrange_output_layers();
 	// zeroed (and thus not yet meaningful) until that's run at least once.
 	struct wlr_box usable_area;
+
+	// Per-output workspace state -- see olc_server::workspaces_manager_global's
+	// doc comment on why this lives here rather than on olc_server.
+	uint32_t workspace_count;
+	uint32_t active_workspace;
+	struct wl_list output_workspace_resources; // olc_output_workspaces_resource::link
+};
+
+// A client's zopenlook_workspaces_output_v1 object, bound to one output via
+// get_output_workspaces. output is NULL once that output is destroyed (see
+// output_destroy) -- same "inert rather than yanked out from under the
+// client" pattern olc_decoration uses for its toplevel pointer -- so
+// request handlers on an inert object just need to check for NULL and
+// silently no-op.
+struct olc_output_workspaces_resource {
+	struct wl_resource *resource;
+	struct olc_output *output;
+	struct wl_list link;
 };
 
 struct olc_toplevel {
@@ -170,6 +192,13 @@ struct olc_toplevel {
 	struct wl_listener foreign_request_activate;
 	struct wl_listener foreign_request_fullscreen;
 	struct wl_listener foreign_request_close;
+	// Which output this toplevel is considered to be on -- workspace_index
+	// is relative to this output's own sequence, not a desktop-wide one.
+	// Set at map time (place_new_toplevel) and kept current across an
+	// interactive move that crosses an output boundary (reset_cursor_mode)
+	// and across the output itself going away (output_destroy). Never
+	// NULL once mapped.
+	struct olc_output *output;
 	uint32_t workspace_index;
 	// Tracked so update_toplevel_visibility() can combine it with workspace
 	// membership -- minimize and workspace-switching are two independent
@@ -233,7 +262,7 @@ struct olc_layer_surface {
 
 // One per client binding of zopenlook_workspaces_manager_v1. wl_resource
 // has no public link field of its own, so we wrap it to keep a list we can
-// broadcast active_changed to.
+// broadcast toplevel_workspace to.
 struct olc_workspaces_resource {
 	struct wl_resource *resource;
 	struct olc_server *server;
@@ -249,6 +278,19 @@ struct olc_keyboard {
 	struct wl_listener destroy;
 };
 
+// Forward declarations: both are used by code earlier in the file than
+// where they're properly defined (output_from_wlr_output needs
+// server_new_output's struct olc_output populated first;
+// broadcast_toplevel_workspace needs olc_workspaces_resource's full
+// per-client-resource-walking helper, defined alongside it much further
+// down), but reset_cursor_mode and output_destroy both need them for
+// keeping a toplevel's output/workspace bookkeeping correct across a
+// cross-monitor drag or an unplugged monitor, respectively.
+static struct olc_output *output_from_wlr_output(
+	struct olc_server *server, struct wlr_output *wlr_output);
+static void broadcast_toplevel_workspace(struct olc_server *server,
+	struct wlr_foreign_toplevel_handle_v1 *handle, struct olc_output *output, uint32_t index);
+
 static struct olc_toplevel *olc_toplevel_from_xdg_toplevel(struct wlr_xdg_toplevel *xdg_toplevel) {
 	struct wlr_scene_tree *tree = xdg_toplevel->base->data;
 	return tree->node.data;
@@ -261,7 +303,8 @@ static struct olc_toplevel *olc_toplevel_from_xdg_toplevel(struct wlr_xdg_toplev
 // takes it along for free.
 static bool toplevel_is_visible(struct olc_toplevel *toplevel) {
 	return !toplevel->minimized &&
-		(toplevel->sticky || toplevel->workspace_index == toplevel->server->active_workspace);
+		(toplevel->sticky ||
+			(toplevel->output != NULL && toplevel->workspace_index == toplevel->output->active_workspace));
 }
 
 static void update_toplevel_visibility(struct olc_toplevel *toplevel) {
@@ -385,6 +428,31 @@ static void server_new_keyboard(struct olc_server *server, struct wlr_input_devi
 
 static void server_new_pointer(struct olc_server *server, struct wlr_input_device *device) {
 	wlr_cursor_attach_input_device(server->cursor, device);
+
+	// Some pointer devices only make sense mapped to one specific
+	// output's own region of the layout, rather than having their
+	// absolute coordinates normalized against the whole layout's
+	// bounding box (every other output included) -- a real touchscreen
+	// bound to one physical monitor is the usual example, but this is
+	// what the wayland backend's per-simulated-output pointers under
+	// WLR_WL_OUTPUTS need too, and is the only way to test multi-output
+	// behavior without real hardware. Confirmed live: without this, an
+	// absolute motion event from a second output's own pointer swept the
+	// cursor across the *entire* layout (both outputs combined) instead
+	// of staying within that one output -- fine with a single output
+	// (the layout's bounding box and that output's box are the same
+	// thing), badly wrong with more than one.
+	struct wlr_pointer *pointer = wlr_pointer_from_input_device(device);
+	if (pointer->output_name != NULL) {
+		struct olc_output *output;
+		wl_list_for_each(output, &server->outputs, link) {
+			if (output->wlr_output->name != NULL &&
+					strcmp(output->wlr_output->name, pointer->output_name) == 0) {
+				wlr_cursor_map_input_to_output(server->cursor, device, output->wlr_output);
+				break;
+			}
+		}
+	}
 }
 
 static void server_new_input(struct wl_listener *listener, void *data) {
@@ -445,6 +513,29 @@ static struct olc_toplevel *desktop_toplevel_at(
 }
 
 static void reset_cursor_mode(struct olc_server *server) {
+	struct olc_toplevel *toplevel = server->grabbed_toplevel;
+	// A move (not resize -- crossing a boundary while resizing isn't
+	// "moving monitors" the way a drag is) that ends with the cursor over
+	// a different output reassigns the toplevel there. The scene-graph
+	// position is already correct regardless (outputs share one
+	// continuous coordinate space via output_layout) -- this just keeps
+	// output/workspace_index bookkeeping in sync with where the window
+	// visually ended up. Same cursor-based output lookup
+	// place_new_toplevel uses for where a new window gets placed.
+	if (toplevel != NULL && server->cursor_mode == OLC_CURSOR_MOVE) {
+		struct wlr_output *wlr_output =
+			wlr_output_layout_output_at(server->output_layout, server->cursor->x, server->cursor->y);
+		struct olc_output *output = wlr_output != NULL ? output_from_wlr_output(server, wlr_output) : NULL;
+		if (output != NULL && output != toplevel->output) {
+			toplevel->output = output;
+			toplevel->workspace_index = output->active_workspace;
+			update_toplevel_visibility(toplevel);
+			if (toplevel->foreign_handle != NULL) {
+				broadcast_toplevel_workspace(server, toplevel->foreign_handle, output, toplevel->workspace_index);
+			}
+		}
+	}
+
 	server->cursor_mode = OLC_CURSOR_PASSTHROUGH;
 	server->grabbed_toplevel = NULL;
 }
@@ -607,10 +698,44 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 
 static void output_destroy(struct wl_listener *listener, void *data) {
 	struct olc_output *output = wl_container_of(listener, output, destroy);
+	struct olc_server *server = output->server;
+
 	wl_list_remove(&output->frame.link);
 	wl_list_remove(&output->request_state.link);
 	wl_list_remove(&output->destroy.link);
 	wl_list_remove(&output->link);
+
+	// Existing zopenlook_workspaces_output_v1 objects for this output
+	// become inert rather than outliving it -- see
+	// olc_output_workspaces_resource's doc comment.
+	struct olc_output_workspaces_resource *wr;
+	wl_list_for_each(wr, &output->output_workspace_resources, link) {
+		wr->output = NULL;
+	}
+
+	// Any toplevel still on this output needs somewhere to go. The
+	// scene-graph position itself is a separate, pre-existing concern
+	// (repositioning window content when a monitor is unplugged isn't
+	// unique to workspaces) -- this just keeps toplevel->output from
+	// dangling, falling back to whatever's now first in server->outputs
+	// (already unlinked above), or NULL if this was the last output.
+	struct olc_output *fallback = NULL;
+	if (!wl_list_empty(&server->outputs)) {
+		fallback = wl_container_of(server->outputs.next, fallback, link);
+	}
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		if (toplevel->output != output) {
+			continue;
+		}
+		toplevel->output = fallback;
+		toplevel->workspace_index = fallback != NULL ? fallback->active_workspace : 0;
+		update_toplevel_visibility(toplevel);
+		if (toplevel->foreign_handle != NULL) {
+			broadcast_toplevel_workspace(server, toplevel->foreign_handle, fallback, toplevel->workspace_index);
+		}
+	}
+
 	free(output);
 }
 
@@ -633,6 +758,9 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	struct olc_output *output = calloc(1, sizeof(*output));
 	output->wlr_output = wlr_output;
 	output->server = server;
+	output->workspace_count = OLC_WORKSPACE_COUNT;
+	output->active_workspace = 0;
+	wl_list_init(&output->output_workspace_resources);
 
 	output->frame.notify = output_frame;
 	wl_signal_add(&wlr_output->events.frame, &output->frame);
@@ -815,26 +943,54 @@ static void server_new_layer_surface(struct wl_listener *listener, void *data) {
 }
 
 // Sends toplevel_workspace to workspaces_resource only if its client also
-// holds a wlr-foreign-toplevel-management resource for this handle -- a
-// client that never bound that protocol has no object to reference.
+// holds a wlr-foreign-toplevel-management resource for this handle, and a
+// wl_output resource for output -- a client missing either has no object
+// to reference for that argument. Both are found the same way: walk the
+// relevant wlroots-owned resources list for one belonging to this
+// client, same pattern for both since struct wlr_output has a
+// `resources` list exactly like wlr_foreign_toplevel_handle_v1 does.
 static void send_toplevel_workspace(struct wl_resource *workspaces_resource,
-		struct wlr_foreign_toplevel_handle_v1 *handle, uint32_t index) {
+		struct wlr_foreign_toplevel_handle_v1 *handle, struct wlr_output *wlr_output, uint32_t index) {
 	struct wl_client *client = wl_resource_get_client(workspaces_resource);
-	struct wl_resource *handle_resource;
-	wl_resource_for_each(handle_resource, &handle->resources) {
-		if (wl_resource_get_client(handle_resource) == client) {
-			zopenlook_workspaces_manager_v1_send_toplevel_workspace(
-				workspaces_resource, handle_resource, index);
-			return;
+
+	struct wl_resource *handle_resource = NULL;
+	struct wl_resource *r;
+	wl_resource_for_each(r, &handle->resources) {
+		if (wl_resource_get_client(r) == client) {
+			handle_resource = r;
+			break;
 		}
 	}
+	if (handle_resource == NULL) {
+		return;
+	}
+
+	struct wl_resource *output_resource = NULL;
+	wl_resource_for_each(r, &wlr_output->resources) {
+		if (wl_resource_get_client(r) == client) {
+			output_resource = r;
+			break;
+		}
+	}
+	if (output_resource == NULL) {
+		return;
+	}
+
+	zopenlook_workspaces_manager_v1_send_toplevel_workspace(
+		workspaces_resource, handle_resource, output_resource, index);
 }
 
 static void broadcast_toplevel_workspace(struct olc_server *server,
-		struct wlr_foreign_toplevel_handle_v1 *handle, uint32_t index) {
+		struct wlr_foreign_toplevel_handle_v1 *handle, struct olc_output *output, uint32_t index) {
+	// output is NULL when a toplevel has nowhere to go (e.g. the last
+	// output was just unplugged, see output_destroy) -- nothing
+	// meaningful to broadcast in that case.
+	if (output == NULL) {
+		return;
+	}
 	struct olc_workspaces_resource *wr;
 	wl_list_for_each(wr, &server->workspace_resources, link) {
-		send_toplevel_workspace(wr->resource, handle, index);
+		send_toplevel_workspace(wr->resource, handle, output->wlr_output, index);
 	}
 }
 
@@ -921,11 +1077,22 @@ static void toplevel_handle_set_app_id(struct wl_listener *listener, void *data)
 // under the panel. Falls back to (0,0) if there's no output yet or layers
 // haven't been arranged yet (usable_area still its zeroed initial value).
 static void place_new_toplevel(struct olc_toplevel *toplevel) {
-	if (wl_list_empty(&toplevel->server->outputs)) {
+	struct olc_server *server = toplevel->server;
+	if (wl_list_empty(&server->outputs)) {
 		return;
 	}
-	struct olc_output *output =
-		wl_container_of(toplevel->server->outputs.next, output, link);
+	// The output under the cursor, matching Sway's "new windows go on the
+	// currently focused output" convention closely enough -- focus
+	// usually follows the cursor in practice, and olcore doesn't track a
+	// separate "focused output" concept of its own. Falls back to
+	// whatever's first in server->outputs if the cursor isn't over any.
+	struct wlr_output *wlr_output =
+		wlr_output_layout_output_at(server->output_layout, server->cursor->x, server->cursor->y);
+	struct olc_output *output = wlr_output != NULL ? output_from_wlr_output(server, wlr_output) : NULL;
+	if (output == NULL) {
+		output = wl_container_of(server->outputs.next, output, link);
+	}
+	toplevel->output = output;
 	if (output->usable_area.width <= 0 || output->usable_area.height <= 0) {
 		return;
 	}
@@ -963,8 +1130,10 @@ static void xdg_toplevel_map(struct wl_listener *listener, void *data) {
 
 	focus_toplevel(toplevel);
 
-	toplevel->workspace_index = toplevel->server->active_workspace;
-	broadcast_toplevel_workspace(toplevel->server, toplevel->foreign_handle, toplevel->workspace_index);
+	// place_new_toplevel (above) already set toplevel->output.
+	toplevel->workspace_index = toplevel->output != NULL ? toplevel->output->active_workspace : 0;
+	broadcast_toplevel_workspace(
+		toplevel->server, toplevel->foreign_handle, toplevel->output, toplevel->workspace_index);
 }
 
 // Tells olshell this decoration's toplevel is gone and drops olcore's side
@@ -1242,25 +1411,31 @@ static void refocus_if_hidden(struct olc_server *server) {
 	wlr_seat_keyboard_notify_clear_focus(server->seat);
 }
 
-static void workspaces_manager_handle_switch_to(
+static void output_workspaces_handle_switch_to(
 		struct wl_client *client, struct wl_resource *resource, uint32_t index) {
-	struct olc_workspaces_resource *r = wl_resource_get_user_data(resource);
-	struct olc_server *server = r->server;
+	struct olc_output_workspaces_resource *r = wl_resource_get_user_data(resource);
+	if (r->output == NULL) {
+		return; // Inert -- see olc_output_workspaces_resource's doc comment.
+	}
+	struct olc_output *output = r->output;
+	struct olc_server *server = output->server;
 
-	if (index >= server->workspace_count || index == server->active_workspace) {
+	if (index >= output->workspace_count || index == output->active_workspace) {
 		return;
 	}
-	server->active_workspace = index;
+	output->active_workspace = index;
 
 	struct olc_toplevel *toplevel;
 	wl_list_for_each(toplevel, &server->toplevels, link) {
-		update_toplevel_visibility(toplevel);
+		if (toplevel->output == output) {
+			update_toplevel_visibility(toplevel);
+		}
 	}
 	refocus_if_hidden(server);
 
-	struct olc_workspaces_resource *other;
-	wl_list_for_each(other, &server->workspace_resources, link) {
-		zopenlook_workspaces_manager_v1_send_active_changed(other->resource, server->active_workspace);
+	struct olc_output_workspaces_resource *other;
+	wl_list_for_each(other, &output->output_workspace_resources, link) {
+		zopenlook_workspaces_output_v1_send_active_changed(other->resource, output->active_workspace);
 	}
 }
 
@@ -1268,23 +1443,84 @@ static void workspaces_manager_handle_switch_to(
 // the currently focused toplevel there -- the only caller for now, but
 // deliberately not tied to "focused" in the protocol itself, in case a
 // future window-menu "Move to Workspace" item wants to target something
-// other than the focused toplevel.
-static void workspaces_manager_handle_assign_toplevel(struct wl_client *client,
+// other than the focused toplevel. Also reassigns the toplevel's own
+// output to this object's output when it wasn't already there -- this is
+// what makes ADJUST-click a real cross-monitor move, not just a
+// same-output workspace change, and lets a future cross-monitor
+// menu-driven move reuse this same request unchanged.
+static void output_workspaces_handle_assign_toplevel(struct wl_client *client,
 		struct wl_resource *resource, struct wl_resource *toplevel_handle_resource, uint32_t index) {
-	struct olc_workspaces_resource *r = wl_resource_get_user_data(resource);
-	struct olc_server *server = r->server;
+	struct olc_output_workspaces_resource *r = wl_resource_get_user_data(resource);
+	if (r->output == NULL) {
+		return;
+	}
+	struct olc_output *output = r->output;
+	struct olc_server *server = output->server;
 
-	if (index >= server->workspace_count) {
+	if (index >= output->workspace_count) {
 		return;
 	}
 	struct olc_toplevel *toplevel = toplevel_from_foreign_handle_resource(server, toplevel_handle_resource);
-	if (toplevel == NULL || toplevel->workspace_index == index) {
+	if (toplevel == NULL || (toplevel->output == output && toplevel->workspace_index == index)) {
 		return;
 	}
+	toplevel->output = output;
 	toplevel->workspace_index = index;
 	update_toplevel_visibility(toplevel);
 	refocus_if_hidden(server);
-	broadcast_toplevel_workspace(server, toplevel->foreign_handle, index);
+	broadcast_toplevel_workspace(server, toplevel->foreign_handle, output, index);
+}
+
+static void output_workspaces_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
+	wl_resource_destroy(resource);
+}
+
+static const struct zopenlook_workspaces_output_v1_interface output_workspaces_impl = {
+	.switch_to = output_workspaces_handle_switch_to,
+	.assign_toplevel = output_workspaces_handle_assign_toplevel,
+	.destroy = output_workspaces_handle_destroy,
+};
+
+static void output_workspaces_resource_destroy(struct wl_resource *resource) {
+	struct olc_output_workspaces_resource *r = wl_resource_get_user_data(resource);
+	wl_list_remove(&r->link);
+	free(r);
+}
+
+static void workspaces_manager_handle_get_output_workspaces(struct wl_client *client,
+		struct wl_resource *manager_resource, uint32_t id, struct wl_resource *output_resource) {
+	struct olc_workspaces_resource *mr = wl_resource_get_user_data(manager_resource);
+	struct olc_server *server = mr->server;
+
+	struct wlr_output *wlr_output = wlr_output_from_resource(output_resource);
+	struct olc_output *output = wlr_output != NULL ? output_from_wlr_output(server, wlr_output) : NULL;
+	if (output == NULL) {
+		wl_resource_post_error(manager_resource, ZOPENLOOK_WORKSPACES_MANAGER_V1_ERROR_NO_SUCH_OUTPUT,
+			"object does not name a currently-known output");
+		return;
+	}
+
+	uint32_t version = wl_resource_get_version(manager_resource);
+	struct wl_resource *resource =
+		wl_resource_create(client, &zopenlook_workspaces_output_v1_interface, (int)version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+
+	struct olc_output_workspaces_resource *r = calloc(1, sizeof(*r));
+	if (r == NULL) {
+		wl_resource_destroy(resource);
+		wl_client_post_no_memory(client);
+		return;
+	}
+	r->resource = resource;
+	r->output = output;
+	wl_list_insert(&output->output_workspace_resources, &r->link);
+	wl_resource_set_implementation(resource, &output_workspaces_impl, r, output_workspaces_resource_destroy);
+
+	zopenlook_workspaces_output_v1_send_workspace_count(resource, output->workspace_count);
+	zopenlook_workspaces_output_v1_send_active_changed(resource, output->active_workspace);
 }
 
 static void workspaces_manager_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
@@ -1292,8 +1528,7 @@ static void workspaces_manager_handle_destroy(struct wl_client *client, struct w
 }
 
 static const struct zopenlook_workspaces_manager_v1_interface workspaces_manager_impl = {
-	.switch_to = workspaces_manager_handle_switch_to,
-	.assign_toplevel = workspaces_manager_handle_assign_toplevel,
+	.get_output_workspaces = workspaces_manager_handle_get_output_workspaces,
 	.destroy = workspaces_manager_handle_destroy,
 };
 
@@ -1325,16 +1560,15 @@ static void workspaces_manager_bind(
 	wl_list_insert(&server->workspace_resources, &r->link);
 	wl_resource_set_implementation(resource, &workspaces_manager_impl, r, workspaces_manager_resource_destroy);
 
-	zopenlook_workspaces_manager_v1_send_workspace_count(resource, server->workspace_count);
-	zopenlook_workspaces_manager_v1_send_active_changed(resource, server->active_workspace);
-
-	// Catch this client up on already-mapped toplevels' workspace
+	// Catch this client up on already-mapped toplevels' output/workspace
 	// assignments. Only takes effect for toplevels this client can also
-	// see via wlr-foreign-toplevel-management; see send_toplevel_workspace().
+	// see via wlr-foreign-toplevel-management, and whose output it's also
+	// bound to wl_output for; see send_toplevel_workspace().
 	struct olc_toplevel *toplevel;
 	wl_list_for_each(toplevel, &server->toplevels, link) {
-		if (toplevel->foreign_handle != NULL) {
-			send_toplevel_workspace(resource, toplevel->foreign_handle, toplevel->workspace_index);
+		if (toplevel->foreign_handle != NULL && toplevel->output != NULL) {
+			send_toplevel_workspace(
+				resource, toplevel->foreign_handle, toplevel->output->wlr_output, toplevel->workspace_index);
 		}
 	}
 }
@@ -1447,12 +1681,17 @@ static void decoration_handle_toggle_sticky(struct wl_client *client, struct wl_
 	toplevel->sticky = !toplevel->sticky;
 	if (!toplevel->sticky) {
 		// Un-sticking commits the toplevel to wherever the user currently
-		// is, rather than snapping back to whatever workspace_index
-		// happened to be from before it was stuck -- likely long
-		// forgotten, and surprising to have the window suddenly vanish to
-		// (confirmed live: it is).
-		toplevel->workspace_index = toplevel->server->active_workspace;
-		broadcast_toplevel_workspace(toplevel->server, toplevel->foreign_handle, toplevel->workspace_index);
+		// is *on its own output* (sticky never changes which output a
+		// toplevel is on, just whether workspace_index matters for
+		// visibility), rather than snapping back to whatever
+		// workspace_index happened to be from before it was stuck --
+		// likely long forgotten, and surprising to have the window
+		// suddenly vanish to (confirmed live: it is).
+		if (toplevel->output != NULL) {
+			toplevel->workspace_index = toplevel->output->active_workspace;
+		}
+		broadcast_toplevel_workspace(
+			toplevel->server, toplevel->foreign_handle, toplevel->output, toplevel->workspace_index);
 	}
 	update_toplevel_visibility(toplevel);
 	zopenlook_decoration_v1_send_sticky_changed(decoration->resource, toplevel->sticky);
@@ -1715,8 +1954,6 @@ int main(int argc, char *argv[]) {
 	wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
 
 	wl_list_init(&server.workspace_resources);
-	server.workspace_count = OLC_WORKSPACE_COUNT;
-	server.active_workspace = 0;
 	server.workspaces_manager_global = wl_global_create(server.wl_display,
 		&zopenlook_workspaces_manager_v1_interface, 1, &server, workspaces_manager_bind);
 

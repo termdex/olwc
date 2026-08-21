@@ -279,8 +279,74 @@ with wlroots compositors generally, not just this project.
   letting a submenu open with nothing meaningful in it.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
-- Multi-monitor behavior for the workspace strip (per-monitor
-  workspaces vs. shared).
+- ~~Multi-monitor behavior for the workspace strip (per-monitor
+  workspaces vs. shared)~~ resolved: per-monitor, following i3/Sway's
+  convention (each output cycles its own independent sequence) rather
+  than GNOME/Windows's single desktop-wide sequence -- the strongest
+  precedent for a wlroots-based compositor specifically, and it avoids a
+  secondary reference monitor getting yanked to a different workspace
+  just because the primary switched. `openlook-workspaces-unstable-v1.xml`
+  now has a per-output object (`zopenlook_workspaces_output_v1`, obtained
+  via a new `get_output_workspaces` request on the manager) carrying
+  `switch_to`/`assign_toplevel`/`workspace_count`/`active_changed` --
+  previously flat on the manager, now meaningless un-scoped to an output.
+  The manager keeps only `get_output_workspaces` and `toplevel_workspace`
+  (which now also reports which output an assignment is relative to).
+  olcore moved `workspace_count`/`active_workspace` from `olc_server`
+  onto `olc_output`, and gave `olc_toplevel` an `output` field tracking
+  which monitor it's considered to be on -- set at map time to whichever
+  output is under the cursor (`place_new_toplevel`, matching Sway's
+  "new windows go on the focused output" convention, since olcore has no
+  separate notion of a focused output to track), and updated when an
+  interactive move ends with the cursor over a different output
+  (`reset_cursor_mode`) -- the scene-graph position is already correct
+  regardless, since outputs share one continuous coordinate space, this
+  just keeps the bookkeeping in sync with where the window visually
+  landed. `assign_toplevel` on the per-output object also reassigns a
+  toplevel's output when it targets a different one than the toplevel is
+  currently on, which is what makes ADJUST-click on a panel segment a
+  real cross-monitor move -- it already called through whichever panel
+  was clicked, so this fell out with no changes needed on the olshell
+  side of that gesture. olshell creates one panel per output (a new
+  `WorkspacePanel`, replacing the flat panel state `Olshell` used to
+  carry directly) in `OutputHandler::new_output`, which already existed
+  as an empty stub -- a layer surface explicitly bound to that output
+  (`create_layer_surface`'s `output` argument, previously always `None`,
+  which is why only one monitor ever got a panel at all before this) plus
+  its own `zopenlook_workspaces_output_v1`. `OutputHandler::output_destroyed`
+  (also a stub before this) tears the panel down again; olcore doesn't
+  need to send anything new for that since the ordinary `wl_output`
+  global going away is already the standard signal. The window menu's
+  Move to Workspace submenu resolves the decorated toplevel's own current
+  output (a new field on `ToplevelInfo`, fed by `toplevel_workspace`) to
+  find the matching panel, and stays scoped to that one output's
+  workspaces -- showing every other monitor's workspaces there too is
+  real follow-up work, not built yet. The root menu's background layer
+  surface is unchanged (still one, still `output: None`) -- right-click
+  to open it still only works on whichever one output the compositor
+  happens to pick; a pre-existing gap this pass didn't cause and didn't
+  fix, worth its own pass later. Verified with `WLR_WL_OUTPUTS=2`
+  (wlroots' nested-backend multi-output simulation): two independent
+  panels render correctly, each reporting and tracking its own
+  workspace_count/active_workspace; interactive switching, cross-monitor
+  dragging, and ADJUST-click need real pointer input to verify, handed
+  off for live testing the same way other pointer-driven features have
+  been this session.
+
+  That live testing surfaced a real bug, not just in the new per-output
+  code but in a gap that had been there all along and simply never
+  mattered with one output: olcore never called
+  `wlr_cursor_map_input_to_output`, so pointer devices were never mapped
+  to a specific output. Harmless with a single output (the layout's
+  bounding box and that one output's box are the same thing), but
+  wlroots' `wayland` backend creates a separate pointer device per
+  simulated output (each carrying an `output_name` hint, meant exactly
+  for this), and without the mapping, absolute motion events from one
+  output's device get normalized against the *entire* multi-output
+  layout instead of just that output's own region -- confirmed live as
+  a 2:1 sweep ratio and motion on one panel highlighting the other
+  entirely, both eliminated once `server_new_pointer` maps each device
+  to its matching output by name.
 - ~~Workspace switching has no visual effect~~ / ~~panel toplevel-title
   list~~ resolved together, as planned: `workspaces_manager_handle_switch_to`
   (`core/main.c`) now actually hides/shows toplevels via a shared
