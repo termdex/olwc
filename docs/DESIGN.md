@@ -357,9 +357,10 @@ with wlroots compositors generally, not just this project.
   global going away is already the standard signal. The window menu's
   Move to Workspace submenu resolves the decorated toplevel's own current
   output (a new field on `ToplevelInfo`, fed by `toplevel_workspace`) to
-  find the matching panel, and stays scoped to that one output's
+  find the matching panel. ~~It stays scoped to that one output's
   workspaces -- showing every other monitor's workspaces there too is
-  real follow-up work, not built yet. ~~The root menu's background layer
+  real follow-up work, not built yet.~~ Resolved in a later pass -- see
+  the Move to Workspace submenu bullet further down. ~~The root menu's background layer
   surface is unchanged (still one, still `output: None`) -- right-click
   to open it still only works on whichever one output the compositor
   happens to pick; a pre-existing gap this pass didn't cause and didn't
@@ -487,6 +488,58 @@ with wlroots compositors generally, not just this project.
   (colors, spacing, shapes) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
+- ~~Move to Workspace submenu is single-output only~~ resolved: it now
+  lists every output's workspaces, not just the decorated toplevel's own
+  current one -- the current output's first (keeping the plain flat list
+  a single-monitor setup always had, unchanged), then every other
+  output's, each introduced by its own non-interactive header row naming
+  that output (`OutputState::info`'s `name`, the same identifier
+  `WLR_WL_OUTPUTS` gives the nested-backend outputs used to test this).
+  Header rows only appear once there's more than one output at all, so a
+  single-monitor setup grows no new chrome it has no use for. Modeled as
+  `WorkspaceSubmenu::rows: Vec<WorkspaceSubmenuRow>` (an `OutputHeader` or
+  a `Workspace { output, index, current }`) rather than nesting another
+  level of submenu per output -- keeps every target a single click away,
+  and the row list is short enough in practice (a handful of workspaces
+  times a handful of monitors) that flattening it doesn't get unwieldy.
+  Clicking a row on a *different* output than the toplevel's own is what
+  this submenu was actually missing mechanically, not just missing rows
+  to click -- `assign_toplevel` on the per-output workspaces object has
+  reassigned a toplevel's `output`/`workspace_index` bookkeeping since
+  the multi-monitor pass above (the same request ADJUST-click on a panel
+  segment already used), but live-testing this submenu's new
+  cross-monitor rows caught that `output_workspaces_handle_assign_toplevel`
+  (`core/main.c`) never actually repositioned the toplevel's scene node
+  when the target output differs from its current one -- it stayed
+  rendered wherever it physically was on the *old* output's screen
+  (a different box in the same shared global coordinate space) while its
+  bookkeeping correctly followed the new one, which was visible as the
+  new output's workspace switcher controlling a window that still looked
+  like it belonged to the old one. This was already latent before this
+  pass -- ADJUST-click has the identical gap, just apparently never
+  exercised across two real outputs before now -- as opposed to a
+  cross-monitor *drag* (`reset_cursor_mode`), which never needed this:
+  the drag itself already leaves the scene node wherever the cursor
+  dropped it. Fixed by repositioning to the target output's
+  `usable_area` top-left, the same place `place_new_toplevel` puts a
+  brand new window, whenever the output actually changes.
+
+  That fix immediately surfaced a second, related bug on the very next
+  round of live testing: a *decorated* window moved this way landed with
+  its header behind the panel instead of just below it. A header
+  decoration pushes its toplevel's own scene node down by the header's
+  height, once, at the moment `get_decoration` attaches it (see that
+  request handler's "push the toplevel itself down" comment) -- the
+  header then sits *above* that pushed-down position, at the toplevel's
+  original spot. `place_new_toplevel` never needs to account for this,
+  since a toplevel is always undecorated at map time (olshell only
+  requests a decoration afterward, once it learns about the new toplevel
+  via wlr-foreign-toplevel-management) -- but a toplevel this
+  reassignment moves is very often already decorated, so repositioning
+  it straight to `usable_area`'s top-left put its *content* where the
+  *header* belongs, pushing the header itself above `usable_area` and
+  behind the panel. Fixed by adding the decoration's height to the
+  target y-coordinate when the toplevel has one.
 - Icon tray / minimize gap: investigating a question about the icon row
   along the bottom of the reference screenshots (see
   `screenshots/sunos551-ow1-scr-01/02/03.png`, which catch Calendar

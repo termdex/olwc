@@ -1529,6 +1529,36 @@ static void output_workspaces_handle_assign_toplevel(struct wl_client *client,
 	if (toplevel == NULL || (toplevel->output == output && toplevel->workspace_index == index)) {
 		return;
 	}
+	// A cross-monitor drag (reset_cursor_mode) never needs to reposition
+	// the scene node here -- the drag itself already left it wherever the
+	// cursor put it, in the same continuous global coordinate space every
+	// output shares. This request is a discrete click with no drag behind
+	// it (ADJUST-click on a panel segment, or the window menu's Move to
+	// Workspace), so when it's actually moving the toplevel to a
+	// *different* output, nothing else has ever positioned it there --
+	// without this, the toplevel's bookkeeping (output, workspace_index,
+	// visibility) all correctly follow the new output while it stays
+	// rendered wherever it happened to be on the old one, since that's a
+	// separate output's box in the same shared coordinate space. Same
+	// top-left-of-usable-area placement place_new_toplevel uses for a
+	// brand new window -- there's no more meaningful "where" to reuse
+	// here than there is for that case.
+	//
+	// If the toplevel already has a header decoration, its scene_tree
+	// (the toplevel's own content, not the header) sits height pixels
+	// below wherever it was originally placed -- see
+	// decoration_manager_handle_get_decoration's "push the toplevel
+	// itself down" comment. place_new_toplevel never needs to account
+	// for this since it only ever runs before a decoration can exist;
+	// this reassignment can happen to an already-decorated toplevel, so
+	// skipping it would put the header itself above usable_area's top
+	// edge -- confirmed live as the header ending up behind the panel.
+	if (toplevel->output != output &&
+			output->usable_area.width > 0 && output->usable_area.height > 0) {
+		int32_t header_height = toplevel->decoration != NULL ? (int32_t)toplevel->decoration->height : 0;
+		wlr_scene_node_set_position(&toplevel->scene_tree->node,
+			output->usable_area.x, output->usable_area.y + header_height);
+	}
 	toplevel->output = output;
 	toplevel->workspace_index = index;
 	update_toplevel_visibility(toplevel);

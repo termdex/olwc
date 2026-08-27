@@ -493,9 +493,29 @@ impl WindowMenu {
     }
 }
 
-/// The window menu's "Move to Workspace" submenu: lists every workspace
-/// directly rather than nesting further, so one can be picked in a single
-/// click. A subsurface of the window menu's own surface (itself a
+/// One row of a WorkspaceSubmenu.
+enum WorkspaceSubmenuRow {
+    /// A non-interactive row naming the output the Workspace rows right
+    /// below it belong to. Only present when there's more than one
+    /// output to choose from at all -- a single-monitor setup keeps
+    /// exactly the plain flat list this submenu always had, no headers.
+    OutputHeader { name: String },
+    /// A clickable "move to this workspace on this output" row.
+    Workspace {
+        output: wl_output::WlOutput,
+        index: u32,
+        /// Whether this is where the toplevel already is -- shown
+        /// disabled, same convention as Properties, since moving a
+        /// window to the workspace it's already on is a no-op.
+        current: bool,
+    },
+}
+
+/// The window menu's "Move to Workspace" submenu: lists every workspace on
+/// every output directly rather than nesting further per output, so one
+/// can still be picked in a single click -- see WorkspaceSubmenuRow for
+/// how a multi-output list stays readable without a second level of
+/// nesting. A subsurface of the window menu's own surface (itself a
 /// subsurface of the header) -- Wayland subsurface trees nest arbitrarily
 /// deep, and every surface in this chain is olshell's own, so this needed
 /// no protocol extension either, same as the window menu itself.
@@ -509,26 +529,29 @@ struct WorkspaceSubmenu {
     width: u32,
     height: u32,
     hovered: Option<usize>,
-    // Which output's workspaces this lists -- resolved once at open time
-    // (the decorated toplevel's own current output) and used to find the
-    // right WorkspacePanel to read/act through when a row is picked.
-    output: wl_output::WlOutput,
-    // Workspace count when this was opened. Doesn't react to the count
-    // changing while open -- a rare enough reconfiguration that
-    // re-deriving row layout live isn't worth the complexity; closing and
-    // reopening picks up the change like everything else here already
-    // does.
-    count: u32,
-    /// The decorated toplevel's own current workspace, if known -- shown
-    /// disabled in the list, same convention as Properties, since moving
-    /// a window to the workspace it's already on is a no-op.
-    current: Option<u32>,
+    // Snapshotted at open time -- doesn't react to a workspace count or
+    // output arrangement changing while open, a rare enough
+    // reconfiguration that re-deriving row layout live isn't worth the
+    // complexity; closing and reopening picks up the change like
+    // everything else here already does.
+    rows: Vec<WorkspaceSubmenuRow>,
 }
 
 impl WorkspaceSubmenu {
+    /// Row index at surface-local `y`, whether or not that row is
+    /// actually clickable (an OutputHeader, or the current-workspace
+    /// Workspace row, isn't) -- callers already need to look the row up
+    /// in `rows` to tell those apart, so this doesn't duplicate that.
     fn item_at(&self, y: f64) -> Option<usize> {
         let row = (y / MENU_ROW_HEIGHT as f64) as usize;
-        (row < self.count as usize).then_some(row)
+        (row < self.rows.len()).then_some(row)
+    }
+
+    /// Whether row `index` is a real, clickable target -- false for an
+    /// OutputHeader (never actionable) and for the current-workspace row
+    /// (a no-op, disabled the same way Properties is elsewhere).
+    fn is_selectable(&self, index: usize) -> bool {
+        matches!(self.rows.get(index), Some(WorkspaceSubmenuRow::Workspace { current: false, .. }))
     }
 }
 
@@ -1224,23 +1247,14 @@ impl Olshell {
     /// it's already open (the MoveToWorkspace click handler calls
     /// close_workspace_submenu instead in that case, same toggle pattern
     /// the header button uses for the window menu itself) or if there's
-    /// only one workspace (nowhere else to move to).
+    /// nowhere to move to at all (one workspace, one output).
     fn open_workspace_submenu(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId) {
-        // Scoped to the toplevel's own current output -- listing every
-        // other monitor's workspaces too is real follow-up work, not
-        // built yet (see docs/DESIGN.md). Same output_workspaces_output
-        // is what ADJUST-click already used before Move to Workspace
-        // existed, just resolved here instead of from a click position.
-        let Some(output) = self.toplevels.get(toplevel_id).and_then(|info| info.output.clone()) else {
+        let Some(current_output) = self.toplevels.get(toplevel_id).and_then(|info| info.output.clone()) else {
             return;
         };
-        let Some(panel_index) = self.panels.iter().position(|p| p.output == output) else {
+        let Some(current_panel_index) = self.panels.iter().position(|p| p.output == current_output) else {
             return;
         };
-        let count = self.panels[panel_index].workspace_count;
-        if count <= 1 {
-            return;
-        }
         // Belt-and-suspenders: draw_window_menu already disables this
         // item's row while sticky (see its doc comment on why moving a
         // sticky window's target workspace can't do anything), so a
@@ -1265,32 +1279,71 @@ impl Olshell {
             .expect("Move to Workspace is always in WINDOW_MENU_ITEMS");
         let row_y = row as i32 * MENU_ROW_HEIGHT;
 
+        let current_workspace = self.toplevels.get(toplevel_id).and_then(|info| info.workspace_index);
+
+        // Current output's workspaces first (matching the plain flat list
+        // this submenu always showed when there was only one output),
+        // then every other output's in whatever order olshell discovered
+        // them -- each one under its own non-interactive header row, but
+        // only once there's more than one output to choose from at all,
+        // so a single-monitor setup never grows headers it has no use
+        // for.
+        let multi_output = self.panels.len() > 1;
+        let mut panel_order: Vec<usize> = (0..self.panels.len()).collect();
+        panel_order.sort_by_key(|&i| if i == current_panel_index { 0 } else { 1 });
+
+        let mut rows = Vec::new();
+        for panel_index in panel_order {
+            let panel = &self.panels[panel_index];
+            if panel.workspace_count == 0 {
+                continue;
+            }
+            if multi_output {
+                let name = self
+                    .output_state
+                    .info(&panel.output)
+                    .and_then(|info| info.name)
+                    .unwrap_or_else(|| format!("Display {}", panel_index + 1));
+                rows.push(WorkspaceSubmenuRow::OutputHeader { name });
+            }
+            let is_current_output = panel_index == current_panel_index;
+            for index in 0..panel.workspace_count {
+                let current = is_current_output && Some(index) == current_workspace;
+                rows.push(WorkspaceSubmenuRow::Workspace { output: panel.output.clone(), index, current });
+            }
+        }
+        // Nothing anywhere to actually move to (one output, one
+        // workspace) -- same "nowhere else to move to" bail the old
+        // single-output count<=1 check covered, generalized to also
+        // cover "and there's no other output either".
+        let any_target = rows.iter().any(|row| matches!(row, WorkspaceSubmenuRow::Workspace { current: false, .. }));
+        if !any_target {
+            return;
+        }
+
         let label_width = |label: &str| -> i32 {
             label
                 .chars()
                 .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
                 .sum()
         };
-        let max_width = (0..count).map(|i| label_width(&format!("Workspace {}", i + 1))).max().unwrap_or(0);
+        let max_width = rows
+            .iter()
+            .map(|row| match row {
+                WorkspaceSubmenuRow::OutputHeader { name } => label_width(name),
+                WorkspaceSubmenuRow::Workspace { index, .. } => label_width(&format!("Workspace {}", index + 1)),
+            })
+            .max()
+            .unwrap_or(0);
         let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
-        let height = (count as i32 * MENU_ROW_HEIGHT) as u32;
-        let current = self.toplevels.get(toplevel_id).and_then(|info| info.workspace_index);
+        let height = (rows.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(wm_surface.clone(), qh);
         subsurface.set_position(wm_width, row_y);
         subsurface.set_desync();
 
         if let Some(wm) = self.window_menu.as_mut() {
-            wm.workspace_submenu = Some(WorkspaceSubmenu {
-                subsurface,
-                surface,
-                width,
-                height,
-                hovered: None,
-                output,
-                count,
-                current,
-            });
+            wm.workspace_submenu = Some(WorkspaceSubmenu { subsurface, surface, width, height, hovered: None, rows });
         }
         self.draw_workspace_submenu();
 
@@ -1329,10 +1382,15 @@ impl Olshell {
             pixel[3] = 0xFF;
         }
 
-        for i in 0..sm.count {
+        for (i, row) in sm.rows.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
-            let is_current = Some(i) == sm.current;
-            if !is_current && sm.hovered == Some(i as usize) {
+            // Only a Workspace row that isn't the current one can be
+            // hovered -- an OutputHeader is a plain separator, and the
+            // current-workspace row is disabled, same as everywhere else
+            // a disabled item never highlights.
+            let hovered = matches!(row, WorkspaceSubmenuRow::Workspace { current: false, .. })
+                && sm.hovered == Some(i);
+            if hovered {
                 let (hr, hg, hb) = MENU_HOVER_COLOR;
                 for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
                     for x in 0..width {
@@ -1344,10 +1402,16 @@ impl Olshell {
                     }
                 }
             }
-            let color = if is_current { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
+            let (label, color) = match row {
+                WorkspaceSubmenuRow::OutputHeader { name } => (name.clone(), MENU_TITLE_COLOR),
+                WorkspaceSubmenuRow::Workspace { index, current, .. } => (
+                    format!("Workspace {}", index + 1),
+                    if *current { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR },
+                ),
+            };
             draw_text_row_centered(
                 canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
-                &format!("Workspace {}", i + 1), &self.font, MENU_FONT_SIZE, color,
+                &label, &self.font, MENU_FONT_SIZE, color,
             );
         }
 
@@ -2481,8 +2545,7 @@ impl PointerHandler for Olshell {
                     let changed = if let Some(sm) =
                         self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
                     {
-                        let hovered =
-                            sm.item_at(event.position.1).filter(|&i| Some(i as u32) != sm.current);
+                        let hovered = sm.item_at(event.position.1).filter(|&i| sm.is_selectable(i));
                         if sm.hovered != hovered {
                             sm.hovered = hovered;
                             true
@@ -2514,9 +2577,11 @@ impl PointerHandler for Olshell {
                 PointerEventKind::Press { button, .. } if on_workspace_submenu && button == BTN_LEFT => {
                     let selection = self.window_menu.as_ref().and_then(|wm| {
                         let sm = wm.workspace_submenu.as_ref()?;
-                        let index = sm.item_at(event.position.1)?;
-                        (Some(index as u32) != sm.current)
-                            .then_some((wm.toplevel_id.clone(), sm.output.clone(), index as u32))
+                        let row_index = sm.item_at(event.position.1).filter(|&i| sm.is_selectable(i))?;
+                        let WorkspaceSubmenuRow::Workspace { output, index, .. } = &sm.rows[row_index] else {
+                            unreachable!("is_selectable guarantees a Workspace row");
+                        };
+                        Some((wm.toplevel_id.clone(), output.clone(), *index))
                     });
                     if let Some((toplevel_id, output, index)) = selection {
                         if let (Some(panel), Some(handle)) = (
