@@ -70,10 +70,39 @@
       <arg name="height" type="uint" summary="preferred header height, surface-local pixels"/>
     </request>
 
+    <request name="grab_keyboard">
+      <description summary="request seat keyboard focus for one of olshell's own surfaces">
+        Grants keyboard focus to surface -- any wl_surface belonging to
+        this client, typically a window-menu popup or one of its
+        submenus (subsurfaces of a header obtained via get_decoration).
+        wlr-layer-shell's Exclusive keyboard interactivity gives the
+        root menu this same ability directly; a decoration's header and
+        the popups hanging off it are plain subsurfaces with no
+        equivalent of their own, hence this request. Replaces whatever
+        surface previously had focus, olshell-owned or not.
+
+        Focus is given back to the most-recently-focused toplevel (see
+        focus_toplevel) as soon as either surface is destroyed or
+        release_keyboard is called, whichever happens first -- callers
+        that always destroy surface promptly when they're done with it
+        (as olshell does today) never need to call release_keyboard
+        explicitly.
+      </description>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+
+    <request name="release_keyboard">
+      <description summary="give back keyboard focus taken by grab_keyboard">
+        A no-op if the surface from the most recent grab_keyboard call
+        no longer has focus for some other reason (e.g. it was already
+        destroyed, or a later grab_keyboard call replaced it).
+      </description>
+    </request>
+
     <request name="destroy" type="destructor">
       <description summary="destroy the manager object">
         Destroys this manager object. Does not affect any decorations
-        already created through it.
+        already created through it, or a keyboard grab in progress.
       </description>
     </request>
 

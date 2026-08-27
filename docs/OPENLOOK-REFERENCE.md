@@ -174,4 +174,6 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - ~~Window header chrome~~ v1 resolved: see `docs/DESIGN.md`'s window
   gadget chrome entry. The window *menu* itself (as opposed to the
-  header it hangs off) is still open.
+  header it hangs off) is built out too now -- every item wired,
+  including a real submenu (Move to Workspace) and, most recently,
+  keyboard focus so Escape closes it -- same entry.

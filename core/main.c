@@ -90,6 +90,14 @@ struct olc_server {
 	// it doesn't own. See protocol/openlook-decoration-unstable-v1.xml.
 	struct wl_global *decoration_manager_global;
 
+	// The surface most recently granted focus via openlook-decoration's
+	// grab_keyboard request -- the window menu and its submenus, which
+	// (unlike the root menu) are plain subsurfaces with no
+	// wlr-layer-shell Exclusive-interactivity equivalent of their own.
+	// NULL when nothing is currently grabbed.
+	struct wlr_surface *keyboard_grab_surface;
+	struct wl_listener keyboard_grab_surface_destroy;
+
 	struct wlr_layer_shell_v1 *layer_shell;
 	struct wl_listener new_layer_surface;
 	struct wl_list layer_surfaces; // olc_layer_surface::link
@@ -347,9 +355,62 @@ static void focus_toplevel(struct olc_toplevel *toplevel) {
 	if (toplevel->foreign_handle != NULL) {
 		wlr_foreign_toplevel_handle_v1_set_activated(toplevel->foreign_handle, true);
 	}
+
+	// A keyboard grab (openlook-decoration's grab_keyboard -- currently
+	// just the window menu, see its doc comment) takes priority over the
+	// ordinary click-to-focus keyboard reassignment below: raising,
+	// reordering, and activating the toplevel above still happens
+	// regardless, but actual key input stays routed to the grabbed
+	// surface until it's released or destroyed, not silently stolen back
+	// just because a click landed somewhere in that toplevel's scene
+	// subtree -- which, from server_cursor_button's perspective, includes
+	// any decoration subsurface stacked on top of it, e.g. clicking a
+	// window menu item that doesn't close the menu (Move to Workspace).
+	// olshell already closes the window menu on a click anywhere else, so
+	// this never leaves a grab stranded -- it's released or destroyed
+	// within the same round trip regardless.
+	if (server->keyboard_grab_surface != NULL) {
+		return;
+	}
 	if (keyboard != NULL) {
 		wlr_seat_keyboard_notify_enter(seat, surface, keyboard->keycodes,
 			keyboard->num_keycodes, &keyboard->modifiers);
+	}
+}
+
+// Grants surface seat keyboard focus outright, with no toplevel-specific
+// bookkeeping (activation state, raise, MRU reordering) attached -- what
+// focus_toplevel does for a toplevel, this does for anything else that
+// legitimately wants keyboard focus for itself: a layer surface with
+// Exclusive interactivity (layer_surface_map) or a decoration subsurface
+// via grab_keyboard (decoration_manager_handle_grab_keyboard).
+static void grant_keyboard_focus(struct olc_server *server, struct wlr_surface *surface) {
+	struct wlr_seat *seat = server->seat;
+	struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
+	wlr_seat_keyboard_notify_enter(seat, surface,
+		keyboard ? keyboard->keycodes : NULL,
+		keyboard ? keyboard->num_keycodes : 0,
+		keyboard ? &keyboard->modifiers : NULL);
+}
+
+// Clears keyboard focus, then hands it to the most-recently-focused
+// toplevel (server->toplevels' own front -- see focus_toplevel, which
+// always inserts there), if any. Shared by everything that can lose
+// keyboard focus without a toplevel itself asking for it: a layer
+// surface being destroyed (layer_surface_destroy) and a grab_keyboard
+// surface being destroyed or explicitly released
+// (decoration_manager_handle_release_keyboard and its destroy-listener
+// counterpart). Callers are responsible for first checking that the
+// surface actually losing focus is the one that currently has it --
+// this unconditionally reassigns focus, which would wrongly steal it
+// from something else (e.g. a still-open pinned root menu popup) if
+// called when it isn't.
+static void restore_toplevel_focus(struct olc_server *server) {
+	wlr_seat_keyboard_notify_clear_focus(server->seat);
+	struct olc_toplevel *toplevel;
+	wl_list_for_each(toplevel, &server->toplevels, link) {
+		focus_toplevel(toplevel);
+		break;
 	}
 }
 
@@ -864,12 +925,7 @@ static void layer_surface_map(struct wl_listener *listener, void *data) {
 	struct wlr_layer_surface_v1 *wlr_layer_surface = layer_surface->layer_surface;
 	if (wlr_layer_surface->current.keyboard_interactive ==
 			ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_EXCLUSIVE) {
-		struct wlr_seat *seat = layer_surface->server->seat;
-		struct wlr_keyboard *keyboard = wlr_seat_get_keyboard(seat);
-		wlr_seat_keyboard_notify_enter(seat, wlr_layer_surface->surface,
-			keyboard ? keyboard->keycodes : NULL,
-			keyboard ? keyboard->num_keycodes : 0,
-			keyboard ? &keyboard->modifiers : NULL);
+		grant_keyboard_focus(layer_surface->server, wlr_layer_surface->surface);
 	}
 }
 
@@ -909,12 +965,7 @@ static void layer_surface_destroy(struct wl_listener *listener, void *data) {
 	free(layer_surface);
 
 	if (had_keyboard_focus) {
-		wlr_seat_keyboard_notify_clear_focus(server->seat);
-		struct olc_toplevel *toplevel;
-		wl_list_for_each(toplevel, &server->toplevels, link) {
-			focus_toplevel(toplevel);
-			break;
-		}
+		restore_toplevel_focus(server);
 	}
 
 	if (output != NULL) {
@@ -1866,6 +1917,56 @@ static void decoration_manager_handle_get_decoration(
 	configure_decoration(decoration);
 }
 
+// server->keyboard_grab_surface losing focus without an explicit
+// release_keyboard call -- either it was destroyed (this listener) or
+// something else (a toplevel being clicked, another grab_keyboard call)
+// already took focus away from it. Only the former needs handling here;
+// the check against the seat's actual focused_surface is what tells them
+// apart, same as layer_surface_destroy's had_keyboard_focus check --
+// without it, closing a grabbed surface that had *already* lost focus to
+// something else (e.g. a still-open pinned root menu popup) would wrongly
+// steal focus back from that something else.
+static void keyboard_grab_surface_handle_destroy(struct wl_listener *listener, void *data) {
+	struct olc_server *server = wl_container_of(listener, server, keyboard_grab_surface_destroy);
+	struct wlr_surface *surface = server->keyboard_grab_surface;
+	wl_list_remove(&server->keyboard_grab_surface_destroy.link);
+	server->keyboard_grab_surface = NULL;
+	if (server->seat->keyboard_state.focused_surface == surface) {
+		restore_toplevel_focus(server);
+	}
+}
+
+static void decoration_manager_handle_grab_keyboard(struct wl_client *client,
+		struct wl_resource *manager_resource, struct wl_resource *surface_resource) {
+	(void)client;
+	struct olc_server *server = wl_resource_get_user_data(manager_resource);
+	struct wlr_surface *surface = wlr_surface_from_resource(surface_resource);
+
+	if (server->keyboard_grab_surface != NULL) {
+		wl_list_remove(&server->keyboard_grab_surface_destroy.link);
+	}
+	server->keyboard_grab_surface = surface;
+	server->keyboard_grab_surface_destroy.notify = keyboard_grab_surface_handle_destroy;
+	wl_signal_add(&surface->events.destroy, &server->keyboard_grab_surface_destroy);
+
+	grant_keyboard_focus(server, surface);
+}
+
+static void decoration_manager_handle_release_keyboard(
+		struct wl_client *client, struct wl_resource *manager_resource) {
+	(void)client;
+	struct olc_server *server = wl_resource_get_user_data(manager_resource);
+	if (server->keyboard_grab_surface == NULL) {
+		return;
+	}
+	struct wlr_surface *surface = server->keyboard_grab_surface;
+	wl_list_remove(&server->keyboard_grab_surface_destroy.link);
+	server->keyboard_grab_surface = NULL;
+	if (server->seat->keyboard_state.focused_surface == surface) {
+		restore_toplevel_focus(server);
+	}
+}
+
 static void decoration_manager_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
 	(void)client;
 	wl_resource_destroy(resource);
@@ -1873,6 +1974,8 @@ static void decoration_manager_handle_destroy(struct wl_client *client, struct w
 
 static const struct zopenlook_decoration_manager_v1_interface decoration_manager_impl = {
 	.get_decoration = decoration_manager_handle_get_decoration,
+	.grab_keyboard = decoration_manager_handle_grab_keyboard,
+	.release_keyboard = decoration_manager_handle_release_keyboard,
 	.destroy = decoration_manager_handle_destroy,
 };
 

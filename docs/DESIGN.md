@@ -154,9 +154,47 @@ with wlroots compositors generally, not just this project.
   the same glyph the root menu's pin-to-persist gesture uses, since both
   mean "stays put").
 
-  No keyboard focus on the window menu yet, so only click-elsewhere
-  closes it, not Escape --
-  follow-up, same as Escape support was for the root menu.
+  ~~No keyboard focus on the window menu yet, so only click-elsewhere
+  closes it, not Escape~~ resolved: unlike the root menu, a plain
+  subsurface has no wlr-layer-shell Exclusive-interactivity equivalent to
+  ask for keyboard focus with, so this needed a small openlook-decoration
+  addition -- `grab_keyboard(surface)`/`release_keyboard()` requests on
+  the manager, letting olshell hand any of its own surfaces seat keyboard
+  focus outright. `open_window_menu` calls `grab_keyboard` once, on the
+  window menu's own surface; `close_window_menu` never needs
+  `release_keyboard` explicitly, since it always destroys that surface
+  right away, and olcore's own destroy-listener counterpart
+  (`keyboard_grab_surface_handle_destroy`) hands focus back to the
+  most-recently-focused toplevel when that happens -- the same
+  `restore_toplevel_focus` helper `layer_surface_destroy` already used
+  for the equivalent case on a closing layer surface, factored out for
+  the second caller.
+
+  Live testing surfaced one more real gap this exposed: `server_cursor_button`
+  calls `focus_toplevel` on every click against a toplevel's own scene
+  subtree, which includes any decoration subsurface stacked on it --
+  including the window menu itself. Without a guard, clicking a menu item
+  that doesn't close the menu (Move to Workspace, which just opens its
+  own submenu) would immediately steal focus back to the toplevel's own
+  surface, breaking Escape for the still-open menu. Fixed by having
+  `focus_toplevel` skip only its final keyboard-reassignment step (not
+  the raise/activate/MRU-reorder steps above it, which still make sense
+  regardless) whenever a `grab_keyboard` grab is active -- olshell already
+  closes the window menu on a click anywhere else, so this never leaves a
+  stale grab stranded; it's released within the same round trip either
+  way.
+
+  A second round of live testing raised a real UX question rather than a
+  bug: with the Move to Workspace submenu open, should Escape close just
+  the submenu or the whole window menu? Made it match the mouse
+  convention already established for the same row (clicking Move to
+  Workspace again closes just the submenu it opened, not the window menu
+  behind it) -- one level at a time, closest thing to a precedent this
+  codebase already has for it. Since keyboard focus stays on the window
+  menu's own surface throughout (the submenu never gets its own grab --
+  see WindowMenu's doc comment), press_key can't tell submenu-open from
+  window-menu-only-open by *which surface* has focus the way it does for
+  everything else; it checks `workspace_submenu.is_some()` instead.
 
   Resize chrome is now complete: all four corners plus a footer strip
   between the two bottom ones, unified under one `ResizeRegion` enum

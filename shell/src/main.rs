@@ -463,13 +463,17 @@ impl Decoration {
 
 /// The window menu popup for one toplevel, opened by clicking its
 /// decoration's button. A wl_subsurface of the decoration's own surface --
-/// both are olshell-owned, so this needs no protocol extension, unlike the
-/// decoration itself -- positioned just below the header, extending down
-/// over the window's content like the reference screenshots show. No
-/// pushpin (the reference doesn't show one on window menus, only on root
-/// menu-style pinnable menus) and no keyboard focus yet, so Escape doesn't
-/// close it -- click elsewhere does. Follow-up work, same as Escape support
-/// was for the root menu.
+/// both are olshell-owned, so positioning it needs no protocol extension,
+/// unlike the decoration itself -- positioned just below the header,
+/// extending down over the window's content like the reference screenshots
+/// show. No pushpin (the reference doesn't show one on window menus, only
+/// on root menu-style pinnable menus).
+///
+/// Unlike a root-menu popup, a plain subsurface has no wlr-layer-shell
+/// Exclusive-interactivity equivalent to ask for keyboard focus with, so
+/// getting Escape-to-close working here (`open_window_menu`) did need a
+/// protocol addition: openlook-decoration's grab_keyboard request. Click
+/// elsewhere still closes it too, same as before.
 struct WindowMenu {
     toplevel_id: ObjectId,
     subsurface: wl_subsurface::WlSubsurface,
@@ -1084,6 +1088,16 @@ impl Olshell {
         // behaves that way too, and there's no reason this one shouldn't.
         subsurface.set_desync();
 
+        // A plain subsurface has no wlr-layer-shell Exclusive-interactivity
+        // equivalent of its own, so getting keyboard focus (and thus
+        // Escape-to-close, see WindowMenu's doc comment) needs asking
+        // olcore explicitly. No matching release_keyboard call on close --
+        // close_window_menu always destroys surface right after, which is
+        // enough on its own (see grab_keyboard's doc comment).
+        if let Some(manager) = self.decoration_manager.as_ref() {
+            manager.grab_keyboard(&surface);
+        }
+
         self.window_menu = Some(WindowMenu {
             toplevel_id: toplevel_id.clone(),
             subsurface,
@@ -1110,6 +1124,16 @@ impl Olshell {
             if let Some(sm) = wm.workspace_submenu {
                 sm.subsurface.destroy();
                 sm.surface.destroy();
+            }
+            // Don't wait for a leave event that destroying our own surface
+            // may or may not still generate -- drop the stale reference now
+            // so a later Escape doesn't look this surface up and find
+            // nothing (same reasoning as close_menu's matching guard for a
+            // root-menu popup). olcore's own destroy-listener counterpart
+            // (keyboard_grab_surface_handle_destroy) is what actually hands
+            // focus back to a toplevel; nothing to request on this end.
+            if self.keyboard_focus.as_ref() == Some(&wm.surface) {
+                self.keyboard_focus = None;
             }
             wm.subsurface.destroy();
             wm.surface.destroy();
@@ -2607,15 +2631,30 @@ impl KeyboardHandler for Olshell {
         _serial: u32,
         event: KeyEvent,
     ) {
-        // The only surface we ever request keyboard focus for is a
-        // root-menu popup (Exclusive interactivity, see MenuPopup's doc
-        // comment) -- with more than one possibly open at once now
-        // (one pinned per output), keyboard_focus is how Escape tells
-        // which one olcore actually handed focus to, so only that one
-        // closes.
+        // The only surfaces we ever request keyboard focus for are a
+        // root-menu popup (wlr-layer-shell's Exclusive interactivity, see
+        // MenuPopup's doc comment) and the window menu (openlook-
+        // decoration's grab_keyboard, see WindowMenu's doc comment) --
+        // keyboard_focus is how Escape tells which one, if either,
+        // olcore actually handed focus to, so only that one closes.
         if event.keysym == Keysym::Escape {
-            if let Some(index) = self.keyboard_focus.as_ref().and_then(|s| self.popup_at(s)) {
+            let Some(surface) = self.keyboard_focus.as_ref() else {
+                return;
+            };
+            if let Some(index) = self.popup_at(surface) {
                 self.close_menu(index);
+            } else if self.window_menu.as_ref().is_some_and(|wm| wm.surface == *surface) {
+                // One level at a time, same as clicking Move to Workspace
+                // again closes just the submenu it opened rather than the
+                // whole window menu -- keyboard focus stays on the window
+                // menu's own surface throughout (see WindowMenu's doc
+                // comment), so this is the only way Escape can tell the
+                // submenu is the topmost thing open right now.
+                if self.window_menu.as_ref().is_some_and(|wm| wm.workspace_submenu.is_some()) {
+                    self.close_workspace_submenu();
+                } else {
+                    self.close_window_menu();
+                }
             }
         }
     }
