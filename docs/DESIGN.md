@@ -540,6 +540,50 @@ with wlroots compositors generally, not just this project.
   *header* belongs, pushing the header itself above `usable_area` and
   behind the panel. Fixed by adding the decoration's height to the
   target y-coordinate when the toplevel has one.
+- ~~Move-grab-only output reassignment~~ resolved: `reset_cursor_mode`
+  (`core/main.c`) now reassigns a toplevel's output on a resize-grab end
+  too, not just a move -- and for both, by which output contains the
+  center of the toplevel's own box (a new `output_for_toplevel` helper)
+  rather than the cursor's exact position at release. The cursor sits
+  wherever the user happened to grab a title bar or resize handle, which
+  isn't necessarily representative of where the bulk of the window
+  actually ended up; the window's own center is. This also means a small
+  resize that only nudges one edge across a boundary doesn't reassign
+  anything -- the center has to actually cross too -- which is what
+  makes extending this to resize safe: the original concern that
+  "resizing across a boundary isn't moving monitors" only really applied
+  to an edge grazing the boundary, not to a resize substantial enough to
+  relocate the window's center, which is just as much "now it lives over
+  there" as a drag is.
+
+  Live-testing this exposed a real limitation of `WLR_WL_OUTPUTS=2`
+  nested-backend testing itself, not a bug: a held-button drag can't
+  actually cross from one nested output's host window into the other's
+  at all -- confirmed as an environment artifact, not code, since it
+  persisted with the two host windows positioned edge-to-edge (no gap)
+  and reproduced with no window involved, just a plain click-hold-drag.
+  Each nested output is its own separate host-level window with its own
+  pointer device, absolute coordinates clamped to that window's own
+  bounds; the host compositor keeps a held-button drag routed to
+  whichever one it started in for as long as the button is down,
+  regardless of where the pointer physically travels meanwhile. Real
+  multi-monitor hardware has no such split to hit a wall against -- one
+  continuous pointer device spans every monitor already. This means a
+  *resize* grab crossing a boundary can't be directly exercised in this
+  environment (a resized edge is a direct function of the capped cursor
+  position, with no way around the wall), unlike a *move*, which can
+  still indirectly confirm the fix: dragging by a header offset close to
+  the window's own edge can push the window's center past the boundary
+  even while the cursor itself is capped at it, and this was confirmed
+  live -- the window ended up correctly reassigned to the far output
+  (workspace membership, panel highlighting) while its header, a plain
+  subsurface rendered whichever output it visually straddles into, sat
+  on the near one -- exactly the "leave a straddling window's decoration
+  wherever it visually is; keep only the *workspace* bookkeeping
+  consistent" behavior already intentional for a drag. The resize case
+  shares the identical `reset_cursor_mode`/`output_for_toplevel` code
+  path this move case just indirectly verified, so it's correct by
+  construction even without being independently exercised live.
 - Icon tray / minimize gap: investigating a question about the icon row
   along the bottom of the reference screenshots (see
   `screenshots/sunos551-ow1-scr-01/02/03.png`, which catch Calendar

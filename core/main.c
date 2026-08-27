@@ -577,20 +577,35 @@ static struct olc_toplevel *desktop_toplevel_at(
 	return tree ? tree->node.data : NULL;
 }
 
+// The output containing the center of toplevel's current on-screen box --
+// a more representative "which output does this toplevel actually belong
+// to now" signal than the cursor's exact position, which can sit anywhere
+// along whichever edge or title bar the user actually grabbed rather than
+// where the bulk of the window ended up. Used by reset_cursor_mode for
+// both move- and resize-grab-end reassignment: growing or shrinking a
+// window across a boundary is exactly as much "now it lives over there"
+// as dragging it is, once enough of it has actually crossed over to move
+// the center: a resize that only nudges one edge across doesn't move the
+// center far enough to reassign anything either, so this doesn't
+// reassign on every small resize near a boundary.
+static struct olc_output *output_for_toplevel(struct olc_server *server, struct olc_toplevel *toplevel) {
+	struct wlr_box geo = toplevel->xdg_toplevel->base->geometry;
+	double cx = toplevel->scene_tree->node.x + geo.width / 2.0;
+	double cy = toplevel->scene_tree->node.y + geo.height / 2.0;
+	struct wlr_output *wlr_output = wlr_output_layout_output_at(server->output_layout, cx, cy);
+	return wlr_output != NULL ? output_from_wlr_output(server, wlr_output) : NULL;
+}
+
 static void reset_cursor_mode(struct olc_server *server) {
 	struct olc_toplevel *toplevel = server->grabbed_toplevel;
-	// A move (not resize -- crossing a boundary while resizing isn't
-	// "moving monitors" the way a drag is) that ends with the cursor over
-	// a different output reassigns the toplevel there. The scene-graph
-	// position is already correct regardless (outputs share one
-	// continuous coordinate space via output_layout) -- this just keeps
-	// output/workspace_index bookkeeping in sync with where the window
-	// visually ended up. Same cursor-based output lookup
-	// place_new_toplevel uses for where a new window gets placed.
-	if (toplevel != NULL && server->cursor_mode == OLC_CURSOR_MOVE) {
-		struct wlr_output *wlr_output =
-			wlr_output_layout_output_at(server->output_layout, server->cursor->x, server->cursor->y);
-		struct olc_output *output = wlr_output != NULL ? output_from_wlr_output(server, wlr_output) : NULL;
+	// A move or resize that ends with the toplevel now centered over a
+	// different output reassigns it there. The scene-graph position is
+	// already correct regardless (outputs share one continuous coordinate
+	// space via output_layout) -- this just keeps output/workspace_index
+	// bookkeeping in sync with where the window visually ended up.
+	if (toplevel != NULL &&
+			(server->cursor_mode == OLC_CURSOR_MOVE || server->cursor_mode == OLC_CURSOR_RESIZE)) {
+		struct olc_output *output = output_for_toplevel(server, toplevel);
 		if (output != NULL && output != toplevel->output) {
 			toplevel->output = output;
 			toplevel->workspace_index = output->active_workspace;
