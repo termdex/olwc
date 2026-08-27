@@ -321,11 +321,12 @@ with wlroots compositors generally, not just this project.
   output (a new field on `ToplevelInfo`, fed by `toplevel_workspace`) to
   find the matching panel, and stays scoped to that one output's
   workspaces -- showing every other monitor's workspaces there too is
-  real follow-up work, not built yet. The root menu's background layer
+  real follow-up work, not built yet. ~~The root menu's background layer
   surface is unchanged (still one, still `output: None`) -- right-click
   to open it still only works on whichever one output the compositor
   happens to pick; a pre-existing gap this pass didn't cause and didn't
-  fix, worth its own pass later. Verified with `WLR_WL_OUTPUTS=2`
+  fix, worth its own pass later.~~ Resolved in a later pass -- see the
+  root-menu background bullet below. Verified with `WLR_WL_OUTPUTS=2`
   (wlroots' nested-backend multi-output simulation): two independent
   panels render correctly, each reporting and tracking its own
   workspace_count/active_workspace; interactive switching, cross-monitor
@@ -347,6 +348,74 @@ with wlroots compositors generally, not just this project.
   a 2:1 sweep ratio and motion on one panel highlighting the other
   entirely, both eliminated once `server_new_pointer` maps each device
   to its matching output by name.
+- ~~Root menu background spanning all outputs~~ resolved: the
+  `background` layer surface (olshell's OPEN LOOK "root window" -- the
+  surface a right-click MENU-click on the desktop opens the root menu
+  from) is now created per-output, the same pattern the multi-monitor
+  workspaces pass above established for panels. A new `BackgroundOutput`
+  struct, mirroring `WorkspacePanel`, holds one background layer surface
+  per output; `OutputHandler::new_output` creates it bound to that output
+  (`create_layer_surface`'s `output` argument, previously always `None`,
+  which is why only one monitor -- whichever the compositor happened to
+  pick -- ever got a root-window background, and so a working right-click
+  menu, at all), and `output_destroyed` tears it down again, same as a
+  panel. `open_menu` now takes the clicked background's own output and
+  binds the popup layer surface to it too, so the menu opens on the same
+  monitor as the click that triggered it rather than wherever the
+  compositor would otherwise place an unbound `Overlay` surface.
+  Exiting olshell when its background layer closes -- previously the
+  "compositor doesn't want us anymore" signal, back when there was only
+  ever one background -- now happens only once the *last* background is
+  gone, i.e. once every output has disappeared, rather than on any one
+  monitor's background closing. Verified with `WLR_WL_OUTPUTS=2`: both
+  nested outputs now render their own background (previously only one
+  did, confirming the bug); the resulting per-output root menu placement
+  needs real pointer input to confirm, handed off for live testing the
+  same way other pointer-driven features have been.
+
+  That live testing (launching a program from WL-2's now-working root
+  menu) surfaced another real bug, again pre-existing and simply never
+  exposed before: a new window launched from WL-2's menu was correctly
+  *tracked* as belonging to WL-2 (its workspace visibility followed
+  WL-2's switcher, not WL-1's) but was visually placed inside WL-1's
+  screen. `arrange_output_layers` (`core/main.c`) computes
+  `output->usable_area` -- the box `place_new_toplevel` positions new
+  windows within -- via `wlr_scene_layer_surface_v1_configure`, which
+  works in output-local coordinates (0,0 at that output's own top-left),
+  the same space `full_area` is deliberately given it in. The layer
+  surfaces themselves then get translated into the shared global
+  scene-graph space by the `wlr_scene_node_set_position` call right
+  below, adding the output's `wlr_output_layout_get_box` offset -- but
+  `usable_area` was stored straight from the local-space calculation,
+  missing that same translation. Every output's usable area therefore
+  came out identical to whichever output happens to sit at (0,0) in the
+  layout, so `place_new_toplevel` placed every new window inside that
+  one output's box regardless of which output it was actually meant
+  for -- harmless-looking with one output (there's only the one box to
+  land in), and never exercised for a non-primary output until this
+  pass made a second output's root menu actually usable. Fixed by adding
+  the same `output_box.x`/`output_box.y` translation to `usable_area`
+  before storing it.
+
+  A second round of live testing (pinning the root menu on one output,
+  then right-clicking the other) surfaced a real design gap rather than
+  a bug: `Olshell` had only ever had a single `popup: Option<MenuPopup>`
+  slot, so `open_menu` unconditionally replaced whatever popup existed
+  -- harmless when there was only ever one output to open a menu on, but
+  now meant opening a menu on WL-2 silently undid a pin made on WL-1.
+  Fixed by making `popups: Vec<MenuPopup>` and having `open_menu` drop
+  only *unpinned* popups before pushing a new one: OPEN LOOK only ever
+  shows one transient menu at a time, so that part of the old behavior
+  is preserved, but a pinned popup is now a true persistent palette,
+  independent of whatever else olshell does -- any number can be open at
+  once, one or more per output. Every place that used to reach for "the"
+  popup (item/pushpin hit-testing, layer-shell `configure`/`closed`,
+  Escape) now looks it up by surface via a new `popup_at()` helper (same
+  family as `panel_at`/`background_at`), except Escape, which can't use
+  the pointer's surface -- added a `keyboard_focus: Option<WlSurface>`
+  field, kept current by `KeyboardHandler::enter`/`leave` (both no-ops
+  before this), so Escape closes whichever popup olcore actually handed
+  keyboard focus to rather than assuming there's only one candidate.
 - ~~Workspace switching has no visual effect~~ / ~~panel toplevel-title
   list~~ resolved together, as planned: `workspaces_manager_handle_switch_to`
   (`core/main.c`) now actually hides/shows toplevels via a shared

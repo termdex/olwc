@@ -145,8 +145,12 @@ struct olc_output {
 	struct wl_listener destroy;
 
 	// The output's box minus space claimed by exclusive-zone layer-shell
-	// surfaces (the panel, primarily). Updated by arrange_output_layers();
-	// zeroed (and thus not yet meaningful) until that's run at least once.
+	// surfaces (the panel, primarily), in the shared global scene-graph
+	// space (like every scene node position) rather than this output's own
+	// local space -- callers place things with it directly, the same way
+	// arrange_output_layers positions the layer surfaces themselves.
+	// Updated by arrange_output_layers(); zeroed (and thus not yet
+	// meaningful) until that's run at least once.
 	struct wlr_box usable_area;
 
 	// Per-output workspace state -- see olc_server::workspaces_manager_global's
@@ -830,6 +834,16 @@ static void arrange_output_layers(struct olc_output *output) {
 			layer_surface->scene_layer_surface->tree->node.y + output_box.y);
 	}
 
+	// wlr_scene_layer_surface_v1_configure works in the same output-local
+	// space as full_area (0,0 at this output's own top-left) -- translate
+	// to the shared global scene-graph space before storing, the same
+	// translation the layer surfaces themselves just got via
+	// wlr_scene_node_set_position above. Without this, usable_area.x/y
+	// come out right only for whichever output happens to sit at (0,0) in
+	// the layout; every other output's new windows would land inside that
+	// one's box instead of their own.
+	usable_area.x += output_box.x;
+	usable_area.y += output_box.y;
 	output->usable_area = usable_area;
 }
 

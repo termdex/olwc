@@ -528,11 +528,20 @@ impl WorkspaceSubmenu {
     }
 }
 
-/// A transient root-menu popup: press MENU on the background to open one,
-/// drag to highlight an item, release over it to run the item's command
-/// and dismiss (release elsewhere just dismisses). Submenu entries are
+/// A root-menu popup: press MENU on a background to open one, drag to
+/// highlight an item, release over it to run the item's command and
+/// dismiss (release elsewhere just dismisses). Submenu entries are
 /// rendered but not yet interactive -- opening a nested popup on hover is
-/// follow-up work. No pushpin/persist gesture yet either.
+/// follow-up work.
+///
+/// `Olshell::popups` holds any number of these at once, but
+/// `open_menu` only ever lets one *unpinned* one exist -- opening a new
+/// menu drops whatever unpinned one was already open, same as OPEN LOOK
+/// only ever shows one transient menu at a time. A pinned one is exempt
+/// from that: pinning (below) turns it into an independent persistent
+/// palette that stays open regardless of what else olshell does,
+/// including opening a menu on another output, so there can be one
+/// pinned per output (or several on the same one) at once.
 struct MenuPopup {
     layer: LayerSurface,
     items: Vec<MenuNode>,
@@ -604,26 +613,11 @@ fn main() {
     let subcompositor = SubcompositorState::bind(compositor.wl_compositor().clone(), &globals, &qh)
         .expect("wl_subcompositor not available");
 
-    // Panels are created per-output, one each, as they're discovered via
-    // OutputHandler::new_output -- see WorkspacePanel's doc comment.
-    // Nothing to do here at startup; new_output fires for every output
-    // that already exists too, once the event loop starts dispatching.
-
-    // The desktop background doubles as the OPEN LOOK "root window": MENU
-    // (right-button) clicks on it open the root menu. Non-exclusive so it
-    // doesn't compete with the panel for space.
-    let bg_surface = compositor.create_surface(&qh);
-    let background = layer_shell.create_layer_surface(
-        &qh,
-        bg_surface,
-        Layer::Background,
-        Some("olshell-background"),
-        None,
-    );
-    background.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
-    background.set_size(0, 0);
-    background.set_keyboard_interactivity(KeyboardInteractivity::None);
-    background.commit();
+    // Panels and backgrounds are created per-output, one each, as outputs
+    // are discovered via OutputHandler::new_output -- see WorkspacePanel's
+    // and BackgroundOutput's doc comments. Nothing to do here at startup;
+    // new_output fires for every output that already exists too, once the
+    // event loop starts dispatching.
 
     let pool = SlotPool::new(4 * (PANEL_HEIGHT as usize) * 1920, &shm)
         .expect("failed to create shm pool");
@@ -661,9 +655,7 @@ fn main() {
         subcompositor,
         pool,
         panels: Vec::new(),
-        background,
-        bg_width: 0,
-        bg_height: 0,
+        backgrounds: Vec::new(),
         exit: false,
         foreign_toplevel_manager,
         workspaces_manager,
@@ -673,7 +665,8 @@ fn main() {
         menu,
         pointer: None,
         keyboard: None,
-        popup: None,
+        keyboard_focus: None,
+        popups: Vec::new(),
         window_menu: None,
     };
 
@@ -704,6 +697,19 @@ struct WorkspacePanel {
     hovered_workspace: Option<u32>,
 }
 
+/// One monitor's desktop background, which doubles as the OPEN LOOK "root
+/// window" -- MENU (right-button) clicks on it open the root menu. Per
+/// output for the same reason WorkspacePanel is: a layer surface created
+/// with `output: None` gets assigned to whichever one output the
+/// compositor picks, so before this every monitor past the first got no
+/// background (and so no right-click root menu) at all.
+struct BackgroundOutput {
+    output: wl_output::WlOutput,
+    layer: LayerSurface,
+    width: u32,
+    height: u32,
+}
+
 struct Olshell {
     registry_state: RegistryState,
     seat_state: SeatState,
@@ -714,9 +720,7 @@ struct Olshell {
     subcompositor: SubcompositorState,
     pool: SlotPool,
     panels: Vec<WorkspacePanel>,
-    background: LayerSurface,
-    bg_width: u32,
-    bg_height: u32,
+    backgrounds: Vec<BackgroundOutput>,
     exit: bool,
     // Kept only to hold the binding alive; no requests are sent on this
     // one, so nothing reads it beyond the Option check at startup.
@@ -729,7 +733,13 @@ struct Olshell {
     menu: Menu,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
-    popup: Option<MenuPopup>,
+    // The surface a keyboard enter most recently reported, without a
+    // matching leave yet -- the only thing that ever requests keyboard
+    // focus is a root-menu popup's Exclusive layer surface (see
+    // MenuPopup's doc comment), so this is how Escape tells *which*
+    // popup to close now that more than one can be open at once.
+    keyboard_focus: Option<wl_surface::WlSurface>,
+    popups: Vec<MenuPopup>,
     window_menu: Option<WindowMenu>,
 }
 
@@ -795,12 +805,18 @@ impl Olshell {
         panel.layer.commit();
     }
 
-    fn draw_background(&mut self) {
-        if self.bg_width == 0 {
+    /// Draws one output's background -- see BackgroundOutput's doc comment
+    /// on why there's one of these per output rather than a single shared
+    /// one.
+    fn draw_background(&mut self, index: usize) {
+        let Some(bg) = self.backgrounds.get(index) else {
+            return;
+        };
+        if bg.width == 0 {
             return;
         }
-        let width = self.bg_width as i32;
-        let height = self.bg_height.max(1) as i32;
+        let width = bg.width as i32;
+        let height = bg.height.max(1) as i32;
         let stride = width * 4;
 
         let (buffer, canvas) = self
@@ -816,10 +832,11 @@ impl Olshell {
             pixel[3] = 0xFF;
         }
 
-        let wl_surface = self.background.wl_surface();
+        let bg = &self.backgrounds[index];
+        let wl_surface = bg.layer.wl_surface();
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
-        self.background.commit();
+        bg.layer.commit();
     }
 
     /// Requests a header decoration for `toplevel_id` if openlook-decoration
@@ -1316,12 +1333,23 @@ impl Olshell {
         wl_surface.commit();
     }
 
-    /// Opens the root menu at `(x, y)` (surface-local coordinates on the
-    /// background, which is fullscreen so those are effectively screen
-    /// coordinates). Anchoring a layer surface to top-left with margins is
-    /// the standard wlr-layer-shell trick for pixel-precise popup placement.
-    fn open_menu(&mut self, qh: &QueueHandle<Self>, x: f64, y: f64) {
-        self.close_menu();
+    /// Opens the root menu at `(x, y)` (surface-local coordinates on
+    /// `output`'s background, which is fullscreen on that output so those
+    /// are effectively screen coordinates local to it). Anchoring a layer
+    /// surface to top-left with margins is the standard wlr-layer-shell
+    /// trick for pixel-precise popup placement; binding the popup itself to
+    /// `output` (the same one the triggering click landed on) keeps it on
+    /// that placement rather than whichever output the compositor would
+    /// otherwise pick arbitrarily.
+    fn open_menu(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput, x: f64, y: f64) {
+        // Drop any existing *unpinned* popup -- OPEN LOOK only ever shows
+        // one transient menu at a time, regardless of which output it's
+        // on. A pinned one is left alone: it's a persistent palette now,
+        // independent of whatever else olshell does (see MenuPopup's doc
+        // comment), so opening a fresh menu on another output shouldn't
+        // undo a pin any more than it would close a real physical palette
+        // sitting on another monitor.
+        self.popups.retain(|p| p.pinned);
 
         let items = self.menu.items.clone();
         let title = self.menu.title.clone();
@@ -1349,7 +1377,7 @@ impl Olshell {
             surface,
             Layer::Overlay,
             Some("olshell-menu"),
-            None,
+            Some(output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT);
         layer.set_margin(y as i32, 0, 0, x as i32);
@@ -1359,16 +1387,22 @@ impl Olshell {
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
 
-        self.popup = Some(MenuPopup { layer, items, title, width, height, hovered: None, pinned: false });
+        self.popups.push(MenuPopup { layer, items, title, width, height, hovered: None, pinned: false });
     }
 
-    fn close_menu(&mut self) {
-        // Just drop it -- sctk's LayerSurface::Drop already destroys the
-        // zwlr_layer_surface_v1 role object before the wl_surface, in the
-        // order the protocol requires. Destroying the wl_surface ourselves
-        // first (as this used to do) is a protocol violation: "surface was
-        // destroyed before its role object".
-        self.popup = None;
+    /// Closes one popup by index. Just drops it -- sctk's LayerSurface::Drop
+    /// already destroys the zwlr_layer_surface_v1 role object before the
+    /// wl_surface, in the order the protocol requires. Destroying the
+    /// wl_surface ourselves first (as this used to do) is a protocol
+    /// violation: "surface was destroyed before its role object".
+    fn close_menu(&mut self, index: usize) {
+        let popup = self.popups.remove(index);
+        // Don't wait for a leave event that destroying our own surface may
+        // or may not still generate -- drop the stale reference now so a
+        // later Escape doesn't look this surface up and find nothing.
+        if self.keyboard_focus.as_ref() == Some(popup.layer.wl_surface()) {
+            self.keyboard_focus = None;
+        }
     }
 
     /// The toplevel whose decoration surface `surface` is, if any.
@@ -1395,6 +1429,18 @@ impl Olshell {
     /// Index into self.panels of whichever panel `surface` is, if any.
     fn panel_at(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.panels.iter().position(|p| p.layer.wl_surface() == surface)
+    }
+
+    /// Index into self.backgrounds of whichever output's background
+    /// `surface` is, if any.
+    fn background_at(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.backgrounds.iter().position(|b| b.layer.wl_surface() == surface)
+    }
+
+    /// Index into self.popups of whichever root-menu popup `surface` is,
+    /// if any.
+    fn popup_at(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
+        self.popups.iter().position(|p| p.layer.wl_surface() == surface)
     }
 
     /// Workspace index (0-based) the panel-local `x` falls on, if any,
@@ -1898,14 +1944,35 @@ impl OutputHandler for Olshell {
         &mut self.output_state
     }
 
-    /// Creates this output's panel (see WorkspacePanel's doc comment) --
-    /// fires for every output that exists at startup too, once the event
-    /// loop starts dispatching, not just ones that appear later. If
-    /// openlook-workspaces isn't available there's no per-output object
-    /// to drive a panel with, so no panel gets created at all for any
-    /// output -- same degrade-gracefully spirit as the other optional
-    /// protocols, just at the whole-panel granularity instead of finer.
+    /// Creates this output's background and panel (see BackgroundOutput's
+    /// and WorkspacePanel's doc comments) -- fires for every output that
+    /// exists at startup too, once the event loop starts dispatching, not
+    /// just ones that appear later. The background doesn't depend on any
+    /// optional protocol, so it's always created; the panel needs
+    /// openlook-workspaces, so if that isn't available this output just
+    /// gets a background (and therefore a working root menu) but no panel
+    /// -- same degrade-gracefully spirit as the other optional protocols,
+    /// just at the whole-panel granularity instead of finer.
     fn new_output(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
+        let bg_surface = self.compositor.create_surface(qh);
+        let bg_layer = self.layer_shell.create_layer_surface(
+            qh,
+            bg_surface,
+            Layer::Background,
+            Some("olshell-background"),
+            Some(&output),
+        );
+        bg_layer.set_anchor(Anchor::TOP | Anchor::BOTTOM | Anchor::LEFT | Anchor::RIGHT);
+        bg_layer.set_size(0, 0);
+        bg_layer.set_keyboard_interactivity(KeyboardInteractivity::None);
+        bg_layer.commit();
+        self.backgrounds.push(BackgroundOutput {
+            output: output.clone(),
+            layer: bg_layer,
+            width: 0,
+            height: 0,
+        });
+
         let Some(manager) = self.workspaces_manager.as_ref() else {
             return;
         };
@@ -1940,11 +2007,14 @@ impl OutputHandler for Olshell {
 
     fn update_output(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _output: wl_output::WlOutput) {}
 
-    /// The client-side half of tearing a panel down when its monitor goes
-    /// away -- olcore doesn't send anything new for this (see
-    /// output_destroy's doc comment in core/main.c): the ordinary
-    /// wl_output global going away is already the standard signal, and
-    /// sctk surfaces it here.
+    /// The client-side half of tearing a panel and background down when
+    /// their monitor goes away -- olcore doesn't send anything new for
+    /// this (see output_destroy's doc comment in core/main.c): the
+    /// ordinary wl_output global going away is already the standard
+    /// signal, and sctk surfaces it here. If that was the last output,
+    /// there's nothing left to show a background, panel, or root menu on,
+    /// so olshell exits -- the same role a single global background's
+    /// closed event used to play back when there was only ever one.
     fn output_destroyed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, output: wl_output::WlOutput) {
         if let Some(index) = self.panels.iter().position(|p| p.output == output) {
             let panel = self.panels.remove(index);
@@ -1952,20 +2022,30 @@ impl OutputHandler for Olshell {
             // panel.layer's own Drop impl destroys the layer surface and
             // its underlying wl_surface -- same as elsewhere in olshell.
         }
+        if let Some(index) = self.backgrounds.iter().position(|b| b.output == output) {
+            self.backgrounds.remove(index);
+        }
+        if self.backgrounds.is_empty() {
+            self.exit = true;
+        }
     }
 }
 
 impl LayerShellHandler for Olshell {
     fn closed(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, layer: &LayerSurface) {
-        // The background closing is the real "the compositor doesn't want
-        // us anymore" signal now -- a single panel closing (as opposed to
-        // its output being unplugged, which is output_destroyed's job)
-        // shouldn't take down the whole shell just because one monitor's
-        // strip went away.
-        if layer.wl_surface() == self.background.wl_surface() {
-            self.exit = true;
-        } else if self.popup.as_ref().is_some_and(|p| layer.wl_surface() == p.layer.wl_surface()) {
-            self.popup = None;
+        // A background closing (typically its output going away -- see
+        // output_destroyed, which handles the same removal from that
+        // side; this lookup is idempotent so whichever fires first wins)
+        // takes the whole shell down only once every last one is gone --
+        // a single panel or background closing on its own, with other
+        // outputs still up, shouldn't.
+        if let Some(index) = self.background_at(layer.wl_surface()) {
+            self.backgrounds.remove(index);
+            if self.backgrounds.is_empty() {
+                self.exit = true;
+            }
+        } else if let Some(index) = self.popup_at(layer.wl_surface()) {
+            self.close_menu(index);
         }
     }
 
@@ -1986,20 +2066,20 @@ impl LayerShellHandler for Olshell {
                 PANEL_HEIGHT
             };
             self.draw_panel(index);
-        } else if layer.wl_surface() == self.background.wl_surface() {
-            self.bg_width = configure.new_size.0;
-            self.bg_height = configure.new_size.1;
-            self.draw_background();
-        } else if let Some(popup) = self.popup.as_mut() {
-            if layer.wl_surface() == popup.layer.wl_surface() {
-                if configure.new_size.0 > 0 {
-                    popup.width = configure.new_size.0;
-                }
-                if configure.new_size.1 > 0 {
-                    popup.height = configure.new_size.1;
-                }
-                draw_popup(&mut self.pool, &self.font, popup);
+        } else if let Some(index) = self.background_at(layer.wl_surface()) {
+            let bg = &mut self.backgrounds[index];
+            bg.width = configure.new_size.0;
+            bg.height = configure.new_size.1;
+            self.draw_background(index);
+        } else if let Some(index) = self.popup_at(layer.wl_surface()) {
+            let popup = &mut self.popups[index];
+            if configure.new_size.0 > 0 {
+                popup.width = configure.new_size.0;
             }
+            if configure.new_size.1 > 0 {
+                popup.height = configure.new_size.1;
+            }
+            draw_popup(&mut self.pool, &self.font, popup);
         }
     }
 }
@@ -2063,12 +2143,9 @@ impl PointerHandler for Olshell {
         events: &[PointerEvent],
     ) {
         for event in events {
-            let on_background = event.surface == *self.background.wl_surface();
+            let background_index = self.background_at(&event.surface);
             let panel_index = self.panel_at(&event.surface);
-            let on_popup = self
-                .popup
-                .as_ref()
-                .is_some_and(|p| event.surface == *p.layer.wl_surface());
+            let popup_index = self.popup_at(&event.surface);
             let decoration_toplevel = self.decoration_toplevel_id(&event.surface);
             let resize_region = self.resize_region_at(&event.surface);
             let on_window_menu =
@@ -2101,8 +2178,9 @@ impl PointerHandler for Olshell {
             }
 
             match event.kind {
-                PointerEventKind::Press { button, .. } if on_background && button == BTN_RIGHT => {
-                    self.open_menu(qh, event.position.0, event.position.1);
+                PointerEventKind::Press { button, .. } if background_index.is_some() && button == BTN_RIGHT => {
+                    let output = self.backgrounds[background_index.unwrap()].output.clone();
+                    self.open_menu(qh, &output, event.position.0, event.position.1);
                 }
                 PointerEventKind::Motion { .. } if panel_index.is_some() => {
                     let i = panel_index.unwrap();
@@ -2429,8 +2507,8 @@ impl PointerHandler for Olshell {
                     // or the disabled current-workspace one.
                     self.close_window_menu();
                 }
-                PointerEventKind::Motion { .. } if on_popup => {
-                    let popup = self.popup.as_mut().unwrap();
+                PointerEventKind::Motion { .. } if popup_index.is_some() => {
+                    let popup = &mut self.popups[popup_index.unwrap()];
                     let hovered = popup.item_at(event.position.1);
                     if popup.hovered != hovered {
                         popup.hovered = hovered;
@@ -2439,50 +2517,53 @@ impl PointerHandler for Olshell {
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
                     let mut command_to_run = None;
-                    let mut should_close = false;
+                    let mut close_index = None;
 
-                    if let Some(popup) = self.popup.as_mut() {
-                        if on_popup && popup.is_on_pushpin(event.position.0, event.position.1) {
+                    if let Some(i) = popup_index {
+                        let popup = &mut self.popups[i];
+                        if popup.is_on_pushpin(event.position.0, event.position.1) {
                             // Pinning a transient popup makes it persistent;
                             // clicking the pushpin again on an already-
                             // pinned popup is how you dismiss it, since
                             // there's no button-hold to release into once
                             // it's just sitting there open.
                             if popup.pinned {
-                                should_close = true;
+                                close_index = Some(i);
                             } else {
                                 popup.pinned = true;
                                 draw_popup(&mut self.pool, &self.font, popup);
                             }
-                        } else if on_popup {
-                            if let Some(index) = popup.item_at(event.position.1) {
-                                match &popup.items[index] {
-                                    MenuNode::Item { command, .. } => {
-                                        command_to_run = Some(command.clone());
-                                    }
-                                    MenuNode::Submenu { .. } => {
-                                        log::info!("root menu: submenus aren't interactive yet");
-                                    }
+                        } else if let Some(item_index) = popup.item_at(event.position.1) {
+                            match &popup.items[item_index] {
+                                MenuNode::Item { command, .. } => {
+                                    command_to_run = Some(command.clone());
                                 }
-                                should_close = !popup.pinned;
-                            } else if !popup.pinned {
-                                // Released on the popup's own padding, not
-                                // an item or the pushpin.
-                                should_close = true;
+                                MenuNode::Submenu { .. } => {
+                                    log::info!("root menu: submenus aren't interactive yet");
+                                }
+                            }
+                            if !popup.pinned {
+                                close_index = Some(i);
                             }
                         } else if !popup.pinned {
-                            // Released off the popup entirely -- a pinned
-                            // popup stays up through this, same as a real
-                            // persistent palette would.
-                            should_close = true;
+                            // Released on this popup's own padding, not an
+                            // item or the pushpin.
+                            close_index = Some(i);
                         }
+                    } else if let Some(i) = self.popups.iter().position(|p| !p.pinned) {
+                        // Released off any popup entirely -- that's how the
+                        // transient one (there's at most one at a time, see
+                        // open_menu) gets dismissed. A pinned popup, on this
+                        // output or any other, stays up through this, same
+                        // as a real persistent palette would.
+                        close_index = Some(i);
                     }
 
                     if let Some(command) = command_to_run {
                         Self::run_command(&command);
                     }
-                    if should_close {
-                        self.close_menu();
+                    if let Some(i) = close_index {
+                        self.close_menu(i);
                     }
                 }
                 _ => {}
@@ -2497,11 +2578,12 @@ impl KeyboardHandler for Olshell {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _serial: u32,
         _raw: &[u32],
         _keysyms: &[Keysym],
     ) {
+        self.keyboard_focus = Some(surface.clone());
     }
 
     fn leave(
@@ -2509,9 +2591,12 @@ impl KeyboardHandler for Olshell {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _serial: u32,
     ) {
+        if self.keyboard_focus.as_ref() == Some(surface) {
+            self.keyboard_focus = None;
+        }
     }
 
     fn press_key(
@@ -2522,11 +2607,16 @@ impl KeyboardHandler for Olshell {
         _serial: u32,
         event: KeyEvent,
     ) {
-        // The only surface we ever request keyboard focus for is the menu
-        // popup (Exclusive interactivity), so there's nothing else to gate
-        // this on -- if we're getting key events at all, they're for it.
-        if event.keysym == Keysym::Escape && self.popup.is_some() {
-            self.close_menu();
+        // The only surface we ever request keyboard focus for is a
+        // root-menu popup (Exclusive interactivity, see MenuPopup's doc
+        // comment) -- with more than one possibly open at once now
+        // (one pinned per output), keyboard_focus is how Escape tells
+        // which one olcore actually handed focus to, so only that one
+        // closes.
+        if event.keysym == Keysym::Escape {
+            if let Some(index) = self.keyboard_focus.as_ref().and_then(|s| self.popup_at(s)) {
+                self.close_menu(index);
+            }
         }
     }
 
