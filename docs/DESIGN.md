@@ -584,8 +584,8 @@ with wlroots compositors generally, not just this project.
   shares the identical `reset_cursor_mode`/`output_for_toplevel` code
   path this move case just indirectly verified, so it's correct by
   construction even without being independently exercised live.
-- Icon tray / minimize gap: investigating a question about the icon row
-  along the bottom of the reference screenshots (see
+- ~~Icon tray / minimize gap~~ resolved: investigating a question about
+  the icon row along the bottom of the reference screenshots (see
   `screenshots/sunos551-ow1-scr-01/02/03.png`, which catch Calendar
   Manager and a Text Editor window transitioning between open-window and
   icon form across the same session) confirmed those are iconified
@@ -593,15 +593,65 @@ with wlroots compositors generally, not just this project.
   shortcuts -- launching is the root menu's job, already implemented.
   OPEN LOOK's own vocabulary splits what most window managers call
   "close" into two: `Close` iconifies (the app keeps running), `Quit`
-  actually terminates it. olwc's window menu already has both labels,
-  but `Close` is currently wired to a real `wlr_foreign_toplevel_handle_v1`
-  close request, not iconify -- a mismatch with authentic OPEN LOOK
-  semantics. olcore separately already has full minimize-state tracking
-  (`olc_toplevel::minimized`, wired to wlr-foreign-toplevel-management's
-  own `request_minimize` for clients that ask to minimize themselves) and
-  visibility logic honoring it, but nothing in the window menu drives it,
-  and there's no olshell UI at all to show or restore a minimized window
-  once it's gone -- the desktop-icon tray itself isn't built. Worth its
-  own design pass: whether `Close` should be repointed at minimize (with
-  `Quit` becoming the only real close/terminate path), and what an icon
-  tray looks like in olshell's plainer, non-VDM visual language.
+  actually terminates it. `shell/src/main.rs`'s `WindowMenuAction::Close`
+  (renamed `Minimize` -- the variant now names the action, the row label
+  stays "Close" per the reference, same convention `ToggleMaximize`/"Full
+  Size" and `Lower`/"Back" already established) now calls
+  `set_minimized()` on the toplevel's own foreign-toplevel-management
+  handle instead of `close()`; `Quit` is now the only real terminate
+  path. No protocol or olcore change needed for this half at all --
+  `set_minimized`/`unset_minimized`/`activate` are already standard
+  wlr-foreign-toplevel-management requests any bound client (not just
+  the owning one) can send, and olcore's `toplevel_handle_request_minimize`
+  (tracking `olc_toplevel::minimized` and the visibility logic honoring
+  it) already existed from whenever some *client* asked to minimize
+  itself -- olshell driving the exact same request from the window menu
+  just needed to start calling it.
+
+  The icon tray itself turned out to need no protocol addition either:
+  every fact it needs (which toplevels are minimized, which output and
+  workspace each belongs to) is already tracked client-side via
+  wlr-foreign-toplevel-management's own state array and the workspaces
+  protocol's `toplevel_workspace` event. `Olshell::minimized_toplevels_for_output`
+  mirrors `toplevel_is_visible`'s combinator inverted (minimized, and
+  either sticky or on the output's own active workspace) using data
+  already in `self.toplevels`. Icons are drawn directly into each
+  output's own background (`draw_background`), the same way a real OPEN
+  LOOK icon sits right on the desktop/root window rather than in a
+  separate dock or taskbar surface -- bottom-anchored, left to right, one
+  row (no wrap yet -- a rare enough number of simultaneously-minimized
+  windows on one output that it isn't worth the complexity), each a
+  plain bordered box (no attempt at OPEN LOOK's real icon chrome, or a
+  per-app glyph -- just the app's first letter and its title/app_id as a
+  label below, same "plain and functional" level of fidelity the
+  workspace strip already set for anything without a concrete reference
+  to match) with hover feedback matching the workspace strip's own.
+  SELECT-clicking an icon calls `unset_minimized()` and then `activate()`
+  on the same handle, restoring and refocusing it in one click -- there's
+  no OPEN LOOK precedent for exactly this gesture (a real icon would open
+  its own small menu with an `Open` item instead), but a single click is
+  the simplest thing that could work.
+
+  Deliberately deferred, not silently dropped: the icon tray doesn't wrap
+  to a second row if it fills up one output's width, there's no per-icon
+  menu (Open/Move/Properties, matching a real OPEN LOOK icon's own
+  popup), and icons show no live content the way a real OPEN LOOK clock
+  or calendar icon could (see the sunos551 screenshots above) -- all real
+  follow-up work if it turns out to matter in practice, not attempted
+  here.
+- Icon restore gesture and free positioning: authentic OPEN LOOK/olwm
+  icons are double-click (SELECT) to restore, not single-click -- a
+  single click just selects/highlights, and a real icon's own MENU-click
+  popup (`Open`, `Move`, `Properties`, `Quit`) is the discoverable
+  alternative to remembering the double-click. Icons are also freely
+  drag-repositionable to anywhere on the desktop -- olwm's
+  `Olwm*IconLocation`/`IconRegion` resources only ever set the *default*
+  placement, same as any other window. olwc's current icon tray does
+  neither: single click restores (an explicitly flagged placeholder, not
+  an attempt at the real gesture -- see the icon tray entry above), and
+  the packed left-to-right layout leaves no per-icon position to drag at
+  all. Free positioning is the bigger lift of the two: it needs per-icon
+  position state instead of the current computed layout, real drag
+  handling, and a decision about what dragging an icon across an output
+  boundary should mean given the per-output desktop model -- double-click
+  restore is a small, self-contained change by comparison.

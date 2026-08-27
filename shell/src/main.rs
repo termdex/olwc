@@ -133,6 +133,26 @@ const WORKSPACE_STRIP_MARGIN: i32 = 6;
 const WORKSPACE_SEGMENT_GAP: i32 = 2;
 const WORKSPACE_ACTIVE_TEXT_COLOR: (u8, u8, u8) = (0xF0, 0xF0, 0xF0);
 
+// Icon tray: a minimized ("Close" in the window menu -- see
+// WindowMenuAction::Minimize's doc comment) toplevel's icon, drawn
+// directly into its own output's background rather than as a separate
+// surface, the same way a real OPEN LOOK icon sits right on the desktop
+// (root window) rather than in a dock or taskbar container. No reference
+// exists for the icon's own look (screenshots/sunos551-ow1-scr-*.png show
+// *that* icons sit there and can be app-specific/live-content, per
+// docs/DESIGN.md's icon tray entry, but not at a resolution that shows
+// real proportions or chrome) -- plain and functional like the workspace
+// strip, not an attempt at OPEN LOOK's actual icon chrome.
+const ICON_SIZE: i32 = 48;
+const ICON_GAP: i32 = 14;
+const ICON_MARGIN_BOTTOM: i32 = 14;
+const ICON_LABEL_HEIGHT: i32 = 16;
+const ICON_FONT_SIZE: f32 = 13.0;
+const ICON_GLYPH_FONT_SIZE: f32 = 22.0;
+const ICON_BG_COLOR: (u8, u8, u8) = DECORATION_BG_COLOR;
+const ICON_BORDER_COLOR: (u8, u8, u8) = DECORATION_BORDER_COLOR;
+const ICON_TEXT_COLOR: (u8, u8, u8) = WORKSPACE_ACTIVE_TEXT_COLOR;
+
 const MENU_FONT_SIZE: f32 = 18.0;
 const MENU_ROW_HEIGHT: i32 = 26;
 const MENU_H_PADDING: i32 = 12;
@@ -202,7 +222,10 @@ const EDGE_LEFT: u32 = 4;
 const EDGE_RIGHT: u32 = 8;
 
 enum WindowMenuAction {
-    Close,
+    /// Labeled "Close" (see WINDOW_MENU_ITEMS) but iconifies rather than
+    /// terminating -- authentic OPEN LOOK terminology, not a typo. See
+    /// WINDOW_MENU_ITEMS' doc comment.
+    Minimize,
     ToggleMaximize,
     Move,
     Resize,
@@ -230,19 +253,25 @@ struct WindowMenuItem {
 // rather than kept as a dead placeholder. Close, Full Size, Move, Resize,
 // Back, and Quit are wired to real actions; Move/Resize reuse the same
 // interactive grabs the header drag gesture and (eventually) resize-corner
-// handles trigger, Back reuses the same "lower to bottom" olcore exposes,
-// and Quit closes every toplevel sharing this one's client connection
-// (see the decoration protocol's quit request) rather than just this
-// window, the same Close-window/Quit-application distinction most desktop
-// environments still draw. Properties is disabled to match the reference
-// screenshot (shown grayed out there too).
+// handles trigger, Back reuses the same "lower to bottom" olcore exposes.
+//
+// Close and Quit are NOT the close-window/quit-application split most
+// desktop environments now use -- that reading predated having an icon
+// tray to make sense of the alternative (see docs/DESIGN.md's icon tray
+// entry). Authentic OPEN LOOK terminology has Close *iconify* the window
+// (the app keeps running, represented by an icon on its output's
+// desktop -- see draw_background) and Quit is the only real terminate,
+// sent to every toplevel sharing this one's client connection (see the
+// decoration protocol's quit request) rather than just this window.
+// Properties is disabled to match the reference screenshot (shown grayed
+// out there too).
 //
 // Move to Workspace has no reference precedent -- see the workspace strip's
 // ADJUST-click, which it complements now that submenus exist: this is the
 // discoverable menu path for the same action, grouped next to Stick since
 // both are about a window's relationship to workspaces.
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
-    WindowMenuItem { label: "Close", action: WindowMenuAction::Close, disabled: false },
+    WindowMenuItem { label: "Close", action: WindowMenuAction::Minimize, disabled: false },
     WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
     WindowMenuItem { label: "Move", action: WindowMenuAction::Move, disabled: false },
     WindowMenuItem { label: "Resize", action: WindowMenuAction::Resize, disabled: false },
@@ -735,6 +764,10 @@ struct BackgroundOutput {
     layer: LayerSurface,
     width: u32,
     height: u32,
+    /// Index (into the per-draw list draw_background/icon_at both
+    /// recompute -- see minimized_toplevels_for_output) of the icon the
+    /// pointer is currently over, if any.
+    hovered_icon: Option<usize>,
 }
 
 struct Olshell {
@@ -832,9 +865,10 @@ impl Olshell {
         panel.layer.commit();
     }
 
-    /// Draws one output's background -- see BackgroundOutput's doc comment
-    /// on why there's one of these per output rather than a single shared
-    /// one.
+    /// Draws one output's background, including its icon tray (see
+    /// BackgroundOutput's doc comment on why there's one of these per
+    /// output rather than a single shared one, and
+    /// minimized_toplevels_for_output for what belongs in the tray).
     fn draw_background(&mut self, index: usize) {
         let Some(bg) = self.backgrounds.get(index) else {
             return;
@@ -845,6 +879,14 @@ impl Olshell {
         let width = bg.width as i32;
         let height = bg.height.max(1) as i32;
         let stride = width * 4;
+
+        // No panel (openlook-workspaces unavailable) means no
+        // active-workspace to gate the tray on -- degrade the same way
+        // the panel itself does, rather than showing every minimized
+        // window on every workspace at once.
+        let active_workspace = self.panels.iter().find(|p| p.output == bg.output).map(|p| p.active_workspace);
+        let icon_ids = active_workspace.map(|w| self.minimized_toplevels_for_output(&bg.output, w));
+        let hovered_icon = bg.hovered_icon;
 
         let (buffer, canvas) = self
             .pool
@@ -857,6 +899,46 @@ impl Olshell {
             pixel[1] = g;
             pixel[2] = r;
             pixel[3] = 0xFF;
+        }
+
+        if let Some(icon_ids) = &icon_ids {
+            for (i, id) in icon_ids.iter().enumerate() {
+                let (x0, y0, x1, y1) = icon_rect(i, height);
+                if x1 > width {
+                    break;
+                }
+                let fill = if hovered_icon == Some(i) { MENU_HOVER_COLOR } else { ICON_BG_COLOR };
+                fill_rect(canvas, width, height, x0, y0, x1, y1, fill);
+                fill_rect(canvas, width, height, x0, y0, x1, y0 + 1, ICON_BORDER_COLOR);
+                fill_rect(canvas, width, height, x0, y1 - 1, x1, y1, ICON_BORDER_COLOR);
+                fill_rect(canvas, width, height, x0, y0, x0 + 1, y1, ICON_BORDER_COLOR);
+                fill_rect(canvas, width, height, x1 - 1, y0, x1, y1, ICON_BORDER_COLOR);
+
+                let info = &self.toplevels[id];
+                let glyph = info
+                    .app_id
+                    .chars()
+                    .next()
+                    .or_else(|| info.title.chars().next())
+                    .unwrap_or('?')
+                    .to_uppercase()
+                    .next()
+                    .unwrap();
+                let glyph_width = self.font.metrics(glyph, ICON_GLYPH_FONT_SIZE).advance_width.round() as i32;
+                draw_text_row_centered(
+                    canvas, width, y0, y1 - y0, x0 + (x1 - x0 - glyph_width) / 2,
+                    &glyph.to_string(), &self.font, ICON_GLYPH_FONT_SIZE, ICON_TEXT_COLOR,
+                );
+
+                let label = if info.title.is_empty() { &info.app_id } else { &info.title };
+                let label_width: i32 =
+                    label.chars().map(|c| self.font.metrics(c, ICON_FONT_SIZE).advance_width.round() as i32).sum();
+                let label_x = (x0 + x1) / 2 - label_width / 2;
+                draw_text_row_centered(
+                    canvas, width, y1, ICON_LABEL_HEIGHT, label_x.max(0),
+                    label, &self.font, ICON_FONT_SIZE, ICON_TEXT_COLOR,
+                );
+            }
         }
 
         let bg = &self.backgrounds[index];
@@ -1525,10 +1607,66 @@ impl Olshell {
         self.backgrounds.iter().position(|b| b.layer.wl_surface() == surface)
     }
 
+    /// Redraws whichever background shows `output`'s icon tray, if any --
+    /// for keeping it in sync whenever something the tray's contents
+    /// depend on changes (a toplevel's minimized state, title, or
+    /// app_id; a toplevel disappearing; which workspace is active) but
+    /// isn't already covered by some other redraw, the way hovering the
+    /// tray itself is. Without this, a change only became visible once
+    /// something else happened to redraw the background anyway (e.g. the
+    /// pointer moving over it) -- confirmed live as an icon not
+    /// appearing/disappearing until the pointer crossed the tray.
+    fn redraw_background_for_output(&mut self, output: &wl_output::WlOutput) {
+        if let Some(index) = self.backgrounds.iter().position(|b| &b.output == output) {
+            self.draw_background(index);
+        }
+    }
+
     /// Index into self.popups of whichever root-menu popup `surface` is,
     /// if any.
     fn popup_at(&self, surface: &wl_surface::WlSurface) -> Option<usize> {
         self.popups.iter().position(|p| p.layer.wl_surface() == surface)
+    }
+
+    /// Minimized toplevels currently showing an icon on `output`'s
+    /// background, in tray order (index 0 is icon_rect(0, ..)'s slot, and
+    /// so on) -- draw_background and the background's own pointer
+    /// handling both call this so they can never disagree about which
+    /// icon is which. A toplevel qualifies the same way
+    /// olcore's toplevel_is_visible does for the window itself, just
+    /// inverted: minimized, and either sticky or on this output's active
+    /// workspace -- both already tracked client-side (via
+    /// wlr-foreign-toplevel-management's states and the workspaces
+    /// protocol's toplevel_workspace event respectively), so this needs
+    /// no protocol addition. Sorted by title so the tray doesn't reorder
+    /// itself from one draw to the next merely because self.toplevels is
+    /// a HashMap.
+    fn minimized_toplevels_for_output(&self, output: &wl_output::WlOutput, active_workspace: u32) -> Vec<ObjectId> {
+        let mut ids: Vec<ObjectId> = self
+            .toplevels
+            .iter()
+            .filter(|(_, info)| {
+                info.states.contains(&1)
+                    && info.output.as_ref() == Some(output)
+                    && (info.decoration.as_ref().is_some_and(|dec| dec.sticky)
+                        || info.workspace_index == Some(active_workspace))
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        ids.sort_by_key(|id| self.toplevels[id].title.clone());
+        ids
+    }
+
+    /// Icon tray index at `(x, y)` (background-local) for the output
+    /// `background_index` names, if any.
+    fn icon_at(&self, background_index: usize, x: f64, y: f64) -> Option<usize> {
+        let bg = &self.backgrounds[background_index];
+        let panel = self.panels.iter().find(|p| p.output == bg.output)?;
+        let count = self.minimized_toplevels_for_output(&bg.output, panel.active_workspace).len();
+        (0..count).find(|&i| {
+            let (x0, y0, x1, y1) = icon_rect(i, bg.height as i32);
+            x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64
+        })
     }
 
     /// Workspace index (0-based) the panel-local `x` falls on, if any,
@@ -1824,6 +1962,19 @@ fn workspace_segment_x(index: u32) -> (i32, i32) {
     (x0, x0 + WORKSPACE_SEGMENT_WIDTH - WORKSPACE_SEGMENT_GAP)
 }
 
+/// Background-local (x0, y0, x1, y1) box of icon tray slot `index`
+/// (0-based, left to right, bottom-anchored) given the background's own
+/// height. Shared by drawing and hit-testing, same reasoning as
+/// workspace_segment_x. Doesn't wrap to a second row -- a rare enough
+/// number of simultaneously-minimized windows on one output that it
+/// isn't worth the complexity yet; they just keep marching right.
+fn icon_rect(index: usize, bg_height: i32) -> (i32, i32, i32, i32) {
+    let x0 = ICON_GAP + index as i32 * (ICON_SIZE + ICON_GAP);
+    let y1 = bg_height - ICON_MARGIN_BOTTOM - ICON_LABEL_HEIGHT;
+    let y0 = y1 - ICON_SIZE;
+    (x0, y0, x0 + ICON_SIZE, y1)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn fill_rect(
     canvas: &mut [u8],
@@ -2059,6 +2210,7 @@ impl OutputHandler for Olshell {
             layer: bg_layer,
             width: 0,
             height: 0,
+            hovered_icon: None,
         });
 
         let Some(manager) = self.workspaces_manager.as_ref() else {
@@ -2270,6 +2422,47 @@ impl PointerHandler for Olshell {
                     let output = self.backgrounds[background_index.unwrap()].output.clone();
                     self.open_menu(qh, &output, event.position.0, event.position.1);
                 }
+                PointerEventKind::Motion { .. } if background_index.is_some() => {
+                    let i = background_index.unwrap();
+                    let hovered = self.icon_at(i, event.position.0, event.position.1);
+                    if self.backgrounds[i].hovered_icon != hovered {
+                        self.backgrounds[i].hovered_icon = hovered;
+                        self.draw_background(i);
+                    }
+                }
+                PointerEventKind::Leave { .. } if background_index.is_some() => {
+                    let i = background_index.unwrap();
+                    if self.backgrounds[i].hovered_icon.take().is_some() {
+                        self.draw_background(i);
+                    }
+                }
+                // SELECT (left-click) an icon to restore it -- unset_minimized
+                // alone would bring the window back but leave focus wherever
+                // it already was (possibly nowhere), so activate it too, the
+                // same pairing clicking a taskbar entry does elsewhere; no
+                // OPEN LOOK precedent for a "restore" gesture specifically
+                // (a real icon would have its own menu with an Open item),
+                // but a single click is the simplest thing that could work,
+                // consistent with the workspace strip's own SELECT-click.
+                PointerEventKind::Press { button, .. } if background_index.is_some() && button == BTN_LEFT => {
+                    let i = background_index.unwrap();
+                    if let Some(icon_index) = self.icon_at(i, event.position.0, event.position.1) {
+                        let output = self.backgrounds[i].output.clone();
+                        let active_workspace =
+                            self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
+                        let handle = active_workspace.and_then(|w| {
+                            let ids = self.minimized_toplevels_for_output(&output, w);
+                            let id = ids.get(icon_index)?.clone();
+                            self.toplevels.get(&id)?.handle.clone()
+                        });
+                        if let Some(handle) = handle {
+                            handle.unset_minimized();
+                            if let Some(seat) = self.seat_state.seats().next() {
+                                handle.activate(&seat);
+                            }
+                        }
+                    }
+                }
                 PointerEventKind::Motion { .. } if panel_index.is_some() => {
                     let i = panel_index.unwrap();
                     let hovered = Olshell::workspace_at(event.position.0, self.panels[i].workspace_count);
@@ -2451,11 +2644,11 @@ impl PointerHandler for Olshell {
                             || (matches!(item.action, WindowMenuAction::MoveToWorkspace) && sticky);
                         if !disabled {
                             match item.action {
-                                WindowMenuAction::Close => {
+                                WindowMenuAction::Minimize => {
                                     if let Some(handle) =
                                         self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref())
                                     {
-                                        handle.close();
+                                        handle.set_minimized();
                                     }
                                 }
                                 WindowMenuAction::ToggleMaximize => {
@@ -2825,6 +3018,13 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                 }
                 state.ensure_decoration(qh, &proxy.id());
                 state.draw_decoration(&proxy.id());
+                // Covers a minimized/unminimized state change (the icon
+                // tray's entire reason for existing) as well as a title
+                // or app_id change while minimized (the icon's own
+                // glyph/label).
+                if let Some(output) = state.toplevels.get(&proxy.id()).and_then(|info| info.output.clone()) {
+                    state.redraw_background_for_output(&output);
+                }
             }
             Event::Closed => {
                 if state.window_menu.as_ref().is_some_and(|wm| wm.toplevel_id == proxy.id()) {
@@ -2834,6 +3034,11 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                     if let Some(dec) = info.decoration.take() {
                         dec.object.destroy();
                         dec.surface.destroy();
+                    }
+                    // A minimized toplevel closing outright (not just
+                    // being restored) needs its icon gone too.
+                    if let Some(output) = info.output.take() {
+                        state.redraw_background_for_output(&output);
                     }
                 }
                 proxy.destroy();
@@ -2961,6 +3166,12 @@ impl Dispatch<ZopenlookWorkspacesOutputV1, ()> for Olshell {
                 state.panels[index].active_workspace = active;
                 log::info!("workspaces: panel {index}: active = {active}");
                 state.draw_panel(index);
+                // A non-sticky minimized window's icon only shows on its
+                // own workspace, same as the window itself would --
+                // switching workspaces can change which icons belong in
+                // this output's tray.
+                let output = state.panels[index].output.clone();
+                state.redraw_background_for_output(&output);
             }
         }
     }
