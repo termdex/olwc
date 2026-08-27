@@ -487,3 +487,24 @@ with wlroots compositors generally, not just this project.
   (colors, spacing, shapes) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
+- Icon tray / minimize gap: investigating a question about the icon row
+  along the bottom of the reference screenshots (see
+  `screenshots/sunos551-ow1-scr-01/02/03.png`, which catch Calendar
+  Manager and a Text Editor window transitioning between open-window and
+  icon form across the same session) confirmed those are iconified
+  (minimized) windows sitting loose on the desktop, not app-launcher
+  shortcuts -- launching is the root menu's job, already implemented.
+  OPEN LOOK's own vocabulary splits what most window managers call
+  "close" into two: `Close` iconifies (the app keeps running), `Quit`
+  actually terminates it. olwc's window menu already has both labels,
+  but `Close` is currently wired to a real `wlr_foreign_toplevel_handle_v1`
+  close request, not iconify -- a mismatch with authentic OPEN LOOK
+  semantics. olcore separately already has full minimize-state tracking
+  (`olc_toplevel::minimized`, wired to wlr-foreign-toplevel-management's
+  own `request_minimize` for clients that ask to minimize themselves) and
+  visibility logic honoring it, but nothing in the window menu drives it,
+  and there's no olshell UI at all to show or restore a minimized window
+  once it's gone -- the desktop-icon tray itself isn't built. Worth its
+  own design pass: whether `Close` should be repointed at minimize (with
+  `Quit` becoming the only real close/terminate path), and what an icon
+  tray looks like in olshell's plainer, non-VDM visual language.
