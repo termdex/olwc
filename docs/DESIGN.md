@@ -654,4 +654,13 @@ with wlroots compositors generally, not just this project.
   position state instead of the current computed layout, real drag
   handling, and a decision about what dragging an icon across an output
   boundary should mean given the per-output desktop model -- double-click
-  restore is a small, self-contained change by comparison.
+  restore is a small, self-contained change by comparison. Worth
+  considering alongside whichever of these lands first: an authentic
+  MENU-click per-icon popup implies each icon becomes independently
+  selectable, which is also the one place in olshell an ADJUST-click
+  extend-selection gesture (see `docs/OPENLOOK-REFERENCE.md`'s open
+  questions) would have a real surface to attach to -- ADJUST-click
+  toggling an icon in/out of a multi-selection without disturbing the
+  rest, the way OPEN LOOK's icon lists originally used it. No batch
+  action needs that selection yet, so this is scope to fold in if/when
+  icon selection state gets built, not a reason to build it now.

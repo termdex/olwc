@@ -167,9 +167,15 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
   workspace-switcher entry in `docs/DESIGN.md`).
 - ~~Whether ADJUST (middle-click extend-selection) is worth
   preserving~~ given a real, if non-authentic, use: ADJUST-click on a
-  workspace strip segment moves the focused window there. Whether
+  workspace strip segment moves the focused window there. ~~Whether
   ADJUST is worth preserving for anything closer to its original
-  extend-selection meaning is still open.
+  extend-selection meaning~~ resolved: no standalone work now -- there's
+  no multi-select surface in olshell for it to extend a selection *on*.
+  The one plausible future home is per-icon selection in the icon tray,
+  which only exists if the icon-repositioning/MENU-popup follow-up
+  (`docs/DESIGN.md`'s "Icon restore gesture and free positioning" entry)
+  gets built; folded the ADJUST-as-extend-selection idea into that
+  entry rather than tracking it separately.
 - ~~Root menu content/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - ~~Window header chrome~~ v1 resolved: see `docs/DESIGN.md`'s window
