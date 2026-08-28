@@ -2188,6 +2188,29 @@ const PUSHPIN_GLYPH_PINNED: &[&str] = &[
     "##.............",
 ];
 
+/// Submenu ("pullright") indicator -- olgx's "menu mark" glyph
+/// (encodings 48/49/50, `HorizMeMa-UL`/`-LR`/`fill`), oriented
+/// horizontally for a pullright item (`OLGX_HORIZ_MENU_MARK`; a vertical
+/// orientation, encodings 45-47, marks the window-menu button itself --
+/// see `olgx_draw_abbrev_button`'s 3D path). XView's own 2D rendering
+/// combines all three layers in one color (`olgx_draw_menu_mark`'s
+/// `!info->three_d` branch draws the UL and LR outline layers together,
+/// then optionally the fill layer on top), which is what this traces --
+/// a solid filled triangle, not just its outline.
+const SUBMENU_ARROW_GLYPH: &[&str] = &[
+    "##.........",
+    "####.......",
+    "######.....",
+    "########...",
+    "##########.",
+    "###########",
+    "##########.",
+    "########...",
+    "######.....",
+    "####.......",
+    "##.........",
+];
+
 /// Renders one of the bitmaps above into box (x0,y0)-(x1,y1): scaled
 /// *uniformly* (the same factor on both axes, so the glyph's own
 /// proportions are never stretched) to the largest size that fits within
@@ -2357,15 +2380,8 @@ fn draw_button_glyph(
 }
 
 /// Draws a small rightward-pointing wedge -- the window menu's indicator
-/// that an item opens a submenu rather than acting immediately. Drawn
-/// geometrically, same placeholder reasoning draw_button_glyph and
-/// draw_pushpin used to share before their bitmaps were traced from
-/// OLGlyph -- an approximation, not an asset-accurate glyph. Unlike those
-/// two, this doesn't correspond to anything in olwm's own window menu (the
-/// reference screenshot's menu has no submenus at all -- Move to Workspace
-/// is olshell's own addition), so there's no equivalent glyph identified
-/// to trace yet; OLIT's "pullright" menus likely used one, just not one
-/// this investigation has located.
+/// that an item opens a submenu rather than acting immediately -- traced
+/// from OLGlyph, see SUBMENU_ARROW_GLYPH's doc comment.
 #[allow(clippy::too_many_arguments)]
 fn draw_submenu_arrow(
     canvas: &mut [u8],
@@ -2377,32 +2393,7 @@ fn draw_submenu_arrow(
     y1: i32,
     color: (u8, u8, u8),
 ) {
-    let (r, g, b) = color;
-    let w = x1 - x0;
-    let h = y1 - y0;
-    let inset = (w.min(h) / 4).max(1);
-    let left = x0 + inset;
-    let right = x1 - inset;
-    let mid_y = (y0 + y1) / 2;
-    for x in left..right {
-        if right == left {
-            break;
-        }
-        // Narrows linearly from the full inset height at `left` down to a
-        // point at `right`, forming a rightward-pointing "wedge".
-        let t = 1.0 - (x - left) as f64 / (right - left) as f64;
-        let half = ((mid_y - y0 - inset) as f64 * t) as i32;
-        for y in (mid_y - half)..=(mid_y + half) {
-            if x < 0 || y < 0 || x >= canvas_width || y >= canvas_height {
-                continue;
-            }
-            let idx = ((y * canvas_width + x) * 4) as usize;
-            canvas[idx] = b;
-            canvas[idx + 1] = g;
-            canvas[idx + 2] = r;
-            canvas[idx + 3] = 0xFF;
-        }
-    }
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, x0, y0, x1, y1, SUBMENU_ARROW_GLYPH, color);
 }
 
 #[allow(clippy::too_many_arguments)]

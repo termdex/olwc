@@ -297,11 +297,11 @@ with wlroots compositors generally, not just this project.
   open closes just the submenu, the same toggle the header button
   already uses for the window menu itself; clicking any other window-menu
   item closes both, same as it always closed one. A small rightward
-  wedge (`draw_submenu_arrow`, geometric like `draw_chevron` used to be
-  before it was replaced -- see the OLGlyph entry below) marks the row as
-  opening a submenu rather than acting immediately -- the only item with
-  one so far, but every row's width now reserves space for it, so a
-  future submenu item doesn't need a different-width popup.
+  arrow (`draw_submenu_arrow`; asset-accurate since a later pass -- see
+  the OLGlyph entry below) marks the row as opening a submenu rather
+  than acting immediately -- the only item with one so far, but every
+  row's width now reserves space for it, so a future submenu item
+  doesn't need a different-width popup.
 
   Live testing surfaced a real gap: while a window is sticky, the
   submenu's grayed-out "current" row reflected whatever workspace it was
@@ -408,6 +408,26 @@ with wlroots compositors generally, not just this project.
   and the Move to Workspace submenu's per-output header rows are an
   olshell-only grouping label with no XView precedent either way, so
   they're left as plain weight rather than guessing.
+
+  ~~The submenu-arrow indicator (Move to Workspace's row) was a
+  geometric wedge~~ resolved: found in `libolgx` after all. It's
+  `olgx`'s "menu mark" glyph (`olgx_draw_menu_mark`), the same
+  primitive the window-menu button's own arrow uses in 3D mode -- just
+  the horizontal orientation (encodings 48-50, `HORIZ_MENU_MARK_UL`/
+  `_LR`/`_FILL`) rather than vertical (45-47). `om_render.c` confirmed
+  it's exactly XView's own pullright-submenu indicator: `if
+  (mi->pullright) olgx_state |= OLGX_HORIZ_MENU_MARK;`. Unlike the
+  pushpin, `olgx_draw_menu_mark`'s 2D rendering path draws all three
+  layers -- the two outline layers together in one color, then the
+  fill layer on top -- so tracing all three combined (rather than
+  picking one variant over another, the pushpin's problem) was correct
+  from the start: a solid filled triangle, not just an outline. Traced
+  into `SUBMENU_ARROW_GLYPH` (`shell/src/main.rs`), rendered through
+  the same `draw_glyph_bitmap` the button and pushpin use -- no new
+  scaling issues, since the box (`SUBMENU_ARROW_SIZE`, 8x8) and the
+  glyph's native size (11x11, already square) are close enough that
+  neither the coverage-sampling nor the aspect-preserving fixes from
+  the pushpin's own pass had anything to correct here.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - ~~Multi-monitor behavior for the workspace strip (per-monitor

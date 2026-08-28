@@ -152,14 +152,15 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
   license, in the historical XView/olwm source trees at
   github.com/MagnetarRocket/xview-openlook and github.com/ggodd/
   xview-64bit (`xview-base/fonts/bdf/misc/olgl14.bdf`), traced from
-  there into `shell/src/main.rs`'s `BUTTON_GLYPH_NORMAL`/`_PRESSED` and
-  `PUSHPIN_GLYPH_PINNED`/`_UNPINNED` -- see `docs/DESIGN.md`'s window
-  gadget chrome entry for the full implementation writeup, including a
-  scaling pitfall this surfaced that's worth knowing about before
-  tracing any further OLGlyph glyphs (the window menu's submenu-arrow
-  indicator is still a geometric placeholder, with no OLGlyph
-  equivalent identified yet -- see `draw_submenu_arrow`'s doc comment
-  in `shell/src/main.rs`).
+  there into `shell/src/main.rs`'s `BUTTON_GLYPH_NORMAL`/`_PRESSED`,
+  `PUSHPIN_GLYPH_PINNED`/`_UNPINNED`, and (in a follow-up pass) the
+  window menu's submenu-arrow indicator, `SUBMENU_ARROW_GLYPH` --
+  `olgx`'s own "menu mark" glyph, used for both a pullright item's
+  arrow and (in a different orientation) the window-menu button's own
+  arrow. See `docs/DESIGN.md`'s window gadget chrome entry for the full
+  implementation writeup, including a scaling pitfall the pushpin
+  surfaced that's worth knowing about before tracing any further
+  OLGlyph glyphs.
 - ~~Resize corner glyphs specifically aren't visible in either
   screenshot at usable resolution~~ resolved: not visible in
   `Olvwm-desktop.jpg`/`Openwindows.jpg` at usable resolution, but
