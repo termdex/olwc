@@ -143,11 +143,23 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
 
 ## Open questions for later look-and-feel passes
 
-- Window-menu button glyph and pushpin icon shape: the screenshots
-  confirm *what* they are and roughly where they sit, but not exact
-  pixel proportions, colors, or the chevron glyph's precise shape.
-  `shell/src/main.rs`'s `draw_chevron()` is an explicitly placeholder
-  geometric approximation (a filled downward wedge), not asset-accurate.
+- ~~Window-menu button glyph and pushpin icon shape~~ resolved: found
+  something better than a screenshot -- the literal pixel data. Both
+  olwm/olvwm and the XView/OLIT toolkits drew this chrome by rendering
+  characters from a private bitmap font, OLGlyph, via the shared
+  `libolgx` drawing library, rather than by drawing bitmaps directly.
+  That font is preserved, still under Sun's original 1989 permissive
+  license, in the historical XView/olwm source trees at
+  github.com/MagnetarRocket/xview-openlook and github.com/ggodd/
+  xview-64bit (`xview-base/fonts/bdf/misc/olgl14.bdf`), traced from
+  there into `shell/src/main.rs`'s `BUTTON_GLYPH_NORMAL`/`_PRESSED` and
+  `PUSHPIN_GLYPH_PINNED`/`_UNPINNED` -- see `docs/DESIGN.md`'s window
+  gadget chrome entry for the full implementation writeup, including a
+  scaling pitfall this surfaced that's worth knowing about before
+  tracing any further OLGlyph glyphs (the window menu's submenu-arrow
+  indicator is still a geometric placeholder, with no OLGlyph
+  equivalent identified yet -- see `draw_submenu_arrow`'s doc comment
+  in `shell/src/main.rs`).
 - ~~Resize corner glyphs specifically aren't visible in either
   screenshot at usable resolution~~ resolved: not visible in
   `Olvwm-desktop.jpg`/`Openwindows.jpg` at usable resolution, but

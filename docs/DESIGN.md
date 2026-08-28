@@ -297,7 +297,8 @@ with wlroots compositors generally, not just this project.
   open closes just the submenu, the same toggle the header button
   already uses for the window menu itself; clicking any other window-menu
   item closes both, same as it always closed one. A small rightward
-  wedge (`draw_submenu_arrow`, mirroring `draw_chevron`) marks the row as
+  wedge (`draw_submenu_arrow`, geometric like `draw_chevron` used to be
+  before it was replaced -- see the OLGlyph entry below) marks the row as
   opening a submenu rather than acting immediately -- the only item with
   one so far, but every row's width now reserves space for it, so a
   future submenu item doesn't need a different-width popup.
@@ -315,6 +316,80 @@ with wlroots compositors generally, not just this project.
   effect, now or later. Fixed by disabling the `Move to Workspace` item
   itself while sticky, same convention as `Properties`, rather than
   letting a submenu open with nothing meaningful in it.
+
+  ~~Window-menu button glyph and pushpin icon shape were placeholder
+  geometry~~ resolved, and not by finding a better screenshot: both
+  olwm/olvwm and the XView/OLIT toolkits drew this chrome by rendering
+  characters from a private bitmap font, OLGlyph, via the shared
+  `libolgx` drawing library, rather than drawing bitmaps directly --
+  and that font is preserved, pixel-for-pixel, in the historical
+  XView/olwm source trees at github.com/MagnetarRocket/xview-openlook
+  and github.com/ggodd/xview-64bit (`xview-base/fonts/bdf/misc/
+  olgl14.bdf`), still under Sun's original 1989 permissive license.
+  `winbutton.c` confirmed the window-menu button is olwm's "abbreviated
+  menu button" widget (`olgx_draw_abbrev_button`); `ol_misc.c` confirmed
+  the pushpin is `olgx_draw_pushpin`. Traced the relevant glyphs
+  (encodings 22/23 for the button, 19/20 for the pushpin -- see below
+  for why not 100-105) directly from the BDF source into
+  `BUTTON_GLYPH_NORMAL`/`_PRESSED` and `PUSHPIN_GLYPH_PINNED`/
+  `_UNPINNED` (`shell/src/main.rs`), replacing `draw_chevron`'s
+  geometric wedge and `draw_pushpin`'s filled/outline circle. This is
+  reference material the same way the screenshots already were, not a
+  code port -- no XView/olwm code was adapted, only the bitmap shapes
+  it draws from a font neither toolkit's C source actually contains.
+
+  Getting from "found the bitmap" to "looks right" took three more
+  rounds, each a genuine bug rather than a fidelity nice-to-have:
+
+  1. `olgx_draw_pushpin`/`olgx_draw_abbrev_button` actually have *two*
+     distinct designs per state, not one -- a three-layer bevel
+     composite (separate highlight/fill/shadow glyphs in three colors,
+     encodings 100-105 for the pushpin) for 3D rendering, and a
+     purpose-built flat single-color glyph (encodings 19/20) for 2D
+     rendering. The first attempt traced the 3D composite and flattened
+     it to one color, which confirmed live as a compressed-looking
+     blob -- a naive union of three offset bevel outlines is thicker
+     and blockier than any one of them alone. The button glyph
+     (encodings 22/23) happened to already be the flat variant (olwm's
+     2D and 3D code paths both use it, unlike the pushpin), which is
+     why it rendered cleanly on the first try with no complaint. Fixed
+     by switching the pushpin to its own flat variant instead.
+  2. `draw_glyph_bitmap`'s first scaling pass point-sampled a single
+     nearest source pixel per destination pixel -- ordinary nearest-
+     neighbor. Shrinking the unpinned pushpin's 29px-wide source into a
+     10px box dropped nearly all of its 1px-wide outline strokes into
+     the gaps between sampled points, confirmed live as a handful of
+     barely-visible scattered dots. Fixed by having each destination
+     pixel turn on if *any* source pixel in the region it covers is on,
+     rather than sampling one point in that region.
+  3. Coverage sampling fixed the missing-pixels problem but not a
+     second one live testing then surfaced: independently stretching
+     each axis to exactly fill the box distorts aspect ratio for any
+     glyph whose proportions don't match the box's -- confirmed live as
+     the unpinned glyph (native ~2:1 wide) still looking noticeably
+     horizontally compressed, even fully covered. This mattered here
+     specifically because one box (the root menu's `pushpin_rect`) has
+     to hold two states with very different native shapes: the pinned
+     glyph is a compact near-square, the unpinned one nearly 2:1 wide.
+     Fixed two ways together: `draw_glyph_bitmap` now scales uniformly
+     (the same factor on both axes) to the largest size that fits the
+     box, centered, rather than stretching each axis independently; and
+     the popup's pushpin box grew from a 10x10 square
+     (`POPUP_PUSHPIN_WIDTH`/`_HEIGHT`, now 26x14) closer to the
+     unpinned glyph's own native footprint, so neither state needs much
+     shrinking at all. The decoration's sticky indicator only ever
+     shows the pinned state, so it kept a square box
+     (`STICKY_PUSHPIN_SIZE`), sized to the pinned glyph's native 15x15
+     for an exact, unscaled render.
+
+  Surfaced, not fixed, since it's a materially bigger and separate gap:
+  none of this accounts for output scale. `CompositorHandler::
+  scale_factor_changed` is currently a no-op stub, so every surface
+  olshell draws (these glyphs included) renders at 1x regardless of the
+  real output scale -- see the HiDPI/output-scale entry above for why
+  `draw_glyph_bitmap`'s uniform, coverage-sampled scaling is still the
+  right foundation for that whenever it gets built, just parameterized
+  by the output's real scale instead of always assuming 1x.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - ~~Multi-monitor behavior for the workspace strip (per-monitor
@@ -488,6 +563,24 @@ with wlroots compositors generally, not just this project.
   (colors, spacing, shapes) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
+- HiDPI / output scale support: `CompositorHandler::scale_factor_changed`
+  (`shell/src/main.rs`) is currently a no-op stub -- every surface olshell
+  draws renders at 1x regardless of the output's real scale. A pre-
+  existing gap affecting all of olshell's rendering, not just the window-
+  menu button/pushpin glyphs, and out of scope for that pass, but worth
+  connecting here: Wayland's own scale model is integer-only at the
+  protocol level (`wl_surface`/`wl_output` only expose whole-number
+  `buffer_scale`; the fractional scaling real desktops offer, e.g. 150%,
+  is `wp_fractional_scale_v1` layered on top, which still has the client
+  render at the next integer scale up and lets the compositor's own
+  viewporter do the final fractional crop/downscale). So whenever real
+  output-scale support gets built, the button/pushpin glyphs traced from
+  OLGlyph (see that entry in `docs/OPENLOOK-REFERENCE.md`) should scale
+  by rendering `draw_glyph_bitmap` against a box sized for the output's
+  actual integer `buffer_scale`, not by smoothly interpolating -- the
+  same uniform, aspect-preserving, coverage-sampled scaling that pass
+  already built generalizes directly to that; it just needs to be told
+  the real scale instead of always assuming 1x.
 - ~~Move to Workspace submenu is single-output only~~ resolved: it now
   lists every output's workspaces, not just the decorated toplevel's own
   current one -- the current output's first (keeping the plain flat list

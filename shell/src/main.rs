@@ -175,7 +175,18 @@ const MENU_HOVER_COLOR: (u8, u8, u8) = (0x8A, 0x9E, 0xB0);
 const MENU_TITLE_COLOR: (u8, u8, u8) = (0x40, 0x40, 0x38);
 const MENU_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
 
-const PUSHPIN_SIZE: i32 = 10;
+// Two separate box shapes rather than one square PUSHPIN_SIZE: the
+// decoration's sticky indicator only ever shows the pinned state (a
+// compact, roughly-square glyph -- see PUSHPIN_GLYPH_PINNED), but a popup
+// toggles between that and the unpinned state, which is nearly 2:1 wide
+// (PUSHPIN_GLYPH_UNPINNED) -- a single square box forced whichever glyph
+// was further from square to be scaled down hard to fit, which is
+// what made the unpinned glyph look compressed. Sized close to each
+// glyph's own native pixel dimensions so draw_glyph_bitmap needs little
+// or no shrinking for either.
+const STICKY_PUSHPIN_SIZE: i32 = 15;
+const POPUP_PUSHPIN_WIDTH: i32 = 26;
+const POPUP_PUSHPIN_HEIGHT: i32 = 14;
 const PUSHPIN_UNPINNED_COLOR: (u8, u8, u8) = MENU_TITLE_COLOR;
 const PUSHPIN_PINNED_COLOR: (u8, u8, u8) = (0xA8, 0x30, 0x28);
 
@@ -459,9 +470,9 @@ impl Decoration {
     /// menu's pin-to-persist gesture uses, since both mean "stays put".
     fn sticky_pushpin_rect(&self) -> (i32, i32, i32, i32) {
         let x1 = self.width as i32 - CORNER_HANDLE_SIZE - DECORATION_BUTTON_MARGIN;
-        let x0 = x1 - PUSHPIN_SIZE;
-        let y0 = (self.height as i32 - PUSHPIN_SIZE) / 2;
-        (x0, y0, x1, y0 + PUSHPIN_SIZE)
+        let x0 = x1 - STICKY_PUSHPIN_SIZE;
+        let y0 = (self.height as i32 - STICKY_PUSHPIN_SIZE) / 2;
+        (x0, y0, x1, y0 + STICKY_PUSHPIN_SIZE)
     }
 
     /// Header-local position for a corner handle -- header-local because
@@ -649,9 +660,9 @@ impl MenuPopup {
         // Top-left, per reference screenshots (screenshots/sunos551-ow1-scr-01.png
         // and -02.png): the pushpin sits before the title text, not after it.
         let x0 = MENU_H_PADDING;
-        let x1 = x0 + PUSHPIN_SIZE;
-        let y0 = (MENU_ROW_HEIGHT - PUSHPIN_SIZE) / 2;
-        (x0, y0, x1, y0 + PUSHPIN_SIZE)
+        let x1 = x0 + POPUP_PUSHPIN_WIDTH;
+        let y0 = (MENU_ROW_HEIGHT - POPUP_PUSHPIN_HEIGHT) / 2;
+        (x0, y0, x1, y0 + POPUP_PUSHPIN_HEIGHT)
     }
 
     fn is_on_pushpin(&self, x: f64, y: f64) -> bool {
@@ -1189,7 +1200,7 @@ impl Olshell {
         let (bx0, by0, bx1, by1) = dec.button_rect();
         let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { header_bg };
         fill_rect(canvas, width, height, bx0, by0, bx1, by1, button_color);
-        draw_chevron(canvas, width, height, bx0, by0, bx1, by1, DECORATION_TEXT_COLOR);
+        draw_button_glyph(canvas, width, height, bx0, by0, bx1, by1, dec.button_hovered, DECORATION_TEXT_COLOR);
 
         if !info.title.is_empty() {
             draw_text_row_centered(
@@ -1642,7 +1653,7 @@ impl Olshell {
         };
         // The header row needs to fit the title text *and* the pushpin
         // without them colliding, so it gets extra reserved width.
-        let mut max_width = title.as_deref().map_or(0, label_width) + PUSHPIN_SIZE + MENU_H_PADDING;
+        let mut max_width = title.as_deref().map_or(0, label_width) + POPUP_PUSHPIN_WIDTH + MENU_H_PADDING;
         for item in &items {
             max_width = max_width.max(label_width(item.label()));
         }
@@ -2034,8 +2045,194 @@ fn draw_text_row_centered(
     draw_text_at(canvas, canvas_width, row_y0 + row_height, start_x, baseline_y, text, font, size, color)
 }
 
-/// Draws the pushpin glyph within box (x0,y0)-(x1,y1): a filled circle when
-/// pinned (the pin pushed in/engaged), or just its outline when not.
+// The window-menu button and pushpin glyphs below are traced pixel-for-
+// pixel from Sun's own OLGlyph bitmap font (olgl14.bdf), not approximated.
+// olwm/olvwm and the XView/OLIT toolkits drew this chrome by rendering
+// characters from that font via libolgx (olgx_draw_abbrev_button,
+// olgx_draw_pushpin) rather than by drawing bitmaps directly; the font
+// itself is preserved, still under Sun's original 1989 "permission to use,
+// copy, modify, and distribute... for any purpose and without fee" notice,
+// in the historical XView/olwm source trees at github.com/MagnetarRocket/
+// xview-openlook and github.com/ggodd/xview-64bit
+// (xview-base/fonts/bdf/misc/olgl14.bdf) -- see docs/OPENLOOK-REFERENCE.md.
+// Each string below is one bitmap row, '#' meaning "on"; draw_glyph_bitmap
+// nearest-neighbor-scales whatever box the caller asks for, so the source
+// bitmap's own resolution doesn't have to match olshell's chosen sizes.
+
+/// Window-menu button glyph (OLGlyph encoding 22, `OLG_ABBREV_MENU_BUTTON`):
+/// a rounded-square housing around a downward-pointing chevron.
+const BUTTON_GLYPH_NORMAL: &[&str] = &[
+    ".###############..",
+    "#...............#.",
+    "#...............##",
+    "#...............##",
+    "#...#########...##",
+    "#...#.......#...##",
+    "#....#.....#....##",
+    "#....#.....#....##",
+    "#.....#...#.....##",
+    "#.....#...#.....##",
+    "#......#.#......##",
+    "#......#.#......##",
+    "#.......#.......##",
+    "#...............##",
+    "#...............##",
+    ".#################",
+    "..###############.",
+];
+
+/// Window-menu button glyph, invoked/pressed state (encoding 23,
+/// `OLG_ABBREV_MENU_BUTTON_INVERTED`). olshell has no separate button-press
+/// state today (only hover, which already gets its own fill-color change --
+/// see button_rect's caller), so this stands in for hover instead of going
+/// untouched.
+const BUTTON_GLYPH_PRESSED: &[&str] = &[
+    ".###############..",
+    "#...............#.",
+    "#.#############.##",
+    "#.#############.##",
+    "#.##.........##.##",
+    "#.##.#######.##.##",
+    "#.###.#####.###.##",
+    "#.###.#####.###.##",
+    "#.####.###.####.##",
+    "#.####.###.####.##",
+    "#.#####.#.#####.##",
+    "#.#####.#.#####.##",
+    "#.######.######.##",
+    "#.#############.##",
+    "#...............##",
+    ".#################",
+    "..###############.",
+];
+
+// olgx_draw_pushpin actually has two distinct designs for these states, not
+// one: encodings 100-105 are three-layer bevel composites (highlight/fill/
+// shadow in three different colors) meant only for 3D rendering, and don't
+// flatten cleanly to a single color -- tried first, and confirmed live to
+// render as a compressed-looking blob, since a naive union of three bevel
+// outlines is thicker and blockier than any one of them alone. olgx has a
+// second, purpose-built flat single-color version of each for its 2D
+// rendering path (`pupinout`/`pupinin` below) -- these are the ones that
+// actually belong here, the same way the button glyph already uses its own
+// flat variant (OLG_ABBREV_MENU_BUTTON) rather than the 3D bevel layers
+// abbrev_button uses in 3D mode.
+
+/// Pushpin, unpinned ("pushpin out") state -- olgx's flat single-color
+/// glyph (encoding 19, `pupinout`): the pin lying on its side, head and
+/// shaft outlined.
+const PUSHPIN_GLYPH_UNPINNED: &[&str] = &[
+    "...............###...........",
+    "...............#..#.......##.",
+    "...............#..#......#..#",
+    "...............#..########..#",
+    "...............#..#......#..#",
+    "...............#..#......#..#",
+    ".....###########..#......#..#",
+    "......##########..#......#..#",
+    "...............#..#......#..#",
+    "...............#..########..#",
+    ".##............#..###########",
+    "#..#...........####......####",
+    "#..#...........####.......##.",
+    ".##............###...........",
+];
+
+/// Pushpin, pinned ("pushpin in") state -- olgx's flat single-color glyph
+/// (encoding 20, `pupinin`): the pin pushed straight into the board, seen
+/// at an angle, outlined.
+const PUSHPIN_GLYPH_PINNED: &[&str] = &[
+    "........###....",
+    ".....###...##..",
+    "...###.......#.",
+    "..#..#.......#.",
+    ".#..#.........#",
+    ".#..#.........#",
+    "#...#.........#",
+    "#...##.......##",
+    "#....#.......#.",
+    "##...###...###.",
+    ".#....#######..",
+    ".##.....#####..",
+    ".####....###...",
+    "###########....",
+    "##.............",
+];
+
+/// Renders one of the bitmaps above into box (x0,y0)-(x1,y1): scaled
+/// *uniformly* (the same factor on both axes, so the glyph's own
+/// proportions are never stretched) to the largest size that fits within
+/// the box, then centered. draw_pushpin shares one box between two
+/// states with different native aspect ratios (the pinned glyph is a
+/// compact square, the unpinned one nearly 2:1 wide -- see
+/// PUSHPIN_GLYPH_PINNED/UNPINNED's doc comments); independently
+/// stretching each axis to exactly fill the box, the first attempt at
+/// this function, squashed whichever glyph was further from the box's
+/// own aspect ratio -- confirmed live as the unpinned pushpin looking
+/// noticeably horizontally compressed.
+///
+/// Within the centered sub-box, each destination pixel is on if *any*
+/// source pixel in the region it covers is on, rather than point-
+/// sampling a single nearest source pixel -- plain nearest-neighbor
+/// dropped nearly all of the pushpin's unpinned glyph on an even earlier
+/// attempt, since most sampled points landed in the gaps between one of
+/// its 1px-wide outline strokes. Shared by draw_button_glyph and
+/// draw_pushpin so both go through the same scaling logic.
+#[allow(clippy::too_many_arguments)]
+fn draw_glyph_bitmap(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    bitmap: &[&str],
+    color: (u8, u8, u8),
+) {
+    let (r, g, b) = color;
+    let src_h = bitmap.len() as i32;
+    let src_w = bitmap.first().map_or(0, |row| row.len() as i32);
+    let box_w = x1 - x0;
+    let box_h = y1 - y0;
+    if src_h == 0 || src_w == 0 || box_w <= 0 || box_h <= 0 {
+        return;
+    }
+    let scale = (box_w as f64 / src_w as f64).min(box_h as f64 / src_h as f64);
+    let dst_w = ((src_w as f64) * scale).round().max(1.0) as i32;
+    let dst_h = ((src_h as f64) * scale).round().max(1.0) as i32;
+    let off_x = x0 + (box_w - dst_w) / 2;
+    let off_y = y0 + (box_h - dst_h) / 2;
+
+    let rows: Vec<&[u8]> = bitmap.iter().map(|row| row.as_bytes()).collect();
+    for dy in 0..dst_h {
+        let sy0 = (dy * src_h / dst_h).clamp(0, src_h - 1);
+        let sy1 = (((dy + 1) * src_h + dst_h - 1) / dst_h).clamp(sy0 + 1, src_h);
+        for dx in 0..dst_w {
+            let sx0 = (dx * src_w / dst_w).clamp(0, src_w - 1);
+            let sx1 = (((dx + 1) * src_w + dst_w - 1) / dst_w).clamp(sx0 + 1, src_w);
+            let on = (sy0..sy1)
+                .any(|sy| (sx0..sx1).any(|sx| rows[sy as usize].get(sx as usize) == Some(&b'#')));
+            if !on {
+                continue;
+            }
+            let px = off_x + dx;
+            let py = off_y + dy;
+            if px < 0 || py < 0 || px >= canvas_width || py >= canvas_height {
+                continue;
+            }
+            let idx = ((py * canvas_width + px) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
+/// Draws the pushpin glyph within box (x0,y0)-(x1,y1): the pinned or
+/// unpinned OLGlyph shape (see PUSHPIN_GLYPH_PINNED/UNPINNED), scaled to
+/// fit.
 #[allow(clippy::too_many_arguments)]
 fn draw_pushpin(
     canvas: &mut [u8],
@@ -2048,30 +2245,8 @@ fn draw_pushpin(
     pinned: bool,
     color: (u8, u8, u8),
 ) {
-    let (r, g, b) = color;
-    let radius = (x1 - x0).min(y1 - y0) / 2;
-    let cx = (x0 + x1) / 2;
-    let cy = (y0 + y1) / 2;
-    for dy in -radius..=radius {
-        for dx in -radius..=radius {
-            let dist2 = dx * dx + dy * dy;
-            let inside = dist2 <= radius * radius;
-            let on_ring = inside && (pinned || dist2 >= (radius - 2) * (radius - 2));
-            if !on_ring {
-                continue;
-            }
-            let px = cx + dx;
-            let py = cy + dy;
-            if px < 0 || py < 0 || px >= canvas_width || py >= canvas_height {
-                continue;
-            }
-            let idx = ((py * canvas_width + px) * 4) as usize;
-            canvas[idx] = b;
-            canvas[idx + 1] = g;
-            canvas[idx + 2] = r;
-            canvas[idx + 3] = 0xFF;
-        }
-    }
+    let bitmap = if pinned { PUSHPIN_GLYPH_PINNED } else { PUSHPIN_GLYPH_UNPINNED };
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, x0, y0, x1, y1, bitmap, color);
 }
 
 /// Fills one full-width row of `canvas` with an opaque color -- used for the
@@ -2131,14 +2306,13 @@ fn fill_rect(
     }
 }
 
-/// Draws a small downward-pointing chevron (the window-menu button glyph)
-/// filling the given box. Drawn geometrically rather than as a font glyph,
-/// same reasoning as draw_pushpin -- no dependency on a specific glyph
-/// being present in the embedded font. Exact proportions are a placeholder;
-/// docs/OPENLOOK-REFERENCE.md notes the real glyph shape still needs asset
-/// work.
+/// Draws the window-menu button's full glyph -- housing and chevron
+/// together, since OLGlyph's own bitmap includes both (see
+/// BUTTON_GLYPH_NORMAL) -- into the given box, scaled to fit. `inverted`
+/// selects the pressed-state glyph; see BUTTON_GLYPH_PRESSED's doc comment
+/// for why olshell's only caller passes hover for this.
 #[allow(clippy::too_many_arguments)]
-fn draw_chevron(
+fn draw_button_glyph(
     canvas: &mut [u8],
     canvas_width: i32,
     canvas_height: i32,
@@ -2146,40 +2320,23 @@ fn draw_chevron(
     y0: i32,
     x1: i32,
     y1: i32,
+    inverted: bool,
     color: (u8, u8, u8),
 ) {
-    let (r, g, b) = color;
-    let w = x1 - x0;
-    let h = y1 - y0;
-    let inset = (w.min(h) / 4).max(1);
-    let top = y0 + inset;
-    let bottom = y1 - inset;
-    let mid_x = (x0 + x1) / 2;
-    for y in top..bottom {
-        if bottom == top {
-            break;
-        }
-        // Narrows linearly from the full inset width at `top` down to a
-        // point at `bottom`, forming a downward-pointing "v".
-        let t = 1.0 - (y - top) as f64 / (bottom - top) as f64;
-        let half = ((mid_x - x0 - inset) as f64 * t) as i32;
-        for x in (mid_x - half)..=(mid_x + half) {
-            if x < 0 || y < 0 || x >= canvas_width || y >= canvas_height {
-                continue;
-            }
-            let idx = ((y * canvas_width + x) * 4) as usize;
-            canvas[idx] = b;
-            canvas[idx + 1] = g;
-            canvas[idx + 2] = r;
-            canvas[idx + 3] = 0xFF;
-        }
-    }
+    let bitmap = if inverted { BUTTON_GLYPH_PRESSED } else { BUTTON_GLYPH_NORMAL };
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, x0, y0, x1, y1, bitmap, color);
 }
 
 /// Draws a small rightward-pointing wedge -- the window menu's indicator
-/// that an item opens a submenu rather than acting immediately. Same
-/// placeholder-geometry reasoning as draw_chevron (which this mirrors,
-/// x/y swapped): an approximation, not an asset-accurate glyph.
+/// that an item opens a submenu rather than acting immediately. Drawn
+/// geometrically, same placeholder reasoning draw_button_glyph and
+/// draw_pushpin used to share before their bitmaps were traced from
+/// OLGlyph -- an approximation, not an asset-accurate glyph. Unlike those
+/// two, this doesn't correspond to anything in olwm's own window menu (the
+/// reference screenshot's menu has no submenus at all -- Move to Workspace
+/// is olshell's own addition), so there's no equivalent glyph identified
+/// to trace yet; OLIT's "pullright" menus likely used one, just not one
+/// this investigation has located.
 #[allow(clippy::too_many_arguments)]
 fn draw_submenu_arrow(
     canvas: &mut [u8],
