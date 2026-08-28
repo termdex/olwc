@@ -725,3 +725,28 @@ with wlroots compositors generally, not just this project.
   press/motion/release handling doesn't attempt; a drag that reaches the
   edge of its starting output's background today just clamps there, the
   same as any other out-of-bounds attempt.
+- Icon thumbnail glyph: a postage-stamp-sized static screenshot of the
+  window, taken at the moment it's iconified, in place of the current
+  generic first-letter glyph. Not an authentic OPEN LOOK convention --
+  real OPEN LOOK/olwm icons were simple bitmap glyphs (an app-supplied
+  pixmap or a generic default), never a snapshot of window content;
+  window-thumbnail icons postdate OPEN LOOK by a couple of decades
+  (macOS Dock, Windows taskbar previews, GNOME/KDE switchers), so this
+  would be a deliberate modern departure like the workspace strip or
+  ADJUST-move-to-workspace already are, not a spec conflict, just not
+  authentic. olshell can't do the capture itself -- it only holds a
+  *foreign* toplevel handle, and Wayland deliberately gives no client
+  access to another client's buffer contents (the same restriction that
+  forced `openlook-decoration` to exist for header chrome at all) -- so
+  this needs a new olcore-side protocol request, on the model of
+  `wlr-screencopy`: read the toplevel's current texture back via
+  `wlr_surface_get_texture()`, render it into a small offscreen buffer
+  at icon resolution, and hand the result to olshell as an SHM buffer.
+  One favorable fact: minimizing in olcore is our own scene-graph
+  visibility toggle (`update_toplevel_visibility`), not a real unmap, so
+  the toplevel's texture stays live the whole time it's minimized --
+  there's no race to capture it in the one frame before it disappears.
+  Freezing it as a single static snapshot (rather than live-updating
+  content, which is a separate and harder idea -- see the "no live
+  content" gap already noted above) avoids needing an ongoing capture
+  subscription, just one readback per iconification.
