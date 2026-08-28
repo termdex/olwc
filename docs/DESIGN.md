@@ -917,3 +917,37 @@ with wlroots compositors generally, not just this project.
   bindings, and how olcore's interception hands off to the existing
   decoration-protocol requests (`close`, `quit`, ...) once a binding
   fires are all still open.
+- Pill-shaped menu-item highlight: hovering a window-menu item (or a
+  root-menu item) currently fills a plain rectangle
+  (`MENU_HOVER_COLOR`); authentic OPEN LOOK uses an obround/pill shape
+  instead, per both reference screenshot families. This is core, not a
+  theme variant -- confirmed from source that `olwm`'s window menu and
+  XView's own menu widget call the same `olgx_draw_accel_button`
+  (`libolgx`) for this, so there's no "Sun vs olvwm" design split to
+  arbitrate, just one shape both share. What *does* differ between the
+  two reference screenshots -- olvwm's beveled/recessed fill vs. the
+  Sun screenshot's flat black outline -- is the same `info->three_d`
+  runtime 2D/3D split already found twice this session (the pushpin's
+  flat-vs-bevel-composite glyphs, the resize corners): `olgx_draw_
+  accel_button`'s `OLGX_INVOKED` state fills with a beveled pill
+  (`BG3` top / `WHITE` bottom / `BG2` fill) in 3D mode, or a single
+  solid black outline in 2D mode, no design choice involved, just
+  which mode a given display/screenshot happened to render in. Default
+  to the 3D beveled version (consistent with the raised/inset bevel
+  convention already used throughout olshell's chrome -- see the
+  window gadget chrome entry's focus-indication paragraph), and note
+  the flat 2D version as a concrete first candidate for the theming
+  entry above once that exists, rather than building a switch for it
+  now.
+
+  Bigger lift than the fixed-size button/pushpin/arrow glyphs already
+  traced: those are small icons blitted at a fixed size, but a menu-
+  item highlight has to stretch to whatever width that row's text
+  needs. OPEN LOOK's own technique for this (visible in
+  `olgx_draw_button`'s glyph names -- `BUTTON_UL`/`_LR` endcaps, a
+  `_TOP_1`/`_BOTTOM_1`/`_FILL_1` middle segment repeated
+  `calc_add_ins()` times to fill the needed width) is stretchable font
+  glyphs: fixed-shape endcap characters plus a middle character tiled
+  to fill the width, all from the same OLGlyph font already traced
+  from -- a new technique for olshell (tiling/repeating a glyph
+  segment, not just scaling one), not yet attempted.
