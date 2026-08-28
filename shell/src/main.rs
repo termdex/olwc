@@ -1993,7 +1993,13 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
         // row -- for a multi-row popup that puts the title text down in
         // the first item's row instead of its own, leaving row 0 blank
         // and garbling whatever's hovered in row 1. Row-centered instead.
-        draw_text_row_centered(
+        // Bold: XView's own menu widget renders a menu's title item in
+        // its bold_font and everything else in the plain font
+        // (lib/libxview/menu/omi.c: `if (im->title) font =
+        // std_image->bold_font;`) -- a toolkit-level convention, not a
+        // one-off screenshot artifact, so this is the one piece of text
+        // in olshell that should be bold.
+        draw_bold_text_row_centered(
             canvas, width, 0, MENU_ROW_HEIGHT, px1 + MENU_H_PADDING,
             title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
         );
@@ -2043,6 +2049,29 @@ fn draw_text_row_centered(
 ) -> i32 {
     let baseline_y = row_y0 + row_height / 2 + (size as i32) / 3;
     draw_text_at(canvas, canvas_width, row_y0 + row_height, start_x, baseline_y, text, font, size, color)
+}
+
+/// Faux-bold variant of draw_text_row_centered: draws the text twice, the
+/// second copy shifted 1px right, thickening strokes via double alpha-
+/// blending. The bundled font (VT323) has no real bold weight to switch
+/// to -- it's a deliberately single-weight retro terminal typeface -- so
+/// this is the practical way to get XView's actual bold-title convention
+/// (see the caller) without bundling a second, stylistically mismatched
+/// font family just for one line of text.
+#[allow(clippy::too_many_arguments)]
+fn draw_bold_text_row_centered(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    row_y0: i32,
+    row_height: i32,
+    start_x: i32,
+    text: &str,
+    font: &fontdue::Font,
+    size: f32,
+    color: (u8, u8, u8),
+) -> i32 {
+    draw_text_row_centered(canvas, canvas_width, row_y0, row_height, start_x, text, font, size, color);
+    draw_text_row_centered(canvas, canvas_width, row_y0, row_height, start_x + 1, text, font, size, color)
 }
 
 // The window-menu button and pushpin glyphs below are traced pixel-for-

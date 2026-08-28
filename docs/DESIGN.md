@@ -390,6 +390,24 @@ with wlroots compositors generally, not just this project.
   `draw_glyph_bitmap`'s uniform, coverage-sampled scaling is still the
   right foundation for that whenever it gets built, just parameterized
   by the output's real scale instead of always assuming 1x.
+
+  ~~The root menu's title was drawn in the same weight as its items~~
+  resolved: confirmed genuine, not a one-off screenshot artifact, by
+  checking XView's own menu widget source
+  (`lib/libxview/menu/omi.c`): `if (im->title) font = std_image->
+  bold_font; else font = INHERIT_VALUE(font);` -- any menu built with
+  XView's menu package gets a bold title and plain-weight items
+  automatically, a toolkit-level convention. The bundled font (VT323)
+  has no real bold weight -- deliberately a single-weight retro
+  terminal typeface -- so a second, stylistically mismatched font
+  family wasn't worth bundling just for one line of text; added
+  `draw_bold_text_row_centered` instead, a faux-bold renderer that
+  draws the text twice, the second copy shifted 1px right, thickening
+  strokes via double alpha-blending. Only `MenuPopup`'s own title (e.g.
+  "Workspace") uses it -- the window menu has no equivalent title row,
+  and the Move to Workspace submenu's per-output header rows are an
+  olshell-only grouping label with no XView precedent either way, so
+  they're left as plain weight rather than guessing.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
   `.openwin-menu`, implemented in `shell/src/menu.rs`.
 - ~~Multi-monitor behavior for the workspace strip (per-monitor
@@ -843,3 +861,23 @@ with wlroots compositors generally, not just this project.
   content, which is a separate and harder idea -- see the "no live
   content" gap already noted above) avoids needing an ongoing capture
   subscription, just one readback per iconification.
+- Window-menu keyboard accelerators: olwm has a real "Mouseless"/menu-
+  accelerator system (`clients/olwm/evbind.c`, `menu.c` in the
+  historical XView/olwm source -- see the window gadget chrome entry's
+  OLGlyph paragraph for where that source lives), with actual
+  configurable key bindings that surface as the accelerator-key hints
+  shown next to some window-menu entries in the reference screenshots
+  (e.g. `Close` paired with a `W`-style hint, `Quit` with `⇧Q`) -- not
+  decorative labels, a real bound shortcut. Bigger than a menu-label
+  fix: normal application windows hold keyboard focus while in use, so
+  a global "Super+W closes the focused window" shortcut can't be
+  handled in olshell alone -- it needs olcore (the privileged half) to
+  intercept those key combinations before routing input to the focused
+  client, the same way any compositor's own window-management
+  shortcuts work. Nothing designed yet: which modifier fits modern
+  keyboards (Super is the obvious candidate, same reasoning
+  `docs/OPENLOOK-REFERENCE.md`'s ADJUST-button entry already went
+  through for a different button), which window-menu actions get
+  bindings, and how olcore's interception hands off to the existing
+  decoration-protocol requests (`close`, `quit`, ...) once a binding
+  fires are all still open.
