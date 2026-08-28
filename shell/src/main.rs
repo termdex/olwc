@@ -161,6 +161,11 @@ const ICON_SELECTED_COLOR: (u8, u8, u8) = DECORATION_FOCUSED_BG_COLOR;
 // the conventional double-click gesture. Timestamps come from the Wayland
 // pointer Press event (server clock, milliseconds), not wall-clock time.
 const ICON_DOUBLE_CLICK_MS: u32 = 400;
+// How far the pointer has to move (surface-local pixels) while SELECT is
+// held on an icon before it counts as a drag rather than a click -- below
+// this, a press-then-release is a click (select or double-click-restore);
+// at or past it, the icon follows the pointer instead.
+const ICON_DRAG_THRESHOLD: f64 = 4.0;
 
 const MENU_FONT_SIZE: f32 = 18.0;
 const MENU_ROW_HEIGHT: i32 = 26;
@@ -312,6 +317,14 @@ struct ToplevelInfo {
     // should read/act through, now that workspaces are per-output.
     workspace_index: Option<u32>,
     output: Option<wl_output::WlOutput>,
+    /// Top-left of this toplevel's icon box (background-surface-local, on
+    /// whichever output it's currently minimized on) once the user has
+    /// dragged it there -- None means "use the default packed left-to-
+    /// right layout", the only kind olwc had before free positioning.
+    /// Reset to None if the toplevel moves to a different output (see
+    /// the ToplevelWorkspace handler below), since a stored position
+    /// only makes sense relative to the output it was set on.
+    icon_position: Option<(i32, i32)>,
 }
 
 /// The header (title bar) chrome olshell draws for one toplevel it doesn't
@@ -791,6 +804,41 @@ struct BackgroundOutput {
     /// ICON_DOUBLE_CLICK_MS as a double-click rather than two single
     /// clicks.
     last_icon_click: Option<(ObjectId, u32)>,
+    /// SELECT is down on an icon and we're still waiting to see whether
+    /// this turns into a drag or a plain click -- see IconDrag's doc
+    /// comment.
+    drag: Option<IconDrag>,
+    /// Whether a wl_surface.frame callback is currently outstanding for
+    /// this background -- see request_background_redraw.
+    frame_requested: bool,
+    /// A redraw was asked for while frame_requested was already true, so
+    /// the frame callback handler should draw once more before going
+    /// idle instead of just clearing frame_requested.
+    redraw_pending: bool,
+}
+
+/// Tracks a SELECT press on an icon from the moment it goes down until
+/// it's either confirmed as a drag (moved past ICON_DRAG_THRESHOLD) or
+/// released as a plain click. Needed because the same button-down starts
+/// both gestures identically -- authentic OPEN LOOK icons are both
+/// draggable to reposition and double-click-to-restore, and there's no
+/// way to tell which one a press is starting until it either moves or
+/// doesn't.
+#[derive(Clone)]
+struct IconDrag {
+    id: ObjectId,
+    // The Press event's own time, carried through to Release so double-
+    // click detection compares press-to-press intervals (matching
+    // last_icon_click's own timestamps) rather than press-to-release.
+    press_time: u32,
+    // Pointer position at press, background-surface-local.
+    press_pos: (f64, f64),
+    // The icon's on-screen top-left at the moment of press, before any
+    // drag offset is applied.
+    origin: (i32, i32),
+    // Set once the pointer has moved past ICON_DRAG_THRESHOLD -- once
+    // true, Release ends a drag rather than acting as a click.
+    dragging: bool,
 }
 
 struct Olshell {
@@ -909,6 +957,7 @@ impl Olshell {
         // window on every workspace at once.
         let active_workspace = self.panels.iter().find(|p| p.output == bg.output).map(|p| p.active_workspace);
         let icon_ids = active_workspace.map(|w| self.minimized_toplevels_for_output(&bg.output, w));
+        let icon_rects = icon_ids.as_ref().map(|ids| self.icon_layout(ids, height));
         let hovered_icon = bg.hovered_icon;
         let selected_icon = bg.selected_icon.clone();
 
@@ -925,11 +974,15 @@ impl Olshell {
             pixel[3] = 0xFF;
         }
 
-        if let Some(icon_ids) = &icon_ids {
+        if let (Some(icon_ids), Some(rects)) = (&icon_ids, &icon_rects) {
             for (i, id) in icon_ids.iter().enumerate() {
-                let (x0, y0, x1, y1) = icon_rect(i, height);
-                if x1 > width {
-                    break;
+                let (x0, y0, x1, y1) = rects[i];
+                // Dragged icons can land anywhere on the background, so
+                // (unlike the old pure packed layout) a too-far entry
+                // doesn't mean every entry after it is too far too --
+                // skip rather than stop.
+                if x0 < 0 || y0 < 0 || x1 > width || y1 > height {
+                    continue;
                 }
                 let fill = if hovered_icon == Some(i) {
                     MENU_HOVER_COLOR
@@ -976,6 +1029,33 @@ impl Olshell {
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
         bg.layer.commit();
+    }
+
+    /// Redraws background `index`, but never more than once per compositor
+    /// frame -- every caller that used to call draw_background directly
+    /// now goes through here instead. Icon dragging calls this on every
+    /// single pointer Motion, which arrives far faster than the display
+    /// can present frames; drawing synchronously on each one (the
+    /// original approach) backed up the connection badly enough that
+    /// olcore killed olshell as a misbehaving client mid-drag (confirmed
+    /// live: "Data too big for buffer" followed by "error in client
+    /// communication" in olcore's log). Standard Wayland throttling:
+    /// request a wl_surface.frame callback alongside the draw, and defer
+    /// any redraw that's asked for before that callback fires -- see
+    /// CompositorHandler::frame below, which drains a deferred redraw
+    /// when it arrives.
+    fn request_background_redraw(&mut self, qh: &QueueHandle<Self>, index: usize) {
+        if self.backgrounds[index].frame_requested {
+            self.backgrounds[index].redraw_pending = true;
+            return;
+        }
+        self.backgrounds[index].frame_requested = true;
+        let surface = self.backgrounds[index].layer.wl_surface().clone();
+        // Requested before draw_background's own commit below so it's
+        // associated with the frame that commit produces, the ordering
+        // wl_surface.frame's own documentation recommends.
+        surface.frame(qh, surface.clone());
+        self.draw_background(index);
     }
 
     /// Requests a header decoration for `toplevel_id` if openlook-decoration
@@ -1646,9 +1726,9 @@ impl Olshell {
     /// something else happened to redraw the background anyway (e.g. the
     /// pointer moving over it) -- confirmed live as an icon not
     /// appearing/disappearing until the pointer crossed the tray.
-    fn redraw_background_for_output(&mut self, output: &wl_output::WlOutput) {
+    fn redraw_background_for_output(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
         if let Some(index) = self.backgrounds.iter().position(|b| &b.output == output) {
-            self.draw_background(index);
+            self.request_background_redraw(qh, index);
         }
     }
 
@@ -1687,14 +1767,37 @@ impl Olshell {
         ids
     }
 
+    /// The on-screen rect (icon box only -- the label sits below y1) for
+    /// each id in `icon_ids`, same order, for a background of the given
+    /// height. An id the user has dragged (ToplevelInfo::icon_position)
+    /// renders there; every other id packs left-to-right along the
+    /// bottom in its own sub-sequence, exactly as icon_rect always did,
+    /// skipping over whichever indices are spoken for by dragged icons.
+    /// Shared by drawing, hit-testing, and drag start so none of them can
+    /// disagree about where an icon actually is.
+    fn icon_layout(&self, icon_ids: &[ObjectId], bg_height: i32) -> Vec<(i32, i32, i32, i32)> {
+        let mut default_index = 0;
+        icon_ids
+            .iter()
+            .map(|id| match self.toplevels.get(id).and_then(|info| info.icon_position) {
+                Some((x0, y0)) => (x0, y0, x0 + ICON_SIZE, y0 + ICON_SIZE),
+                None => {
+                    let rect = icon_rect(default_index, bg_height);
+                    default_index += 1;
+                    rect
+                }
+            })
+            .collect()
+    }
+
     /// Icon tray index at `(x, y)` (background-local) for the output
     /// `background_index` names, if any.
     fn icon_at(&self, background_index: usize, x: f64, y: f64) -> Option<usize> {
         let bg = &self.backgrounds[background_index];
         let panel = self.panels.iter().find(|p| p.output == bg.output)?;
-        let count = self.minimized_toplevels_for_output(&bg.output, panel.active_workspace).len();
-        (0..count).find(|&i| {
-            let (x0, y0, x1, y1) = icon_rect(i, bg.height as i32);
+        let icon_ids = self.minimized_toplevels_for_output(&bg.output, panel.active_workspace);
+        let rects = self.icon_layout(&icon_ids, bg.height as i32);
+        rects.iter().position(|&(x0, y0, x1, y1)| {
             x >= x0 as f64 && x < x1 as f64 && y >= y0 as f64 && y < y1 as f64
         })
     }
@@ -2180,13 +2283,19 @@ impl CompositorHandler for Olshell {
     ) {
     }
 
-    fn frame(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _time: u32,
-    ) {
+    // Fires once for each wl_surface.frame callback request_background_redraw
+    // makes -- the only caller of that request today. Clears the
+    // outstanding-callback flag and, if a redraw was deferred while it was
+    // outstanding, performs it now (requesting the next callback in turn).
+    fn frame(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, surface: &wl_surface::WlSurface, _time: u32) {
+        let Some(index) = self.background_at(surface) else {
+            return;
+        };
+        self.backgrounds[index].frame_requested = false;
+        if self.backgrounds[index].redraw_pending {
+            self.backgrounds[index].redraw_pending = false;
+            self.request_background_redraw(qh, index);
+        }
     }
 
     fn surface_enter(
@@ -2243,6 +2352,9 @@ impl OutputHandler for Olshell {
             hovered_icon: None,
             selected_icon: None,
             last_icon_click: None,
+            drag: None,
+            frame_requested: false,
+            redraw_pending: false,
         });
 
         let Some(manager) = self.workspaces_manager.as_ref() else {
@@ -2324,7 +2436,7 @@ impl LayerShellHandler for Olshell {
     fn configure(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         layer: &LayerSurface,
         configure: LayerSurfaceConfigure,
         _serial: u32,
@@ -2342,7 +2454,7 @@ impl LayerShellHandler for Olshell {
             let bg = &mut self.backgrounds[index];
             bg.width = configure.new_size.0;
             bg.height = configure.new_size.1;
-            self.draw_background(index);
+            self.request_background_redraw(qh, index);
         } else if let Some(index) = self.popup_at(layer.wl_surface()) {
             let popup = &mut self.popups[index];
             if configure.new_size.0 > 0 {
@@ -2456,60 +2568,119 @@ impl PointerHandler for Olshell {
                 }
                 PointerEventKind::Motion { .. } if background_index.is_some() => {
                     let i = background_index.unwrap();
-                    let hovered = self.icon_at(i, event.position.0, event.position.1);
-                    if self.backgrounds[i].hovered_icon != hovered {
-                        self.backgrounds[i].hovered_icon = hovered;
-                        self.draw_background(i);
+                    // If SELECT is down on an icon, this motion either
+                    // starts or continues a drag rather than updating
+                    // hover -- see IconDrag's doc comment.
+                    let drag = self.backgrounds[i]
+                        .drag
+                        .as_ref()
+                        .map(|d| (d.id.clone(), d.press_pos, d.origin, d.dragging));
+                    if let Some((id, press_pos, origin, already_dragging)) = drag {
+                        let dx = event.position.0 - press_pos.0;
+                        let dy = event.position.1 - press_pos.1;
+                        if already_dragging || dx.hypot(dy) >= ICON_DRAG_THRESHOLD {
+                            let bg = &self.backgrounds[i];
+                            let max_x = (bg.width as i32 - ICON_SIZE).max(0);
+                            let max_y = (bg.height as i32 - ICON_SIZE - ICON_LABEL_HEIGHT).max(0);
+                            let new_x = (origin.0 + dx.round() as i32).clamp(0, max_x);
+                            let new_y = (origin.1 + dy.round() as i32).clamp(0, max_y);
+                            if let Some(info) = self.toplevels.get_mut(&id) {
+                                info.icon_position = Some((new_x, new_y));
+                            }
+                            let bg = &mut self.backgrounds[i];
+                            if let Some(d) = bg.drag.as_mut() {
+                                d.dragging = true;
+                            }
+                            // Visual "picked up" feedback for as long as the
+                            // drag lasts; stays selected after the drop too,
+                            // same as most desktop icon dragging conventions.
+                            bg.selected_icon = Some(id);
+                            self.request_background_redraw(qh, i);
+                        }
+                    } else {
+                        let hovered = self.icon_at(i, event.position.0, event.position.1);
+                        if self.backgrounds[i].hovered_icon != hovered {
+                            self.backgrounds[i].hovered_icon = hovered;
+                            self.request_background_redraw(qh, i);
+                        }
                     }
                 }
                 PointerEventKind::Leave { .. } if background_index.is_some() => {
                     let i = background_index.unwrap();
                     if self.backgrounds[i].hovered_icon.take().is_some() {
-                        self.draw_background(i);
+                        self.request_background_redraw(qh, i);
                     }
                 }
-                // SELECT (left-click) an icon to select/highlight it, matching
-                // authentic OPEN LOOK -- a second SELECT-click on the same
-                // icon within ICON_DOUBLE_CLICK_MS restores it instead
-                // (double-click), the conventional gesture a real icon's own
-                // MENU-click Open item would otherwise be the alternative to.
-                // Clicking the background outside any icon just clears
-                // whatever was selected.
+                // SELECT (left-button) press on an icon starts tracking a
+                // possible drag or click -- which one this turns out to be
+                // isn't decided until Release (below), based on how far the
+                // pointer moves while held (see IconDrag's doc comment).
+                // Pressing the background outside any icon has no drag/click
+                // ambiguity to defer -- it just clears whatever was selected,
+                // immediately.
                 PointerEventKind::Press { button, time, .. } if background_index.is_some() && button == BTN_LEFT => {
                     let i = background_index.unwrap();
                     let icon_index = self.icon_at(i, event.position.0, event.position.1);
                     let output = self.backgrounds[i].output.clone();
                     let active_workspace =
                         self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
-                    let clicked_id = icon_index.and_then(|idx| {
-                        let w = active_workspace?;
-                        self.minimized_toplevels_for_output(&output, w).get(idx).cloned()
+                    let icon_ids = active_workspace.map(|w| self.minimized_toplevels_for_output(&output, w));
+                    let clicked = icon_index.zip(icon_ids.as_ref()).and_then(|(idx, ids)| {
+                        let height = self.backgrounds[i].height as i32;
+                        let rects = self.icon_layout(ids, height);
+                        let id = ids.get(idx)?.clone();
+                        let &(x0, y0, ..) = rects.get(idx)?;
+                        Some((id, (x0, y0)))
                     });
 
-                    let bg = &mut self.backgrounds[i];
-                    let is_double_click = match (&clicked_id, &bg.last_icon_click) {
-                        (Some(id), Some((last_id, last_time))) => {
-                            id == last_id && time.wrapping_sub(*last_time) <= ICON_DOUBLE_CLICK_MS
-                        }
-                        _ => false,
+                    if let Some((id, origin)) = clicked {
+                        self.backgrounds[i].drag = Some(IconDrag {
+                            id,
+                            press_time: time,
+                            press_pos: event.position,
+                            origin,
+                            dragging: false,
+                        });
+                    } else if self.backgrounds[i].selected_icon.take().is_some() {
+                        self.request_background_redraw(qh, i);
+                    }
+                }
+                // Ends whatever the matching Press started. A drag that
+                // already moved the icon (see Motion above) just lets go;
+                // otherwise this was a plain click -- select/highlight it,
+                // or restore it if it's a second click on the same icon
+                // within ICON_DOUBLE_CLICK_MS (double-click), matching
+                // authentic OPEN LOOK.
+                PointerEventKind::Release { button, .. } if background_index.is_some() && button == BTN_LEFT => {
+                    let i = background_index.unwrap();
+                    let Some(drag) = self.backgrounds[i].drag.take() else {
+                        continue;
                     };
+                    if drag.dragging {
+                        continue;
+                    }
+                    let is_double_click = match &self.backgrounds[i].last_icon_click {
+                        Some((last_id, last_time)) => {
+                            *last_id == drag.id && drag.press_time.wrapping_sub(*last_time) <= ICON_DOUBLE_CLICK_MS
+                        }
+                        None => false,
+                    };
+                    let bg = &mut self.backgrounds[i];
                     if is_double_click {
                         bg.selected_icon = None;
                         bg.last_icon_click = None;
                     } else {
-                        bg.selected_icon = clicked_id.clone();
-                        bg.last_icon_click = clicked_id.clone().map(|id| (id, time));
+                        bg.selected_icon = Some(drag.id.clone());
+                        bg.last_icon_click = Some((drag.id.clone(), drag.press_time));
                     }
-                    self.draw_background(i);
+                    self.request_background_redraw(qh, i);
 
                     // unset_minimized alone would bring the window back but
                     // leave focus wherever it already was (possibly nowhere),
                     // so activate it too, the same pairing clicking a taskbar
                     // entry does elsewhere.
                     if is_double_click {
-                        if let Some(handle) =
-                            clicked_id.and_then(|id| self.toplevels.get(&id)?.handle.clone())
-                        {
+                        if let Some(handle) = self.toplevels.get(&drag.id).and_then(|info| info.handle.clone()) {
                             handle.unset_minimized();
                             if let Some(seat) = self.seat_state.seats().next() {
                                 handle.activate(&seat);
@@ -3077,7 +3248,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                 // or app_id change while minimized (the icon's own
                 // glyph/label).
                 if let Some(output) = state.toplevels.get(&proxy.id()).and_then(|info| info.output.clone()) {
-                    state.redraw_background_for_output(&output);
+                    state.redraw_background_for_output(qh, &output);
                 }
             }
             Event::Closed => {
@@ -3092,7 +3263,7 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                     // A minimized toplevel closing outright (not just
                     // being restored) needs its icon gone too.
                     if let Some(output) = info.output.take() {
-                        state.redraw_background_for_output(&output);
+                        state.redraw_background_for_output(qh, &output);
                     }
                 }
                 proxy.destroy();
@@ -3187,6 +3358,12 @@ impl Dispatch<ZopenlookWorkspacesManagerV1, ()> for Olshell {
                 let title = state.toplevels.get(&toplevel.id()).map(|i| i.title.clone());
                 log::info!("workspaces: toplevel {title:?} -> output {output:?} workspace {index}");
                 if let Some(info) = state.toplevels.get_mut(&toplevel.id()) {
+                    if info.output.as_ref() != Some(&output) {
+                        // A dragged icon position is only meaningful on the
+                        // output it was set on -- falls back to the default
+                        // packed layout on whichever output it lands on now.
+                        info.icon_position = None;
+                    }
                     info.output = Some(output);
                     info.workspace_index = Some(index);
                 }
@@ -3202,7 +3379,7 @@ impl Dispatch<ZopenlookWorkspacesOutputV1, ()> for Olshell {
         event: zopenlook_workspaces_output_v1::Event,
         _data: &(),
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
     ) {
         use zopenlook_workspaces_output_v1::Event;
 
@@ -3225,7 +3402,7 @@ impl Dispatch<ZopenlookWorkspacesOutputV1, ()> for Olshell {
                 // switching workspaces can change which icons belong in
                 // this output's tray.
                 let output = state.panels[index].output.clone();
-                state.redraw_background_for_output(&output);
+                state.redraw_background_for_output(qh, &output);
             }
         }
     }

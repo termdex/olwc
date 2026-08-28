@@ -641,7 +641,14 @@ with wlroots compositors generally, not just this project.
   popup), and icons show no live content the way a real OPEN LOOK clock
   or calendar icon could (see the sunos551 screenshots above) -- all real
   follow-up work if it turns out to matter in practice, not attempted
-  here.
+  here. A per-icon MENU popup, if it's ever built, is also the one place
+  in olshell an ADJUST-click extend-selection gesture (see
+  `docs/OPENLOOK-REFERENCE.md`'s open questions) would have a real
+  surface to attach to -- ADJUST-click toggling an icon in/out of a
+  multi-selection without disturbing the rest, the way OPEN LOOK's icon
+  lists originally used it. No batch action needs that selection yet, so
+  this is scope to fold in alongside the popup, not a reason to build
+  either now.
 - ~~Icon restore gesture~~ resolved: authentic OPEN LOOK/olwm icons are
   double-click (SELECT) to restore, not single-click -- a single click
   just selects/highlights, and a real icon's own MENU-click popup
@@ -660,20 +667,61 @@ with wlroots compositors generally, not just this project.
   different icon after such a reshuffle. No per-icon MENU-click popup
   yet (see the icon tray entry above), so selecting an icon has no
   effect beyond the highlight for now.
-- Icon free positioning: icons are freely drag-repositionable to
-  anywhere on the desktop in authentic OPEN LOOK/olwm -- olwm's
-  `Olwm*IconLocation`/`IconRegion` resources only ever set the *default*
-  placement, same as any other window. olwc's packed left-to-right
-  tray layout leaves no per-icon position to drag at all. It needs
-  per-icon position state instead of the current computed layout, real
-  drag handling, and a decision about what dragging an icon across an
-  output boundary should mean given the per-output desktop model. Worth
-  considering alongside whichever of these lands first: an authentic
-  MENU-click per-icon popup implies each icon becomes independently
-  selectable, which is also the one place in olshell an ADJUST-click
-  extend-selection gesture (see `docs/OPENLOOK-REFERENCE.md`'s open
-  questions) would have a real surface to attach to -- ADJUST-click
-  toggling an icon in/out of a multi-selection without disturbing the
-  rest, the way OPEN LOOK's icon lists originally used it. No batch
-  action needs that selection yet, so this is scope to fold in if/when
-  icon selection state gets built, not a reason to build it now.
+- ~~Icon free positioning~~ resolved: icons are freely drag-
+  repositionable to anywhere on the desktop in authentic OPEN LOOK/olwm
+  -- olwm's `Olwm*IconLocation`/`IconRegion` resources only ever set the
+  *default* placement, same as any other window. olwc's icon tray now
+  matches: `ToplevelInfo::icon_position` (`shell/src/main.rs`) holds a
+  dragged icon's top-left, background-surface-local; `None` (the default
+  for every icon until dragged) falls back to the original packed
+  left-to-right layout, with only the *other* undragged icons filling in
+  around it. `Olshell::icon_layout()` computes the on-screen rect for
+  every icon in the tray this way, shared by drawing, hit-testing, and
+  drag start so none of them can disagree about where an icon actually
+  is. A press on an icon doesn't commit to being a click or a drag until
+  it either moves past `ICON_DRAG_THRESHOLD` (4px) or is released still
+  under it (`IconDrag` tracks the ambiguity in between) -- past the
+  threshold the icon follows the pointer, clamped to stay fully within
+  the background's bounds; released before it, the existing single-
+  select/double-click-restore handling from the previous entry runs
+  unchanged. A dragged position resets to the default layout if the
+  toplevel later moves to a *different* output (via `ToplevelWorkspace`),
+  since a stored position only makes sense relative to the output it was
+  set on -- carrying it over unchanged could easily land it off-screen on
+  a differently-sized output. Confirmed live as a pleasant, unplanned
+  side effect: iconifying a window a second time restores it to wherever
+  it was last dragged rather than always snapping back to the default
+  slot, which reads as expected per-window position memory even though
+  nothing was deliberately built to provide it -- it falls straight out
+  of `icon_position` living on the toplevel's own long-lived
+  `ToplevelInfo` rather than being tray-layout state.
+
+  Dragging surfaced a real bug, not a design question: redrawing the
+  *entire* background on every single pointer Motion event (needed so
+  the icon visibly follows the pointer) fires far more often than the
+  display can present frames, and did so testing live -- badly enough
+  that the flood of outgoing Wayland messages overran olcore's
+  per-client write buffer, which responded by disconnecting olshell as
+  a misbehaving client ("Data too big for buffer" / "error in client
+  communication" in olcore's log), taking down the whole nested session.
+  Fixed with the standard Wayland throttling idiom: `Olshell::
+  request_background_redraw()` requests a `wl_surface.frame` callback
+  alongside every redraw and defers any further redraw asked for before
+  that callback fires (`CompositorHandler::frame`, previously an unused
+  stub, drains the deferred one when it arrives) -- caps redraws to one
+  per compositor frame regardless of how fast input events arrive. Every
+  caller that used to call `draw_background` directly now goes through
+  this instead, not just the drag path, since none of them have a good
+  reason to bypass the throttle.
+
+  Explicitly out of scope, not silently dropped: dragging an icon across
+  an output boundary. Unlike a toplevel move grab (handled compositor-
+  side in olcore, where the cursor position is global), an icon's drag
+  is tracked entirely client-side against one output's own background
+  surface -- olcore has no idea icons exist at all. Carrying a drag from
+  one background surface to another would need olshell to notice the
+  Leave/Enter pair on two different `BackgroundOutput`s mid-drag and
+  hand the `IconDrag` state across them, which the current per-surface
+  press/motion/release handling doesn't attempt; a drag that reaches the
+  edge of its starting output's background today just clamps there, the
+  same as any other out-of-bounds attempt.
