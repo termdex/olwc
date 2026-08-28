@@ -307,6 +307,41 @@ const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Quit", action: WindowMenuAction::Quit, disabled: false },
 ];
 
+enum IconMenuAction {
+    /// Restores the toplevel -- the same action a double-click on the
+    /// icon triggers, offered here too since a real OPEN LOOK icon's own
+    /// popup is the discoverable alternative to remembering the
+    /// double-click (see the icon tray entry's own restore-gesture
+    /// paragraph in docs/DESIGN.md).
+    Open,
+    /// Arms a click-to-follow move of the icon, ended by the next press
+    /// anywhere -- see IconDrag's doc comment for why it's modeled as an
+    /// IconDrag with `armed: true` rather than a new mechanism.
+    Move,
+    /// Not wired up yet -- logs a placeholder, same as the window menu's
+    /// own Properties item.
+    Unimplemented,
+}
+
+struct IconMenuItem {
+    label: &'static str,
+    action: IconMenuAction,
+    disabled: bool,
+}
+
+// Deliberately just these three, matching docs/DESIGN.md's icon tray
+// entry: a real OPEN LOOK icon's popup is Open/Move/Properties, plus
+// Quit -- Quit is left out for now since nothing here has needed it yet
+// (the icon tray's icons are always attached to a live, running
+// application; wiring in a Quit path can wait until it does).
+// Properties is disabled to match the window menu's own convention for
+// the same not-yet-implemented item.
+const ICON_MENU_ITEMS: &[IconMenuItem] = &[
+    IconMenuItem { label: "Open", action: IconMenuAction::Open, disabled: false },
+    IconMenuItem { label: "Move", action: IconMenuAction::Move, disabled: false },
+    IconMenuItem { label: "Properties", action: IconMenuAction::Unimplemented, disabled: true },
+];
+
 // SIL Open Font License 1.1, see assets/fonts/OFL.txt.
 static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
 
@@ -555,6 +590,37 @@ impl WindowMenu {
     }
 }
 
+/// A MENU-click (right-click) popup for one icon in the tray -- Open,
+/// Move, Properties (see ICON_MENU_ITEMS). A subsurface of the icon's own
+/// `BackgroundOutput` layer surface, positioned just below the icon
+/// (`open_icon_menu`) -- the same "any of olshell's own surfaces can
+/// parent a subsurface, no protocol extension needed" reasoning the
+/// window menu already relies on for the decoration header, just with
+/// the background as parent instead. Keyboard focus (openlook-
+/// decoration's grab_keyboard) so Escape closes it, same as the window
+/// menu and for the same reason -- a plain subsurface has no
+/// wlr-layer-shell Exclusive-interactivity equivalent of its own.
+struct IconMenu {
+    toplevel_id: ObjectId,
+    /// Which BackgroundOutput this icon (and so this menu) belongs to --
+    /// needed by the Move item to know which background's icon_position
+    /// to update and which pointer events (keyed by background surface)
+    /// apply.
+    background_index: usize,
+    subsurface: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
+    width: u32,
+    height: u32,
+    hovered: Option<usize>,
+}
+
+impl IconMenu {
+    fn item_at(&self, y: f64) -> Option<usize> {
+        let row = (y / MENU_ROW_HEIGHT as f64) as usize;
+        (row < ICON_MENU_ITEMS.len()).then_some(row)
+    }
+}
+
 /// One row of a WorkspaceSubmenu.
 enum WorkspaceSubmenuRow {
     /// A non-interactive row naming the output the Workspace rows right
@@ -757,6 +823,7 @@ fn main() {
         keyboard_focus: None,
         popups: Vec::new(),
         window_menu: None,
+        icon_menu: None,
     };
 
     while !state.exit {
@@ -835,21 +902,47 @@ struct BackgroundOutput {
 /// draggable to reposition and double-click-to-restore, and there's no
 /// way to tell which one a press is starting until it either moves or
 /// doesn't.
+///
+/// Also doubles as the icon menu's Move item's state (`armed: true`) --
+/// that's a discrete click, not a press-and-hold, so it starts already
+/// `dragging` (no threshold to cross) and finalizes on the *next* press
+/// anywhere rather than a matching Release, the same click-to-arm/click-
+/// to-drop pattern the window menu's own Move item uses (see
+/// `zopenlook_decoration_v1::move`'s doc comment) -- see
+/// `open_icon_menu`'s `Move` handler and the armed-move check at the top
+/// of `pointer_frame`.
 #[derive(Clone)]
 struct IconDrag {
     id: ObjectId,
     // The Press event's own time, carried through to Release so double-
     // click detection compares press-to-press intervals (matching
     // last_icon_click's own timestamps) rather than press-to-release.
+    // Unused (0) for an armed move, which never goes through Release.
     press_time: u32,
-    // Pointer position at press, background-surface-local.
-    press_pos: (f64, f64),
-    // The icon's on-screen top-left at the moment of press, before any
-    // drag offset is applied.
+    // Pointer position establishing the drag's reference point,
+    // background-surface-local. Known immediately for a real press-and-
+    // hold drag; None for an armed move until the first Motion arrives
+    // after arming, so the icon doesn't jump to reflect pointer movement
+    // that happened before tracking started (the pointer isn't
+    // necessarily anywhere near the icon at the moment Move is clicked,
+    // since the click happens on the icon menu's own surface).
+    press_pos: Option<(f64, f64)>,
+    // The icon's on-screen top-left at the moment of press (or arming),
+    // before any drag offset is applied.
     origin: (i32, i32),
-    // Set once the pointer has moved past ICON_DRAG_THRESHOLD -- once
-    // true, Release ends a drag rather than acting as a click.
+    // Set once the pointer has moved past ICON_DRAG_THRESHOLD (a real
+    // drag) or immediately (an armed move, no threshold to cross) --
+    // once true, Release ends a real drag rather than acting as a click;
+    // an armed move ignores Release entirely and ends on the next Press
+    // instead (see `armed` below).
     dragging: bool,
+    // True for a Move-item-armed move, false for an ordinary press-and-
+    // hold drag. Changes how the drag ends: an ordinary drag ends on
+    // Release of the button that started it; an armed move has no
+    // button held at all, so it ends on the next Press anywhere instead
+    // (handled up front in `pointer_frame`, before normal click
+    // handling for that press runs).
+    armed: bool,
 }
 
 struct Olshell {
@@ -876,13 +969,15 @@ struct Olshell {
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     // The surface a keyboard enter most recently reported, without a
-    // matching leave yet -- the only thing that ever requests keyboard
-    // focus is a root-menu popup's Exclusive layer surface (see
-    // MenuPopup's doc comment), so this is how Escape tells *which*
-    // popup to close now that more than one can be open at once.
+    // matching leave yet -- three things ever request keyboard focus (a
+    // root-menu popup's Exclusive layer surface, the window menu, and
+    // the icon menu, the latter two via openlook-decoration's
+    // grab_keyboard -- see each struct's own doc comment), so this is
+    // how Escape tells which one, if any, to close.
     keyboard_focus: Option<wl_surface::WlSurface>,
     popups: Vec<MenuPopup>,
     window_menu: Option<WindowMenu>,
+    icon_menu: Option<IconMenu>,
 }
 
 impl Olshell {
@@ -1441,6 +1536,143 @@ impl Olshell {
         }
 
         let wl_surface = &wm.surface;
+        buffer.attach_to(wl_surface).expect("failed to attach buffer");
+        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.commit();
+    }
+
+    /// Restores (unset_minimized) and refocuses toplevel `id` -- shared by
+    /// double-clicking its icon and the icon menu's Open item, the two
+    /// ways to trigger the same action. unset_minimized alone would bring
+    /// the window back but leave focus wherever it already was (possibly
+    /// nowhere), so activate it too, the same pairing clicking a taskbar
+    /// entry does elsewhere.
+    fn restore_toplevel(&mut self, id: &ObjectId) {
+        if let Some(handle) = self.toplevels.get(id).and_then(|info| info.handle.clone()) {
+            handle.unset_minimized();
+            if let Some(seat) = self.seat_state.seats().next() {
+                handle.activate(&seat);
+            }
+        }
+    }
+
+    /// Opens toplevel_id's icon menu (Open/Move/Properties) positioned
+    /// just below its icon on background_index's tray -- a no-op if the
+    /// icon isn't actually in the tray right now (e.g. the click and the
+    /// tray contents raced). Always closes whatever icon menu was already
+    /// open first, same as the window menu's own open always does; the
+    /// caller is responsible for the toggle-closed behavior when this
+    /// exact icon's menu was the one already open (see pointer_frame's
+    /// BTN_RIGHT handling), the same pattern open_window_menu's caller
+    /// already uses for the header button.
+    fn open_icon_menu(&mut self, qh: &QueueHandle<Self>, background_index: usize, toplevel_id: &ObjectId) {
+        self.close_icon_menu();
+
+        let output = self.backgrounds[background_index].output.clone();
+        let Some(active_workspace) =
+            self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace)
+        else {
+            return;
+        };
+        let icon_ids = self.minimized_toplevels_for_output(&output, active_workspace);
+        let Some(icon_index) = icon_ids.iter().position(|id| id == toplevel_id) else {
+            return;
+        };
+        let bg_height = self.backgrounds[background_index].height as i32;
+        let rects = self.icon_layout(&icon_ids, bg_height);
+        let (ix0, _, _, iy1) = rects[icon_index];
+
+        let label_width = |label: &str| -> i32 {
+            label.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum()
+        };
+        let max_width = ICON_MENU_ITEMS.iter().map(|item| label_width(item.label)).max().unwrap_or(0);
+        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        let height = (ICON_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
+
+        let bg_surface = self.backgrounds[background_index].layer.wl_surface().clone();
+        let (subsurface, surface) = self.subcompositor.create_subsurface(bg_surface.clone(), qh);
+        // Just below the icon's label, left-aligned with the icon itself.
+        subsurface.set_position(ix0, iy1 + ICON_LABEL_HEIGHT);
+        subsurface.set_desync();
+
+        // A plain subsurface has no wlr-layer-shell Exclusive-interactivity
+        // equivalent of its own, so getting keyboard focus (and thus
+        // Escape-to-close) needs asking olcore explicitly -- same
+        // reasoning as the window menu's own grab_keyboard call.
+        if let Some(manager) = self.decoration_manager.as_ref() {
+            manager.grab_keyboard(&surface);
+        }
+
+        self.icon_menu = Some(IconMenu {
+            toplevel_id: toplevel_id.clone(),
+            background_index,
+            subsurface,
+            surface,
+            width,
+            height,
+            hovered: None,
+        });
+        self.draw_icon_menu();
+
+        // Same "parent needs a fresh commit after the subsurface
+        // relationship is established, even in desync mode" nudge
+        // open_window_menu's own doc comment explains.
+        bg_surface.commit();
+    }
+
+    fn close_icon_menu(&mut self) {
+        if let Some(im) = self.icon_menu.take() {
+            if self.keyboard_focus.as_ref() == Some(&im.surface) {
+                self.keyboard_focus = None;
+            }
+            im.subsurface.destroy();
+            im.surface.destroy();
+        }
+    }
+
+    fn draw_icon_menu(&mut self) {
+        let Some(im) = self.icon_menu.as_ref() else {
+            return;
+        };
+        let width = im.width as i32;
+        let height = im.height as i32;
+        let stride = width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+
+        let (r, g, b) = MENU_BG_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+
+        for (i, item) in ICON_MENU_ITEMS.iter().enumerate() {
+            let row_y0 = i as i32 * MENU_ROW_HEIGHT;
+            if !item.disabled && im.hovered == Some(i) {
+                let (hr, hg, hb) = MENU_HOVER_COLOR;
+                for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
+                    for x in 0..width {
+                        let idx = ((y * width + x) * 4) as usize;
+                        canvas[idx] = hb;
+                        canvas[idx + 1] = hg;
+                        canvas[idx + 2] = hr;
+                        canvas[idx + 3] = 0xFF;
+                    }
+                }
+            }
+            let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
+            draw_text_row_centered(
+                canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                item.label, &self.font, MENU_FONT_SIZE, color,
+            );
+        }
+
+        let wl_surface = &im.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.damage_buffer(0, 0, width, height);
         wl_surface.commit();
@@ -2716,6 +2948,7 @@ impl PointerHandler for Olshell {
                 .as_ref()
                 .and_then(|wm| wm.workspace_submenu.as_ref())
                 .is_some_and(|sm| event.surface == sm.surface);
+            let on_icon_menu = self.icon_menu.as_ref().is_some_and(|im| event.surface == im.surface);
             // Captured before the "click elsewhere closes it" step below
             // clears it, so the button-click handler can tell a second
             // click on the button that opened this exact menu (which
@@ -2723,6 +2956,24 @@ impl PointerHandler for Olshell {
             // open one (a different toplevel's button, or this one after
             // the menu was already closed some other way).
             let window_menu_toplevel = self.window_menu.as_ref().map(|wm| wm.toplevel_id.clone());
+            let icon_menu_toplevel = self.icon_menu.as_ref().map(|im| im.toplevel_id.clone());
+
+            // A Move-item-armed icon move (see IconDrag's doc comment) ends
+            // on the next press anywhere, not a matching Release -- there's
+            // no button held for it to match. Checked and consumed before
+            // anything else a press might otherwise do, since "confirm the
+            // pending move" takes priority over whatever's actually under
+            // the pointer (the same way a real window move grab consumes
+            // the confirming click entirely rather than also delivering it
+            // to whatever's underneath).
+            if let PointerEventKind::Press { .. } = event.kind {
+                let armed = self.backgrounds.iter().position(|bg| bg.drag.as_ref().is_some_and(|d| d.armed));
+                if let Some(i) = armed {
+                    self.backgrounds[i].drag = None;
+                    self.request_background_redraw(qh, i);
+                    continue;
+                }
+            }
 
             // No keyboard focus on the window menu yet (see WindowMenu's
             // doc comment), so a press anywhere else is how it closes --
@@ -2736,12 +2987,42 @@ impl PointerHandler for Olshell {
                 if self.window_menu.is_some() && !on_window_menu && !on_workspace_submenu {
                     self.close_window_menu();
                 }
+                // Same reasoning, for the icon menu.
+                if self.icon_menu.is_some() && !on_icon_menu {
+                    self.close_icon_menu();
+                }
             }
 
             match event.kind {
+                // MENU (right-button) on an icon opens its own popup
+                // (Open/Move/Properties) instead of the root menu, same as
+                // a real OPEN LOOK icon would; a second MENU-click on the
+                // icon whose menu is already open toggles it closed
+                // instead of reopening it, same convention the window
+                // menu's own header button uses.
                 PointerEventKind::Press { button, .. } if background_index.is_some() && button == BTN_RIGHT => {
-                    let output = self.backgrounds[background_index.unwrap()].output.clone();
-                    self.open_menu(qh, &output, event.position.0, event.position.1);
+                    let i = background_index.unwrap();
+                    let icon_index = self.icon_at(i, event.position.0, event.position.1);
+                    let output = self.backgrounds[i].output.clone();
+                    let active_workspace =
+                        self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
+                    let clicked_id = icon_index.and_then(|idx| {
+                        let w = active_workspace?;
+                        self.minimized_toplevels_for_output(&output, w).get(idx).cloned()
+                    });
+                    match clicked_id {
+                        Some(id) if icon_menu_toplevel.as_ref() != Some(&id) => {
+                            self.open_icon_menu(qh, i, &id);
+                        }
+                        Some(_) => {
+                            // Toggling closed: the pre-step above already
+                            // closed it since this press isn't on the menu
+                            // itself, so there's nothing more to do here.
+                        }
+                        None => {
+                            self.open_menu(qh, &output, event.position.0, event.position.1);
+                        }
+                    }
                 }
                 PointerEventKind::Motion { .. } if background_index.is_some() => {
                     let i = background_index.unwrap();
@@ -2753,6 +3034,24 @@ impl PointerHandler for Olshell {
                         .as_ref()
                         .map(|d| (d.id.clone(), d.press_pos, d.origin, d.dragging));
                     if let Some((id, press_pos, origin, already_dragging)) = drag {
+                        let press_pos = match press_pos {
+                            Some(p) => p,
+                            None => {
+                                // First motion after an armed (menu-
+                                // triggered) move -- establish the
+                                // reference point now, from wherever the
+                                // pointer happens to be, so the icon
+                                // doesn't jump to reflect movement that
+                                // happened before tracking started (the
+                                // click that armed this happened on the
+                                // icon menu's own surface, not
+                                // necessarily anywhere near the icon).
+                                if let Some(d) = self.backgrounds[i].drag.as_mut() {
+                                    d.press_pos = Some(event.position);
+                                }
+                                event.position
+                            }
+                        };
                         let dx = event.position.0 - press_pos.0;
                         let dy = event.position.1 - press_pos.1;
                         if already_dragging || dx.hypot(dy) >= ICON_DRAG_THRESHOLD {
@@ -2814,9 +3113,10 @@ impl PointerHandler for Olshell {
                         self.backgrounds[i].drag = Some(IconDrag {
                             id,
                             press_time: time,
-                            press_pos: event.position,
+                            press_pos: Some(event.position),
                             origin,
                             dragging: false,
+                            armed: false,
                         });
                     } else if self.backgrounds[i].selected_icon.take().is_some() {
                         self.request_background_redraw(qh, i);
@@ -2852,17 +3152,8 @@ impl PointerHandler for Olshell {
                     }
                     self.request_background_redraw(qh, i);
 
-                    // unset_minimized alone would bring the window back but
-                    // leave focus wherever it already was (possibly nowhere),
-                    // so activate it too, the same pairing clicking a taskbar
-                    // entry does elsewhere.
                     if is_double_click {
-                        if let Some(handle) = self.toplevels.get(&drag.id).and_then(|info| info.handle.clone()) {
-                            handle.unset_minimized();
-                            if let Some(seat) = self.seat_state.seats().next() {
-                                handle.activate(&seat);
-                            }
-                        }
+                        self.restore_toplevel(&drag.id);
                     }
                 }
                 PointerEventKind::Motion { .. } if panel_index.is_some() => {
@@ -3136,6 +3427,79 @@ impl PointerHandler for Olshell {
                         self.close_window_menu();
                     }
                 }
+                PointerEventKind::Motion { .. } if on_icon_menu => {
+                    let changed = if let Some(im) = self.icon_menu.as_mut() {
+                        let hovered = im.item_at(event.position.1).filter(|&i| !ICON_MENU_ITEMS[i].disabled);
+                        if im.hovered != hovered {
+                            im.hovered = hovered;
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if changed {
+                        self.draw_icon_menu();
+                    }
+                }
+                PointerEventKind::Leave { .. } if on_icon_menu => {
+                    let had_hover = self.icon_menu.as_ref().is_some_and(|im| im.hovered.is_some());
+                    if had_hover {
+                        if let Some(im) = self.icon_menu.as_mut() {
+                            im.hovered = None;
+                        }
+                        self.draw_icon_menu();
+                    }
+                }
+                PointerEventKind::Press { button, .. } if on_icon_menu && button == BTN_LEFT => {
+                    let selection = self.icon_menu.as_ref().and_then(|im| {
+                        im.item_at(event.position.1)
+                            .map(|index| (im.toplevel_id.clone(), im.background_index, index))
+                    });
+                    if let Some((toplevel_id, background_index, index)) = selection {
+                        let item = &ICON_MENU_ITEMS[index];
+                        if !item.disabled {
+                            match item.action {
+                                IconMenuAction::Open => {
+                                    self.restore_toplevel(&toplevel_id);
+                                }
+                                IconMenuAction::Move => {
+                                    let output = self.backgrounds[background_index].output.clone();
+                                    let active_workspace = self
+                                        .panels
+                                        .iter()
+                                        .find(|p| p.output == output)
+                                        .map(|p| p.active_workspace);
+                                    let origin = active_workspace.and_then(|w| {
+                                        let ids = self.minimized_toplevels_for_output(&output, w);
+                                        let idx = ids.iter().position(|id| *id == toplevel_id)?;
+                                        let height = self.backgrounds[background_index].height as i32;
+                                        let &(x0, y0, ..) = self.icon_layout(&ids, height).get(idx)?;
+                                        Some((x0, y0))
+                                    });
+                                    if let Some(origin) = origin {
+                                        let bg = &mut self.backgrounds[background_index];
+                                        bg.drag = Some(IconDrag {
+                                            id: toplevel_id.clone(),
+                                            press_time: 0,
+                                            press_pos: None,
+                                            origin,
+                                            dragging: true,
+                                            armed: true,
+                                        });
+                                        bg.selected_icon = Some(toplevel_id);
+                                        self.request_background_redraw(qh, background_index);
+                                    }
+                                }
+                                IconMenuAction::Unimplemented => {
+                                    log::info!("icon menu: {} not yet implemented", item.label);
+                                }
+                            }
+                        }
+                    }
+                    self.close_icon_menu();
+                }
                 PointerEventKind::Motion { .. } if on_workspace_submenu => {
                     let changed = if let Some(sm) =
                         self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
@@ -3293,10 +3657,11 @@ impl KeyboardHandler for Olshell {
     ) {
         // The only surfaces we ever request keyboard focus for are a
         // root-menu popup (wlr-layer-shell's Exclusive interactivity, see
-        // MenuPopup's doc comment) and the window menu (openlook-
-        // decoration's grab_keyboard, see WindowMenu's doc comment) --
-        // keyboard_focus is how Escape tells which one, if either,
-        // olcore actually handed focus to, so only that one closes.
+        // MenuPopup's doc comment), the window menu, and the icon menu
+        // (the latter two via openlook-decoration's grab_keyboard, see
+        // each struct's own doc comment) -- keyboard_focus is how Escape
+        // tells which one, if any, olcore actually handed focus to, so
+        // only that one closes.
         if event.keysym == Keysym::Escape {
             let Some(surface) = self.keyboard_focus.as_ref() else {
                 return;
@@ -3315,6 +3680,8 @@ impl KeyboardHandler for Olshell {
                 } else {
                     self.close_window_menu();
                 }
+            } else if self.icon_menu.as_ref().is_some_and(|im| im.surface == *surface) {
+                self.close_icon_menu();
             }
         }
     }
@@ -3431,6 +3798,9 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
             Event::Closed => {
                 if state.window_menu.as_ref().is_some_and(|wm| wm.toplevel_id == proxy.id()) {
                     state.close_window_menu();
+                }
+                if state.icon_menu.as_ref().is_some_and(|im| im.toplevel_id == proxy.id()) {
+                    state.close_icon_menu();
                 }
                 if let Some(mut info) = state.toplevels.remove(&proxy.id()) {
                     if let Some(dec) = info.decoration.take() {

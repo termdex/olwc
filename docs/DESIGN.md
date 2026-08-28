@@ -783,19 +783,51 @@ with wlroots compositors generally, not just this project.
   LOOK.
 
   Deliberately deferred, not silently dropped: the icon tray doesn't wrap
-  to a second row if it fills up one output's width, there's no per-icon
-  menu (Open/Move/Properties, matching a real OPEN LOOK icon's own
-  popup), and icons show no live content the way a real OPEN LOOK clock
-  or calendar icon could (see the sunos551 screenshots above) -- all real
-  follow-up work if it turns out to matter in practice, not attempted
-  here. A per-icon MENU popup, if it's ever built, is also the one place
-  in olshell an ADJUST-click extend-selection gesture (see
-  `docs/OPENLOOK-REFERENCE.md`'s open questions) would have a real
-  surface to attach to -- ADJUST-click toggling an icon in/out of a
-  multi-selection without disturbing the rest, the way OPEN LOOK's icon
-  lists originally used it. No batch action needs that selection yet, so
-  this is scope to fold in alongside the popup, not a reason to build
-  either now.
+  to a second row if it fills up one output's width, and icons show no
+  live content the way a real OPEN LOOK clock or calendar icon could (see
+  the sunos551 screenshots above) -- real follow-up work if it turns out
+  to matter in practice, not attempted here.
+
+  ~~No per-icon menu (Open/Move/Properties, matching a real OPEN LOOK
+  icon's own popup)~~ resolved: MENU (right-button) on an icon now opens
+  an `IconMenu` (`shell/src/main.rs`) instead of the root menu, a plain
+  subsurface of the icon's own `BackgroundOutput` layer surface (same
+  "any of olshell's own surfaces can parent a subsurface" trick the
+  window menu already relies on, just with the background as parent
+  instead of a decoration header), with keyboard focus via
+  `grab_keyboard` so Escape closes it, same as the window menu and for
+  the same reason. `Open` restores the toplevel -- the same action a
+  double-click on the icon already triggers, factored into a shared
+  `restore_toplevel` helper. `Properties` is disabled, matching the
+  window menu's own convention for the same not-yet-implemented item.
+  `Move` is the interesting one: it arms a click-to-follow move ended by
+  the *next* press anywhere, the same click-to-arm/click-to-drop pattern
+  the window menu's own Move item uses for a real window
+  (`zopenlook_decoration_v1::move`'s `held` argument) -- modeled as an
+  `IconDrag` with a new `armed: true` flag rather than a separate
+  mechanism, since it's the same "follow the pointer, then stop"
+  behavior a real press-and-hold drag already has, just started and
+  ended differently. Two wrinkles that behavior change surfaced:
+  `IconDrag::press_pos` had to become `Option` (`None` until the first
+  Motion after arming) since the click that arms a move happens on the
+  icon menu's own surface, not necessarily anywhere near the icon --
+  establishing the reference point immediately would make the icon jump
+  to reflect pointer movement that happened before tracking started;
+  and ending on "the next press anywhere" needed a check at the very top
+  of `pointer_frame`, before any other press handling, that finalizes
+  and fully swallows that confirming press (matching a real window move
+  grab, which never delivers its own confirming click to whatever's
+  underneath either).
+
+  A per-icon menu is also the one place in olshell an ADJUST-click
+  extend-selection gesture (see `docs/OPENLOOK-REFERENCE.md`'s open
+  questions) would have a real surface to attach to now -- ADJUST-click
+  toggling an icon in/out of a multi-selection without disturbing the
+  rest, the way OPEN LOOK's icon lists originally used it. Deliberately
+  not built alongside the menu itself: no batch action exists yet to
+  consume that selection, so it would be speculative scope with nothing
+  to show for it -- still a candidate for later, now that the surface
+  for it actually exists.
 - ~~Icon restore gesture~~ resolved: authentic OPEN LOOK/olwm icons are
   double-click (SELECT) to restore, not single-click -- a single click
   just selects/highlights, and a real icon's own MENU-click popup
