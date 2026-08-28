@@ -17,6 +17,22 @@ first-class goals.
 - Source compatibility with the original XView/olwm codebase. The
   original is a behavioral/visual reference only (clean-room
   reimplementation).
+- OPEN LOOK-styled scrollbars (or any other widget that lives *inside*
+  a window's own content area). Scrollbars were a genuine OPEN LOOK
+  toolkit widget (XView's `lib/libxview/scrollbar/`, matching this
+  doc's own widget vocabulary table's "Scrolled window" row), but drawn
+  by whatever *application* linked against the toolkit and used that
+  widget -- never by `olwm`/`olvwm` itself, which only ever draws
+  chrome from outside a window (title bar, pushpin, resize handles),
+  the same boundary olshell draws for itself. A Wayland client owns and
+  draws its own content pixels; nothing outside it can reach in to add
+  a scrollbar, the same restriction that forced `openlook-decoration`
+  to exist just for *external* header chrome. Real OPEN LOOK/olvwm
+  screenshots showing scrollbars and others not is just which
+  applications happen to appear in each, not a spec inconsistency to
+  chase. Styling scrollbars to match would be a concern for some future
+  Wayland-native app's own toolkit, entirely outside olcore/olshell's
+  scope.
 
 ## High-level architecture
 
