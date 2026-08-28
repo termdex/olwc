@@ -152,6 +152,15 @@ const ICON_GLYPH_FONT_SIZE: f32 = 22.0;
 const ICON_BG_COLOR: (u8, u8, u8) = DECORATION_BG_COLOR;
 const ICON_BORDER_COLOR: (u8, u8, u8) = DECORATION_BORDER_COLOR;
 const ICON_TEXT_COLOR: (u8, u8, u8) = WORKSPACE_ACTIVE_TEXT_COLOR;
+// Distinct from ICON_BG_COLOR/MENU_HOVER_COLOR so selected, hovered, and
+// plain icons are all visually distinguishable at once (e.g. hovering a
+// different icon than the one currently selected).
+const ICON_SELECTED_COLOR: (u8, u8, u8) = DECORATION_FOCUSED_BG_COLOR;
+// SELECT-click on an icon only selects/highlights it, matching authentic
+// OPEN LOOK -- restoring takes a second SELECT-click within this window,
+// the conventional double-click gesture. Timestamps come from the Wayland
+// pointer Press event (server clock, milliseconds), not wall-clock time.
+const ICON_DOUBLE_CLICK_MS: u32 = 400;
 
 const MENU_FONT_SIZE: f32 = 18.0;
 const MENU_ROW_HEIGHT: i32 = 26;
@@ -768,6 +777,20 @@ struct BackgroundOutput {
     /// recompute -- see minimized_toplevels_for_output) of the icon the
     /// pointer is currently over, if any.
     hovered_icon: Option<usize>,
+    /// Toplevel a single SELECT-click most recently selected, if any --
+    /// authentic OPEN LOOK icons need a second click (double-click) to
+    /// restore; a single click just highlights. Cleared by clicking
+    /// elsewhere on the background or restoring the icon. Keyed by the
+    /// toplevel's ObjectId rather than its tray position, since the tray
+    /// is sorted by title and re-sorts as windows are minimized/restored
+    /// -- a position-based selection could silently end up highlighting a
+    /// different icon after such a reshuffle.
+    selected_icon: Option<ObjectId>,
+    /// (toplevel, event time) of the most recent SELECT-click on an icon,
+    /// used to recognize the next click on the *same* icon within
+    /// ICON_DOUBLE_CLICK_MS as a double-click rather than two single
+    /// clicks.
+    last_icon_click: Option<(ObjectId, u32)>,
 }
 
 struct Olshell {
@@ -887,6 +910,7 @@ impl Olshell {
         let active_workspace = self.panels.iter().find(|p| p.output == bg.output).map(|p| p.active_workspace);
         let icon_ids = active_workspace.map(|w| self.minimized_toplevels_for_output(&bg.output, w));
         let hovered_icon = bg.hovered_icon;
+        let selected_icon = bg.selected_icon.clone();
 
         let (buffer, canvas) = self
             .pool
@@ -907,7 +931,13 @@ impl Olshell {
                 if x1 > width {
                     break;
                 }
-                let fill = if hovered_icon == Some(i) { MENU_HOVER_COLOR } else { ICON_BG_COLOR };
+                let fill = if hovered_icon == Some(i) {
+                    MENU_HOVER_COLOR
+                } else if selected_icon.as_ref() == Some(id) {
+                    ICON_SELECTED_COLOR
+                } else {
+                    ICON_BG_COLOR
+                };
                 fill_rect(canvas, width, height, x0, y0, x1, y1, fill);
                 fill_rect(canvas, width, height, x0, y0, x1, y0 + 1, ICON_BORDER_COLOR);
                 fill_rect(canvas, width, height, x0, y1 - 1, x1, y1, ICON_BORDER_COLOR);
@@ -2211,6 +2241,8 @@ impl OutputHandler for Olshell {
             width: 0,
             height: 0,
             hovered_icon: None,
+            selected_icon: None,
+            last_icon_click: None,
         });
 
         let Some(manager) = self.workspaces_manager.as_ref() else {
@@ -2436,26 +2468,48 @@ impl PointerHandler for Olshell {
                         self.draw_background(i);
                     }
                 }
-                // SELECT (left-click) an icon to restore it -- unset_minimized
-                // alone would bring the window back but leave focus wherever
-                // it already was (possibly nowhere), so activate it too, the
-                // same pairing clicking a taskbar entry does elsewhere; no
-                // OPEN LOOK precedent for a "restore" gesture specifically
-                // (a real icon would have its own menu with an Open item),
-                // but a single click is the simplest thing that could work,
-                // consistent with the workspace strip's own SELECT-click.
-                PointerEventKind::Press { button, .. } if background_index.is_some() && button == BTN_LEFT => {
+                // SELECT (left-click) an icon to select/highlight it, matching
+                // authentic OPEN LOOK -- a second SELECT-click on the same
+                // icon within ICON_DOUBLE_CLICK_MS restores it instead
+                // (double-click), the conventional gesture a real icon's own
+                // MENU-click Open item would otherwise be the alternative to.
+                // Clicking the background outside any icon just clears
+                // whatever was selected.
+                PointerEventKind::Press { button, time, .. } if background_index.is_some() && button == BTN_LEFT => {
                     let i = background_index.unwrap();
-                    if let Some(icon_index) = self.icon_at(i, event.position.0, event.position.1) {
-                        let output = self.backgrounds[i].output.clone();
-                        let active_workspace =
-                            self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
-                        let handle = active_workspace.and_then(|w| {
-                            let ids = self.minimized_toplevels_for_output(&output, w);
-                            let id = ids.get(icon_index)?.clone();
-                            self.toplevels.get(&id)?.handle.clone()
-                        });
-                        if let Some(handle) = handle {
+                    let icon_index = self.icon_at(i, event.position.0, event.position.1);
+                    let output = self.backgrounds[i].output.clone();
+                    let active_workspace =
+                        self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
+                    let clicked_id = icon_index.and_then(|idx| {
+                        let w = active_workspace?;
+                        self.minimized_toplevels_for_output(&output, w).get(idx).cloned()
+                    });
+
+                    let bg = &mut self.backgrounds[i];
+                    let is_double_click = match (&clicked_id, &bg.last_icon_click) {
+                        (Some(id), Some((last_id, last_time))) => {
+                            id == last_id && time.wrapping_sub(*last_time) <= ICON_DOUBLE_CLICK_MS
+                        }
+                        _ => false,
+                    };
+                    if is_double_click {
+                        bg.selected_icon = None;
+                        bg.last_icon_click = None;
+                    } else {
+                        bg.selected_icon = clicked_id.clone();
+                        bg.last_icon_click = clicked_id.clone().map(|id| (id, time));
+                    }
+                    self.draw_background(i);
+
+                    // unset_minimized alone would bring the window back but
+                    // leave focus wherever it already was (possibly nowhere),
+                    // so activate it too, the same pairing clicking a taskbar
+                    // entry does elsewhere.
+                    if is_double_click {
+                        if let Some(handle) =
+                            clicked_id.and_then(|id| self.toplevels.get(&id)?.handle.clone())
+                        {
                             handle.unset_minimized();
                             if let Some(seat) = self.seat_state.seats().next() {
                                 handle.activate(&seat);

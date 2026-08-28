@@ -626,11 +626,14 @@ with wlroots compositors generally, not just this project.
   label below, same "plain and functional" level of fidelity the
   workspace strip already set for anything without a concrete reference
   to match) with hover feedback matching the workspace strip's own.
-  SELECT-clicking an icon calls `unset_minimized()` and then `activate()`
-  on the same handle, restoring and refocusing it in one click -- there's
-  no OPEN LOOK precedent for exactly this gesture (a real icon would open
-  its own small menu with an `Open` item instead), but a single click is
-  the simplest thing that could work.
+  ~~SELECT-clicking an icon calls `unset_minimized()` and then
+  `activate()` on the same handle, restoring and refocusing it in one
+  click -- there's no OPEN LOOK precedent for exactly this gesture (a
+  real icon would open its own small menu with an `Open` item instead),
+  but a single click is the simplest thing that could work.~~ superseded:
+  see the "Icon restore gesture" entry below -- single click now
+  selects/highlights, double-click restores, matching authentic OPEN
+  LOOK.
 
   Deliberately deferred, not silently dropped: the icon tray doesn't wrap
   to a second row if it fills up one output's width, there's no per-icon
@@ -639,22 +642,32 @@ with wlroots compositors generally, not just this project.
   or calendar icon could (see the sunos551 screenshots above) -- all real
   follow-up work if it turns out to matter in practice, not attempted
   here.
-- Icon restore gesture and free positioning: authentic OPEN LOOK/olwm
-  icons are double-click (SELECT) to restore, not single-click -- a
-  single click just selects/highlights, and a real icon's own MENU-click
-  popup (`Open`, `Move`, `Properties`, `Quit`) is the discoverable
-  alternative to remembering the double-click. Icons are also freely
-  drag-repositionable to anywhere on the desktop -- olwm's
+- ~~Icon restore gesture~~ resolved: authentic OPEN LOOK/olwm icons are
+  double-click (SELECT) to restore, not single-click -- a single click
+  just selects/highlights, and a real icon's own MENU-click popup
+  (`Open`, `Move`, `Properties`, `Quit`) is the discoverable alternative
+  to remembering the double-click. olwc's icon tray now matches: SELECT
+  on an icon selects/highlights it (a distinct fill color,
+  `ICON_SELECTED_COLOR`), and a second SELECT within
+  `ICON_DOUBLE_CLICK_MS` (400ms, measured off the Wayland pointer Press
+  event's own timestamp rather than wall-clock time) on the *same* icon
+  restores it; clicking elsewhere on the background clears the
+  selection. Selection is tracked by the toplevel's `ObjectId`
+  (`BackgroundOutput::selected_icon`/`last_icon_click` in
+  `shell/src/main.rs`) rather than tray position, since the tray is
+  sorted by title and re-sorts as windows are minimized/restored -- a
+  position-keyed selection could silently end up highlighting a
+  different icon after such a reshuffle. No per-icon MENU-click popup
+  yet (see the icon tray entry above), so selecting an icon has no
+  effect beyond the highlight for now.
+- Icon free positioning: icons are freely drag-repositionable to
+  anywhere on the desktop in authentic OPEN LOOK/olwm -- olwm's
   `Olwm*IconLocation`/`IconRegion` resources only ever set the *default*
-  placement, same as any other window. olwc's current icon tray does
-  neither: single click restores (an explicitly flagged placeholder, not
-  an attempt at the real gesture -- see the icon tray entry above), and
-  the packed left-to-right layout leaves no per-icon position to drag at
-  all. Free positioning is the bigger lift of the two: it needs per-icon
-  position state instead of the current computed layout, real drag
-  handling, and a decision about what dragging an icon across an output
-  boundary should mean given the per-output desktop model -- double-click
-  restore is a small, self-contained change by comparison. Worth
+  placement, same as any other window. olwc's packed left-to-right
+  tray layout leaves no per-icon position to drag at all. It needs
+  per-icon position state instead of the current computed layout, real
+  drag handling, and a decision about what dragging an icon across an
+  output boundary should mean given the per-output desktop model. Worth
   considering alongside whichever of these lands first: an authentic
   MENU-click per-icon popup implies each icon becomes independently
   selectable, which is also the one place in olshell an ADJUST-click
