@@ -617,24 +617,73 @@ with wlroots compositors generally, not just this project.
   (colors, spacing, shapes) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
-- HiDPI / output scale support: `CompositorHandler::scale_factor_changed`
+- ~~HiDPI / output scale support: `CompositorHandler::scale_factor_changed`
   (`shell/src/main.rs`) is currently a no-op stub -- every surface olshell
-  draws renders at 1x regardless of the output's real scale. A pre-
-  existing gap affecting all of olshell's rendering, not just the window-
-  menu button/pushpin glyphs, and out of scope for that pass, but worth
-  connecting here: Wayland's own scale model is integer-only at the
-  protocol level (`wl_surface`/`wl_output` only expose whole-number
-  `buffer_scale`; the fractional scaling real desktops offer, e.g. 150%,
-  is `wp_fractional_scale_v1` layered on top, which still has the client
+  draws renders at 1x regardless of the output's real scale.~~ resolved:
+  integer `buffer_scale` support, built as anticipated below -- fractional
+  (150%, etc., via `wp_fractional_scale_v1`) stays a distinct, explicitly
+  deferred follow-up, not attempted here, per Wayland's own two-layer scale
+  model (see the original reasoning, kept below).
+
+  Every surface-owning struct that matters (`BackgroundOutput`,
+  `WorkspacePanel`, `MenuPopup`, `WindowMenu`, `IconMenu`, `Decoration`)
+  gained a `scale: i32` field, updated by the now-real
+  `scale_factor_changed`, which dispatches by surface identity using the
+  same helpers `pointer_frame` already relies on for this
+  (`background_at`, `panel_at`, `decoration_toplevel_id`, `popup_at`,
+  direct `==` for `window_menu`/`icon_menu`). Deliberately *not* added to
+  `WorkspaceSubmenu` or `Decoration`'s seven child chrome pieces (footer,
+  4 `ResizeHandle` corners, 2 `BorderStrip`s) -- each of those always
+  redraws through its owning struct's own draw call (`draw_window_menu`
+  redrawing an open submenu too; `draw_decoration` already redraws all
+  seven pieces internally every call), reading that one owner's `scale`,
+  since a submenu or corner glyph is always positioned within its parent's
+  bounds and so is on the same output/scale in every realistic case.
+
+  The actual scaling work turned out to be entirely confined to a handful
+  of shared low-level pixel-writing primitives (`fill_rect`,
+  `draw_text_row_centered`/`draw_bold_text_row_centered`,
+  `draw_glyph_bitmap`, `paint_row`, plus the free-standing
+  `draw_corner_handle`/`draw_footer`/`draw_border_strip`), each of which
+  now takes a `scale: i32` and multiplies its own logical coordinate
+  arguments internally before touching the canvas -- every `draw_*`
+  function's own layout arithmetic (which rect goes where, hit-testing,
+  `font.metrics()` centering-width lookups, every `subsurface.
+  set_position()` call) stays completely untouched, since Wayland already
+  keeps all of that logical-space state independent of `buffer_scale`; only
+  the final raster step -- the buffer's physical pixel size and what
+  `set_buffer_scale()` is told -- changes. One genuine landmine surfaced by
+  this split: several `draw_*` functions reused the same `width`/`height`
+  variable both for logical coordinate math (e.g. `width - CORNER_HANDLE_SIZE`)
+  and as the primitives' physical `canvas_width`/`canvas_height` bound --
+  fixed by introducing a separate `buf_width`/`buf_height` pair (`=
+  logical * scale`) for buffer creation and the primitives' canvas-size
+  arguments, leaving the original logical `width`/`height` untouched for
+  everything else.
+
+  No physical HiDPI display exists in this dev environment, so
+  verification needed a way to simulate one: `server_new_output`
+  (`core/main.c`) gained a debug/testing-only env var,
+  `OLC_TEST_OUTPUT_SCALE`, calling `wlr_output_state_set_scale()` (a real
+  wlroots API the compositor never previously called) -- no protocol or UI
+  surface of its own, defaults to wlroots' own 1.0 when unset, same spirit
+  as the wlroots-provided `WLR_NO_HARDWARE_CURSORS` knob already relied on
+  for testing all session. Confirmed live at `OLC_TEST_OUTPUT_SCALE=2`:
+  the panel, decoration header (title text and the OLGlyph-traced button
+  glyph and resize-corner bracket both included), and their surrounding
+  chrome all render crisply doubled rather than blurry or misaligned, with
+  hit-testing (clicking, dragging) still lining up correctly with what's
+  drawn -- exactly what the logical/physical split above predicts, since
+  nothing about *where* things are was ever supposed to change, only how
+  many physical pixels render them.
+
+  Original reasoning, still the basis for why fractional stays deferred:
+  Wayland's own scale model is integer-only at the protocol level
+  (`wl_surface`/`wl_output` only expose whole-number `buffer_scale`); the
+  fractional scaling real desktops offer, e.g. 150%, is
+  `wp_fractional_scale_v1` layered on top, which still has the client
   render at the next integer scale up and lets the compositor's own
-  viewporter do the final fractional crop/downscale). So whenever real
-  output-scale support gets built, the button/pushpin glyphs traced from
-  OLGlyph (see that entry in `docs/OPENLOOK-REFERENCE.md`) should scale
-  by rendering `draw_glyph_bitmap` against a box sized for the output's
-  actual integer `buffer_scale`, not by smoothly interpolating -- the
-  same uniform, aspect-preserving, coverage-sampled scaling that pass
-  already built generalizes directly to that; it just needs to be told
-  the real scale instead of always assuming 1x.
+  viewporter do the final fractional crop/downscale.
 - ~~Move to Workspace submenu is single-output only~~ resolved: it now
   lists every output's workspaces, not just the decorated toplevel's own
   current one -- the current output's first (keeping the plain flat list

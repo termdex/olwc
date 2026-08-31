@@ -381,6 +381,12 @@ struct Decoration {
     object: ZopenlookDecorationV1,
     width: u32,
     height: u32,
+    /// Integer buffer_scale for the header and (see draw_decoration) all
+    /// seven of its child chrome subsurfaces -- footer/corners/borders
+    /// deliberately don't track their own, since they're always positioned
+    /// within this header's own bounds and so are on the same output/scale
+    /// in every realistic case. Updated by scale_factor_changed.
+    scale: i32,
     /// The decorated toplevel's own current content height -- not this
     /// header's, which is always `height`. Needed to position the bottom
     /// resize handles, which have to reach the toplevel's bottom edge;
@@ -577,6 +583,11 @@ struct WindowMenu {
     surface: wl_surface::WlSurface,
     width: u32,
     height: u32,
+    /// Integer buffer_scale, updated by scale_factor_changed -- also used
+    /// to redraw the workspace_submenu below when it changes, which
+    /// doesn't track its own (see BackgroundOutput/Decoration's own child-
+    /// chrome fields for the same reasoning).
+    scale: i32,
     hovered: Option<usize>,
     /// The "Move to Workspace" submenu, if currently open -- see
     /// WorkspaceSubmenu's doc comment.
@@ -620,6 +631,8 @@ struct IconMenu {
     surface: wl_surface::WlSurface,
     width: u32,
     height: u32,
+    /// Integer buffer_scale, updated by scale_factor_changed.
+    scale: i32,
     hovered: Option<usize>,
 }
 
@@ -712,6 +725,8 @@ struct MenuPopup {
     title: Option<String>,
     width: u32,
     height: u32,
+    /// Integer buffer_scale, updated by scale_factor_changed.
+    scale: i32,
     hovered: Option<usize>,
     // Pin-to-persist (OPEN LOOK's pushpin gesture): clicking the pushpin
     // in the header converts a transient popup into a persistent one that
@@ -857,6 +872,8 @@ struct WorkspacePanel {
     workspaces: ZopenlookWorkspacesOutputV1,
     width: u32,
     height: u32,
+    /// Integer buffer_scale, updated by scale_factor_changed.
+    scale: i32,
     workspace_count: u32,
     active_workspace: u32,
     hovered_workspace: Option<u32>,
@@ -873,6 +890,8 @@ struct BackgroundOutput {
     layer: LayerSurface,
     width: u32,
     height: u32,
+    /// Integer buffer_scale, updated by scale_factor_changed.
+    scale: i32,
     /// Index (into the per-draw list draw_background/icon_at both
     /// recompute -- see minimized_toplevels_for_output) of the icon the
     /// pointer is currently over, if any.
@@ -1025,11 +1044,14 @@ impl Olshell {
         }
         let width = panel.width as i32;
         let height = panel.height.max(1) as i32;
-        let stride = width * 4;
+        let scale = panel.scale;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
         let (r, g, b) = PANEL_BG_COLOR;
@@ -1055,19 +1077,20 @@ impl Olshell {
             } else {
                 ((0xAA, 0xAA, 0xA2), PANEL_TEXT_COLOR)
             };
-            fill_rect(canvas, width, height, x0, 2, x1.min(width), height - 2, fill);
+            fill_rect(canvas, buf_width, buf_height, scale, x0, 2, x1.min(width), height - 2, fill);
 
             let label = (i + 1).to_string();
             let label_width: i32 =
                 label.chars().map(|c| self.font.metrics(c, PANEL_FONT_SIZE).advance_width.round() as i32).sum();
             let label_x = x0 + ((x1 - x0) - label_width) / 2;
-            draw_text_row_centered(canvas, width, 0, height, label_x, &label, &self.font, PANEL_FONT_SIZE, text_color);
+            draw_text_row_centered(canvas, buf_width, scale, 0, height, label_x, &label, &self.font, PANEL_FONT_SIZE, text_color);
         }
 
         let panel = &self.panels[panel_index];
         let wl_surface = panel.layer.wl_surface();
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
         panel.layer.commit();
     }
 
@@ -1084,7 +1107,10 @@ impl Olshell {
         }
         let width = bg.width as i32;
         let height = bg.height.max(1) as i32;
-        let stride = width * 4;
+        let scale = bg.scale;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
 
         // No panel (openlook-workspaces unavailable) means no
         // active-workspace to gate the tray on -- degrade the same way
@@ -1098,7 +1124,7 @@ impl Olshell {
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
         let (r, g, b) = BACKGROUND_COLOR;
@@ -1126,11 +1152,11 @@ impl Olshell {
                 } else {
                     ICON_BG_COLOR
                 };
-                fill_rect(canvas, width, height, x0, y0, x1, y1, fill);
-                fill_rect(canvas, width, height, x0, y0, x1, y0 + 1, ICON_BORDER_COLOR);
-                fill_rect(canvas, width, height, x0, y1 - 1, x1, y1, ICON_BORDER_COLOR);
-                fill_rect(canvas, width, height, x0, y0, x0 + 1, y1, ICON_BORDER_COLOR);
-                fill_rect(canvas, width, height, x1 - 1, y0, x1, y1, ICON_BORDER_COLOR);
+                fill_rect(canvas, buf_width, buf_height, scale, x0, y0, x1, y1, fill);
+                fill_rect(canvas, buf_width, buf_height, scale, x0, y0, x1, y0 + 1, ICON_BORDER_COLOR);
+                fill_rect(canvas, buf_width, buf_height, scale, x0, y1 - 1, x1, y1, ICON_BORDER_COLOR);
+                fill_rect(canvas, buf_width, buf_height, scale, x0, y0, x0 + 1, y1, ICON_BORDER_COLOR);
+                fill_rect(canvas, buf_width, buf_height, scale, x1 - 1, y0, x1, y1, ICON_BORDER_COLOR);
 
                 let info = &self.toplevels[id];
                 let glyph = info
@@ -1144,7 +1170,7 @@ impl Olshell {
                     .unwrap();
                 let glyph_width = self.font.metrics(glyph, ICON_GLYPH_FONT_SIZE).advance_width.round() as i32;
                 draw_text_row_centered(
-                    canvas, width, y0, y1 - y0, x0 + (x1 - x0 - glyph_width) / 2,
+                    canvas, buf_width, scale, y0, y1 - y0, x0 + (x1 - x0 - glyph_width) / 2,
                     &glyph.to_string(), &self.font, ICON_GLYPH_FONT_SIZE, ICON_TEXT_COLOR,
                 );
 
@@ -1153,7 +1179,7 @@ impl Olshell {
                     label.chars().map(|c| self.font.metrics(c, ICON_FONT_SIZE).advance_width.round() as i32).sum();
                 let label_x = (x0 + x1) / 2 - label_width / 2;
                 draw_text_row_centered(
-                    canvas, width, y1, ICON_LABEL_HEIGHT, label_x.max(0),
+                    canvas, buf_width, scale, y1, ICON_LABEL_HEIGHT, label_x.max(0),
                     label, &self.font, ICON_FONT_SIZE, ICON_TEXT_COLOR,
                 );
             }
@@ -1162,7 +1188,8 @@ impl Olshell {
         let bg = &self.backgrounds[index];
         let wl_surface = bg.layer.wl_surface();
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
         bg.layer.commit();
     }
 
@@ -1254,6 +1281,7 @@ impl Olshell {
             object,
             width: 0,
             height: DECORATION_HEIGHT,
+            scale: 1,
             toplevel_height: 0,
             button_hovered: false,
             sticky: false,
@@ -1281,11 +1309,14 @@ impl Olshell {
         }
         let width = dec.width as i32;
         let height = dec.height.max(1) as i32;
-        let stride = width * 4;
+        let scale = dec.scale;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
         // state code 2 is "activated" -- see focused_toplevel_handle().
@@ -1308,9 +1339,9 @@ impl Olshell {
         // Just inside the top border below -- the bevel row's the focus
         // indicator, the border's the window edge, and they're not the
         // same thing (docs/DESIGN.md has the reasoning for each).
-        paint_row(canvas, width, DECORATION_BORDER_WIDTH, bevel_top);
+        paint_row(canvas, buf_width, scale, DECORATION_BORDER_WIDTH, bevel_top);
         if height > 1 {
-            paint_row(canvas, width, height - 1, bevel_bottom);
+            paint_row(canvas, buf_width, scale, height - 1, bevel_bottom);
         }
 
         // The plain black frame's top stretch, skipping the two top
@@ -1319,28 +1350,29 @@ impl Olshell {
         // anything drawn underneath them must stop exactly at their
         // edges, not bleed into the gap. See border_side_rect for the
         // matching left/right stretches.
-        fill_rect(canvas, width, height, CORNER_HANDLE_SIZE, 0, width - CORNER_HANDLE_SIZE, DECORATION_BORDER_WIDTH, DECORATION_BORDER_COLOR);
+        fill_rect(canvas, buf_width, buf_height, scale, CORNER_HANDLE_SIZE, 0, width - CORNER_HANDLE_SIZE, DECORATION_BORDER_WIDTH, DECORATION_BORDER_COLOR);
 
         let (bx0, by0, bx1, by1) = dec.button_rect();
         let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { header_bg };
-        fill_rect(canvas, width, height, bx0, by0, bx1, by1, button_color);
-        draw_button_glyph(canvas, width, height, bx0, by0, bx1, by1, dec.button_hovered, DECORATION_TEXT_COLOR);
+        fill_rect(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, button_color);
+        draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, dec.button_hovered, DECORATION_TEXT_COLOR);
 
         if !info.title.is_empty() {
             draw_text_row_centered(
-                canvas, width, 0, height, bx1 + DECORATION_BUTTON_MARGIN,
+                canvas, buf_width, scale, 0, height, bx1 + DECORATION_BUTTON_MARGIN,
                 &info.title, &self.font, DECORATION_FONT_SIZE, DECORATION_TEXT_COLOR,
             );
         }
 
         if dec.sticky {
             let (px0, py0, px1, py1) = dec.sticky_pushpin_rect();
-            draw_pushpin(canvas, width, height, px0, py0, px1, py1, true, PUSHPIN_PINNED_COLOR);
+            draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, true, PUSHPIN_PINNED_COLOR);
         }
 
         let wl_surface = &dec.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
         wl_surface.commit();
         log::info!("decoration: drew {toplevel_id:?} at {width}x{height}");
 
@@ -1350,37 +1382,37 @@ impl Olshell {
         // header's.
         let (tl_x, tl_y) = dec.corner_handle_position(ResizeRegion::TopLeft);
         dec.top_left.subsurface.set_position(tl_x, tl_y);
-        draw_corner_handle(&mut self.pool, &dec.top_left.surface, dec.top_left.hovered, ResizeRegion::TopLeft, header_bg);
+        draw_corner_handle(&mut self.pool, &dec.top_left.surface, scale, dec.top_left.hovered, ResizeRegion::TopLeft, header_bg);
 
         let (tr_x, tr_y) = dec.corner_handle_position(ResizeRegion::TopRight);
         dec.top_right.subsurface.set_position(tr_x, tr_y);
-        draw_corner_handle(&mut self.pool, &dec.top_right.surface, dec.top_right.hovered, ResizeRegion::TopRight, header_bg);
+        draw_corner_handle(&mut self.pool, &dec.top_right.surface, scale, dec.top_right.hovered, ResizeRegion::TopRight, header_bg);
 
         if dec.toplevel_height > 0 {
             let (bl_x, bl_y) = dec.corner_handle_position(ResizeRegion::BottomLeft);
             dec.bottom_left.subsurface.set_position(bl_x, bl_y);
-            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, dec.bottom_left.hovered, ResizeRegion::BottomLeft, header_bg);
+            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, scale, dec.bottom_left.hovered, ResizeRegion::BottomLeft, header_bg);
 
             let (br_x, br_y) = dec.corner_handle_position(ResizeRegion::BottomRight);
             dec.bottom_right.subsurface.set_position(br_x, br_y);
-            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, dec.bottom_right.hovered, ResizeRegion::BottomRight, header_bg);
+            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, scale, dec.bottom_right.hovered, ResizeRegion::BottomRight, header_bg);
 
             let (f_x, f_y, f_width) = dec.footer_rect();
             if f_width > 0 {
                 dec.footer.subsurface.set_position(f_x, f_y);
-                draw_footer(&mut self.pool, &dec.footer.surface, f_width as u32, dec.footer.hovered);
+                draw_footer(&mut self.pool, &dec.footer.surface, scale, f_width as u32, dec.footer.hovered);
             }
 
             let (lb_x, lb_y0, lb_y1) = dec.border_side_rect(false);
             if lb_y1 > lb_y0 {
                 dec.left_border.subsurface.set_position(lb_x, lb_y0);
-                draw_border_strip(&mut self.pool, &dec.left_border.surface, (lb_y1 - lb_y0) as u32);
+                draw_border_strip(&mut self.pool, &dec.left_border.surface, scale, (lb_y1 - lb_y0) as u32);
             }
 
             let (rb_x, rb_y0, rb_y1) = dec.border_side_rect(true);
             if rb_y1 > rb_y0 {
                 dec.right_border.subsurface.set_position(rb_x, rb_y0);
-                draw_border_strip(&mut self.pool, &dec.right_border.surface, (rb_y1 - rb_y0) as u32);
+                draw_border_strip(&mut self.pool, &dec.right_border.surface, scale, (rb_y1 - rb_y0) as u32);
             }
         }
 
@@ -1454,6 +1486,7 @@ impl Olshell {
             surface,
             width,
             height,
+            scale: 1,
             hovered: None,
             workspace_submenu: None,
         });
@@ -1496,11 +1529,14 @@ impl Olshell {
         };
         let width = wm.width as i32;
         let height = wm.height as i32;
-        let stride = width * 4;
+        let scale = wm.scale;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
         let (r, g, b) = MENU_BG_COLOR;
@@ -1534,16 +1570,10 @@ impl Olshell {
             let disabled =
                 item.disabled || (matches!(item.action, WindowMenuAction::MoveToWorkspace) && sticky);
             if !disabled && wm.hovered == Some(i) {
-                let (hr, hg, hb) = MENU_HOVER_COLOR;
-                for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
-                    for x in 0..width {
-                        let idx = ((y * width + x) * 4) as usize;
-                        canvas[idx] = hb;
-                        canvas[idx + 1] = hg;
-                        canvas[idx + 2] = hr;
-                        canvas[idx + 3] = 0xFF;
-                    }
-                }
+                // Equivalent to the manual per-pixel loop this replaced,
+                // now via fill_rect so the scale multiplication happens in
+                // one place rather than needing its own here too.
+                fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
             }
             let color = if disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             let label = if matches!(item.action, WindowMenuAction::ToggleSticky) && sticky {
@@ -1552,7 +1582,7 @@ impl Olshell {
                 item.label
             };
             draw_text_row_centered(
-                canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
                 label, &self.font, MENU_FONT_SIZE, color,
             );
             if matches!(item.action, WindowMenuAction::MoveToWorkspace) {
@@ -1560,13 +1590,14 @@ impl Olshell {
                 let ax0 = ax1 - SUBMENU_ARROW_SIZE;
                 let ay0 = row_y0 + (MENU_ROW_HEIGHT - SUBMENU_ARROW_SIZE) / 2;
                 let ay1 = ay0 + SUBMENU_ARROW_SIZE;
-                draw_submenu_arrow(canvas, width, height, ax0, ay0, ax1, ay1, color);
+                draw_submenu_arrow(canvas, buf_width, buf_height, scale, ax0, ay0, ax1, ay1, color);
             }
         }
 
         let wl_surface = &wm.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
         wl_surface.commit();
     }
 
@@ -1646,6 +1677,7 @@ impl Olshell {
             surface,
             width,
             height,
+            scale: 1,
             hovered: None,
         });
         self.draw_icon_menu();
@@ -1672,11 +1704,14 @@ impl Olshell {
         };
         let width = im.width as i32;
         let height = im.height as i32;
-        let stride = width * 4;
+        let scale = im.scale;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
         let (r, g, b) = MENU_BG_COLOR;
@@ -1690,27 +1725,19 @@ impl Olshell {
         for (i, item) in ICON_MENU_ITEMS.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
             if !item.disabled && im.hovered == Some(i) {
-                let (hr, hg, hb) = MENU_HOVER_COLOR;
-                for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
-                    for x in 0..width {
-                        let idx = ((y * width + x) * 4) as usize;
-                        canvas[idx] = hb;
-                        canvas[idx + 1] = hg;
-                        canvas[idx + 2] = hr;
-                        canvas[idx + 3] = 0xFF;
-                    }
-                }
+                fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
             }
             let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             draw_text_row_centered(
-                canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
                 item.label, &self.font, MENU_FONT_SIZE, color,
             );
         }
 
         let wl_surface = &im.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
         wl_surface.commit();
     }
 
@@ -1836,13 +1863,19 @@ impl Olshell {
         let Some(sm) = self.window_menu.as_ref().and_then(|wm| wm.workspace_submenu.as_ref()) else {
             return;
         };
+        // Doesn't track its own scale -- always redrawn alongside its
+        // parent window menu, whose scale it reads (see WindowMenu::
+        // scale's doc comment).
+        let scale = self.window_menu.as_ref().map_or(1, |wm| wm.scale);
         let width = sm.width as i32;
         let height = sm.height as i32;
-        let stride = width * 4;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
 
         let (buffer, canvas) = self
             .pool
-            .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
             .expect("failed to create buffer");
 
         let (r, g, b) = MENU_BG_COLOR;
@@ -1862,16 +1895,7 @@ impl Olshell {
             let hovered = matches!(row, WorkspaceSubmenuRow::Workspace { current: false, .. })
                 && sm.hovered == Some(i);
             if hovered {
-                let (hr, hg, hb) = MENU_HOVER_COLOR;
-                for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
-                    for x in 0..width {
-                        let idx = ((y * width + x) * 4) as usize;
-                        canvas[idx] = hb;
-                        canvas[idx + 1] = hg;
-                        canvas[idx + 2] = hr;
-                        canvas[idx + 3] = 0xFF;
-                    }
-                }
+                fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
             }
             let (label, color) = match row {
                 WorkspaceSubmenuRow::OutputHeader { name } => (name.clone(), MENU_TITLE_COLOR),
@@ -1881,14 +1905,15 @@ impl Olshell {
                 ),
             };
             draw_text_row_centered(
-                canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
                 &label, &self.font, MENU_FONT_SIZE, color,
             );
         }
 
         let wl_surface = &sm.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
-        wl_surface.damage_buffer(0, 0, width, height);
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
         wl_surface.commit();
     }
 
@@ -1946,7 +1971,7 @@ impl Olshell {
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
 
-        self.popups.push(MenuPopup { layer, items, title, width, height, hovered: None, pinned: false });
+        self.popups.push(MenuPopup { layer, items, title, width, height, scale: 1, hovered: None, pinned: false });
     }
 
     /// Closes one popup by index. Just drops it -- sctk's LayerSurface::Drop
@@ -2137,11 +2162,16 @@ impl Olshell {
 fn draw_corner_handle(
     pool: &mut SlotPool,
     surface: &wl_surface::WlSurface,
+    scale: i32,
     hovered: bool,
     region: ResizeRegion,
     fill_color: (u8, u8, u8),
 ) {
-    let size = CORNER_HANDLE_SIZE;
+    // Every other quantity in this function derives from `size`, so
+    // scaling it once here (rather than threading scale through fill_rect
+    // calls, which this function doesn't make) scales the whole glyph,
+    // bracket thickness included, proportionally.
+    let size = CORNER_HANDLE_SIZE * scale;
     let stride = size * 4;
     let (buffer, canvas) =
         pool.create_buffer(size, size, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
@@ -2187,6 +2217,7 @@ fn draw_corner_handle(
         }
     }
     buffer.attach_to(surface).expect("failed to attach buffer");
+    surface.set_buffer_scale(scale);
     surface.damage_buffer(0, 0, size, size);
     surface.commit();
 }
@@ -2195,32 +2226,41 @@ fn draw_corner_handle(
 /// an otherwise fully transparent buffer -- same reasoning as
 /// draw_corner_handle (floats over the toplevel's own content, and needs
 /// RGB zeroed along with alpha for the same premultiplication reason).
-fn draw_footer(pool: &mut SlotPool, surface: &wl_surface::WlSurface, width: u32, hovered: bool) {
+/// Unlike draw_corner_handle, this one calls fill_rect, so (following
+/// fill_rect's own doc comment) `width`/`height` stay logical throughout
+/// and only the separate buf_width/buf_height pair is scaled, to avoid
+/// scaling the same coordinates twice over.
+fn draw_footer(pool: &mut SlotPool, surface: &wl_surface::WlSurface, scale: i32, width: u32, hovered: bool) {
     let width = width as i32;
     let height = CORNER_HANDLE_SIZE;
-    let stride = width * 4;
+    let buf_width = width * scale;
+    let buf_height = height * scale;
+    let stride = buf_width * 4;
     let (buffer, canvas) =
-        pool.create_buffer(width, height, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
+        pool.create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
     canvas.fill(0);
     let color = if hovered { DECORATION_BUTTON_HOVER_COLOR } else { DECORATION_TEXT_COLOR };
     let bar_y0 = height / 2 - 1;
     let bar_y1 = height / 2 + 1;
-    fill_rect(canvas, width, height, 0, bar_y0, width, bar_y1, color);
+    fill_rect(canvas, buf_width, buf_height, scale, 0, bar_y0, width, bar_y1, color);
     // The plain black frame's bottom stretch, at the toplevel's actual
     // bottom edge -- same border the left/right strips and the header's
     // own top stretch draw, completing the frame around all four sides.
-    fill_rect(canvas, width, height, 0, height - DECORATION_BORDER_WIDTH, width, height, DECORATION_BORDER_COLOR);
+    fill_rect(canvas, buf_width, buf_height, scale, 0, height - DECORATION_BORDER_WIDTH, width, height, DECORATION_BORDER_COLOR);
     buffer.attach_to(surface).expect("failed to attach buffer");
-    surface.damage_buffer(0, 0, width, height);
+    surface.set_buffer_scale(scale);
+    surface.damage_buffer(0, 0, buf_width, buf_height);
     surface.commit();
 }
 
 /// Draws a solid black border strip -- see Decoration::border_side_rect().
 /// Unlike the corner handles and footer, every pixel here is opaque, so
-/// there's no transparency/premultiplication gotcha to work around.
-fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, height: u32) {
-    let width = DECORATION_BORDER_WIDTH;
-    let height = height as i32;
+/// there's no transparency/premultiplication gotcha to work around, and no
+/// fill_rect call either (every pixel gets the same color) -- so, like
+/// draw_corner_handle, its own width/height can just be scaled directly.
+fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, scale: i32, height: u32) {
+    let width = DECORATION_BORDER_WIDTH * scale;
+    let height = height as i32 * scale;
     let stride = width * 4;
     let (buffer, canvas) =
         pool.create_buffer(width, height, stride, wl_shm::Format::Argb8888).expect("failed to create buffer");
@@ -2232,6 +2272,7 @@ fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, heigh
         pixel[3] = 0xFF;
     }
     buffer.attach_to(surface).expect("failed to attach buffer");
+    surface.set_buffer_scale(scale);
     surface.damage_buffer(0, 0, width, height);
     surface.commit();
 }
@@ -2239,10 +2280,13 @@ fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, heigh
 fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
     let width = popup.width as i32;
     let height = popup.height as i32;
-    let stride = width * 4;
+    let scale = popup.scale;
+    let buf_width = width * scale;
+    let buf_height = height * scale;
+    let stride = buf_width * 4;
 
     let (buffer, canvas) = pool
-        .create_buffer(width, height, stride, wl_shm::Format::Argb8888)
+        .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
         .expect("failed to create buffer");
 
     let (r, g, b) = MENU_BG_COLOR;
@@ -2268,45 +2312,43 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
         // one-off screenshot artifact, so this is the one piece of text
         // in olshell that should be bold.
         draw_bold_text_row_centered(
-            canvas, width, 0, MENU_ROW_HEIGHT, px1 + MENU_H_PADDING,
+            canvas, buf_width, scale, 0, MENU_ROW_HEIGHT, px1 + MENU_H_PADDING,
             title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
         );
     }
     let pushpin_color = if popup.pinned { PUSHPIN_PINNED_COLOR } else { PUSHPIN_UNPINNED_COLOR };
-    draw_pushpin(canvas, width, height, px0, py0, px1, py1, popup.pinned, pushpin_color);
+    draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, popup.pinned, pushpin_color);
     let row = popup.header_rows();
 
     for (i, item) in popup.items.iter().enumerate() {
         let row_y0 = (row + i as i32) * MENU_ROW_HEIGHT;
         if popup.hovered == Some(i) {
-            let (hr, hg, hb) = MENU_HOVER_COLOR;
-            for y in row_y0..(row_y0 + MENU_ROW_HEIGHT).min(height) {
-                for x in 0..width {
-                    let idx = ((y * width + x) * 4) as usize;
-                    canvas[idx] = hb;
-                    canvas[idx + 1] = hg;
-                    canvas[idx + 2] = hr;
-                    canvas[idx + 3] = 0xFF;
-                }
-            }
+            fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
         }
         draw_text_row_centered(
-            canvas, width, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+            canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
             item.label(), font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
         );
     }
 
     let wl_surface = popup.layer.wl_surface();
     buffer.attach_to(wl_surface).expect("failed to attach buffer");
-    wl_surface.damage_buffer(0, 0, width, height);
+    wl_surface.set_buffer_scale(scale);
+    wl_surface.damage_buffer(0, 0, buf_width, buf_height);
     popup.layer.commit();
 }
 
 /// Draws `text` with its baseline at `baseline_y`, rather than centered in
 /// the whole canvas -- e.g. for centering within a single menu row.
+// scale multiplies row_y0/row_height/start_x/size here, once, before
+// handing off to draw_text_at -- which stays scale-unaware, working
+// purely in whatever pixel space it's given (see fill_rect's doc comment
+// for the general split this follows).
+#[allow(clippy::too_many_arguments)]
 fn draw_text_row_centered(
     canvas: &mut [u8],
     canvas_width: i32,
+    scale: i32,
     row_y0: i32,
     row_height: i32,
     start_x: i32,
@@ -2315,6 +2357,10 @@ fn draw_text_row_centered(
     size: f32,
     color: (u8, u8, u8),
 ) -> i32 {
+    let row_y0 = row_y0 * scale;
+    let row_height = row_height * scale;
+    let start_x = start_x * scale;
+    let size = size * scale as f32;
     let baseline_y = row_y0 + row_height / 2 + (size as i32) / 3;
     draw_text_at(canvas, canvas_width, row_y0 + row_height, start_x, baseline_y, text, font, size, color)
 }
@@ -2330,6 +2376,7 @@ fn draw_text_row_centered(
 fn draw_bold_text_row_centered(
     canvas: &mut [u8],
     canvas_width: i32,
+    scale: i32,
     row_y0: i32,
     row_height: i32,
     start_x: i32,
@@ -2338,8 +2385,13 @@ fn draw_bold_text_row_centered(
     size: f32,
     color: (u8, u8, u8),
 ) -> i32 {
-    draw_text_row_centered(canvas, canvas_width, row_y0, row_height, start_x, text, font, size, color);
-    draw_text_row_centered(canvas, canvas_width, row_y0, row_height, start_x + 1, text, font, size, color)
+    draw_text_row_centered(canvas, canvas_width, scale, row_y0, row_height, start_x, text, font, size, color);
+    // The +1 here is logical, not physical -- draw_text_row_centered
+    // multiplies it by scale along with start_x itself, so the faux-bold
+    // offset stays a proportional 1 logical pixel (i.e. `scale` physical
+    // ones) at any scale, not a hairline-thin single physical pixel once
+    // scale > 1.
+    draw_text_row_centered(canvas, canvas_width, scale, row_y0, row_height, start_x + 1, text, font, size, color)
 }
 
 // The window-menu button and pushpin glyphs below are traced pixel-for-
@@ -2503,6 +2555,7 @@ fn draw_glyph_bitmap(
     canvas: &mut [u8],
     canvas_width: i32,
     canvas_height: i32,
+    scale: i32,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -2510,6 +2563,7 @@ fn draw_glyph_bitmap(
     bitmap: &[&str],
     color: (u8, u8, u8),
 ) {
+    let (x0, y0, x1, y1) = (x0 * scale, y0 * scale, x1 * scale, y1 * scale);
     let (r, g, b) = color;
     let src_h = bitmap.len() as i32;
     let src_w = bitmap.first().map_or(0, |row| row.len() as i32);
@@ -2558,6 +2612,7 @@ fn draw_pushpin(
     canvas: &mut [u8],
     canvas_width: i32,
     canvas_height: i32,
+    scale: i32,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -2566,19 +2621,25 @@ fn draw_pushpin(
     color: (u8, u8, u8),
 ) {
     let bitmap = if pinned { PUSHPIN_GLYPH_PINNED } else { PUSHPIN_GLYPH_UNPINNED };
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, x0, y0, x1, y1, bitmap, color);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, bitmap, color);
 }
 
-/// Fills one full-width row of `canvas` with an opaque color -- used for the
-/// light/dark bevel edges along a decoration header's top and bottom.
-fn paint_row(canvas: &mut [u8], canvas_width: i32, y: i32, color: (u8, u8, u8)) {
+/// Fills one full-width logical row of `canvas` with an opaque color --
+/// used for the light/dark bevel edges along a decoration header's top and
+/// bottom. `y` is logical and becomes a `scale`-pixel-tall physical band,
+/// same reasoning as the bold-text offset above: a 1-logical-pixel bevel
+/// line should stay a proportional single line at any scale, not shrink to
+/// a hairline-thin single physical pixel once scale > 1.
+fn paint_row(canvas: &mut [u8], canvas_width: i32, scale: i32, y: i32, color: (u8, u8, u8)) {
     let (r, g, b) = color;
-    for x in 0..canvas_width {
-        let idx = ((y * canvas_width + x) * 4) as usize;
-        canvas[idx] = b;
-        canvas[idx + 1] = g;
-        canvas[idx + 2] = r;
-        canvas[idx + 3] = 0xFF;
+    for yy in (y * scale)..(y * scale + scale) {
+        for x in 0..canvas_width {
+            let idx = ((yy * canvas_width + x) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
     }
 }
 
@@ -2603,17 +2664,27 @@ fn icon_rect(index: usize, bg_height: i32) -> (i32, i32, i32, i32) {
     (x0, y0, x0 + ICON_SIZE, y1)
 }
 
+// canvas_width/canvas_height are physical pixels (the buffer's actual
+// size, already multiplied by scale by the caller); every other
+// coordinate argument -- x0/y0/x1/y1 here, and likewise throughout every
+// other primitive below that takes a `scale` -- stays in the same logical
+// units the rest of each draw_* function's layout math already uses, and
+// gets multiplied by `scale` right here, once, rather than at every call
+// site. See docs/DESIGN.md's HiDPI entry for why this split (logical
+// layout, scaled only at the final raster step) is the design.
 #[allow(clippy::too_many_arguments)]
 fn fill_rect(
     canvas: &mut [u8],
     canvas_width: i32,
     canvas_height: i32,
+    scale: i32,
     x0: i32,
     y0: i32,
     x1: i32,
     y1: i32,
     color: (u8, u8, u8),
 ) {
+    let (x0, y0, x1, y1) = (x0 * scale, y0 * scale, x1 * scale, y1 * scale);
     let (r, g, b) = color;
     for y in y0.max(0)..y1.min(canvas_height) {
         for x in x0.max(0)..x1.min(canvas_width) {
@@ -2636,6 +2707,7 @@ fn draw_button_glyph(
     canvas: &mut [u8],
     canvas_width: i32,
     canvas_height: i32,
+    scale: i32,
     x0: i32,
     y0: i32,
     x1: i32,
@@ -2644,7 +2716,7 @@ fn draw_button_glyph(
     color: (u8, u8, u8),
 ) {
     let bitmap = if inverted { BUTTON_GLYPH_PRESSED } else { BUTTON_GLYPH_NORMAL };
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, x0, y0, x1, y1, bitmap, color);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, bitmap, color);
 }
 
 /// Draws a small rightward-pointing wedge -- the window menu's indicator
@@ -2655,13 +2727,14 @@ fn draw_submenu_arrow(
     canvas: &mut [u8],
     canvas_width: i32,
     canvas_height: i32,
+    scale: i32,
     x0: i32,
     y0: i32,
     x1: i32,
     y1: i32,
     color: (u8, u8, u8),
 ) {
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, x0, y0, x1, y1, SUBMENU_ARROW_GLYPH, color);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, SUBMENU_ARROW_GLYPH, color);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2710,13 +2783,53 @@ fn draw_text_at(
 }
 
 impl CompositorHandler for Olshell {
+    /// Dispatches to whichever of the six scale-tracked surface owners
+    /// `surface` belongs to (see each struct's own `scale` field doc
+    /// comment for why exactly these six and not, say, WorkspaceSubmenu or
+    /// Decoration's child chrome pieces too), using the same surface-
+    /// identity helpers pointer_frame already relies on for this. Each
+    /// arm's own draw_* call does the actual `set_buffer_scale` (see
+    /// fill_rect's doc comment for the logical/physical split every one of
+    /// them follows) -- this function only updates the tracked `scale`
+    /// field and asks for a redraw.
     fn scale_factor_changed(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
-        _new_factor: i32,
+        qh: &QueueHandle<Self>,
+        surface: &wl_surface::WlSurface,
+        new_factor: i32,
     ) {
+        if let Some(i) = self.background_at(surface) {
+            self.backgrounds[i].scale = new_factor;
+            self.request_background_redraw(qh, i);
+        } else if let Some(i) = self.panel_at(surface) {
+            self.panels[i].scale = new_factor;
+            self.draw_panel(i);
+        } else if let Some(toplevel_id) = self.decoration_toplevel_id(surface) {
+            if let Some(dec) = self.toplevels.get_mut(&toplevel_id).and_then(|info| info.decoration.as_mut()) {
+                dec.scale = new_factor;
+            }
+            // Redraws the header and all seven child chrome pieces
+            // (footer/corners/borders), which read this same scale --
+            // see Decoration::scale's doc comment.
+            self.draw_decoration(&toplevel_id);
+        } else if self.window_menu.as_ref().is_some_and(|wm| wm.surface == *surface) {
+            if let Some(wm) = self.window_menu.as_mut() {
+                wm.scale = new_factor;
+            }
+            self.draw_window_menu();
+            if self.window_menu.as_ref().is_some_and(|wm| wm.workspace_submenu.is_some()) {
+                self.draw_workspace_submenu();
+            }
+        } else if self.icon_menu.as_ref().is_some_and(|im| im.surface == *surface) {
+            if let Some(im) = self.icon_menu.as_mut() {
+                im.scale = new_factor;
+            }
+            self.draw_icon_menu();
+        } else if let Some(i) = self.popup_at(surface) {
+            self.popups[i].scale = new_factor;
+            draw_popup(&mut self.pool, &self.font, &self.popups[i]);
+        }
     }
 
     fn transform_changed(
@@ -2794,6 +2907,7 @@ impl OutputHandler for Olshell {
             layer: bg_layer,
             width: 0,
             height: 0,
+            scale: 1,
             hovered_icon: None,
             selected_icons: Vec::new(),
             last_icon_click: None,
@@ -2828,6 +2942,7 @@ impl OutputHandler for Olshell {
             workspaces,
             width: 0,
             height: PANEL_HEIGHT,
+            scale: 1,
             workspace_count: 0,
             active_workspace: 0,
             hovered_workspace: None,

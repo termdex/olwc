@@ -832,6 +832,18 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	if (mode != NULL) {
 		wlr_output_state_set_mode(&state, mode);
 	}
+	// Debug/testing knob only, no protocol or UI surface of its own: lets
+	// HiDPI code paths on the olshell side be exercised in this nested test
+	// setup without real scaled hardware, the same spirit as the
+	// wlroots-provided WLR_NO_HARDWARE_CURSORS knob already relied on for
+	// testing. Real outputs just get wlroots' own default scale (1.0) since
+	// the env var is unset.
+	const char *scale_env = getenv("OLC_TEST_OUTPUT_SCALE");
+	float scale = scale_env ? strtof(scale_env, NULL) : 1.0f;
+	if (scale <= 0.0f) {
+		scale = 1.0f;
+	}
+	wlr_output_state_set_scale(&state, scale);
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
 
