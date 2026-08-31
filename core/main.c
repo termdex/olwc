@@ -414,6 +414,80 @@ static void restore_toplevel_focus(struct olc_server *server) {
 	}
 }
 
+// The toplevel currently holding keyboard focus, or NULL -- same
+// resolve-from-focused-surface pattern refocus_if_hidden already uses
+// further down, factored out here so handle_keybinding's window-menu
+// keyboard accelerators (below) can share it.
+static struct olc_toplevel *focused_toplevel(struct olc_server *server) {
+	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
+	struct wlr_xdg_toplevel *focused_xdg_toplevel =
+		focused ? wlr_xdg_toplevel_try_from_wlr_surface(focused) : NULL;
+	return focused_xdg_toplevel ? olc_toplevel_from_xdg_toplevel(focused_xdg_toplevel) : NULL;
+}
+
+// Shared by the wlr-foreign-toplevel-management request_minimize signal
+// (a client, normally olshell, asking via that protocol) and the Super+W
+// keyboard accelerator below -- both just want to set this state and
+// have everything else (visibility, telling every client's foreign-
+// toplevel handle) follow from it.
+static void toplevel_set_minimized(struct olc_toplevel *toplevel, bool minimized) {
+	toplevel->minimized = minimized;
+	update_toplevel_visibility(toplevel);
+	wlr_foreign_toplevel_handle_v1_set_minimized(toplevel->foreign_handle, minimized);
+}
+
+// Shared by the wlr-foreign-toplevel-management request_maximize signal
+// and the Super+F keyboard accelerator below, same reasoning as
+// toplevel_set_minimized.
+static void toplevel_set_maximized(struct olc_toplevel *toplevel, bool maximized) {
+	wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, maximized);
+	wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->foreign_handle, maximized);
+}
+
+// Shared by the window menu's Back item (openlook-decoration's lower
+// request) and the Super+B keyboard accelerator below.
+static void toplevel_lower(struct olc_toplevel *toplevel) {
+	wlr_scene_node_lower_to_bottom(&toplevel->scene_tree->node);
+	wl_list_remove(&toplevel->link);
+	wl_list_insert(toplevel->server->toplevels.prev, &toplevel->link);
+}
+
+// Shared by the window menu's Stick item (openlook-decoration's
+// toggle_sticky request) and the Super+S keyboard accelerator below --
+// see decoration_handle_toggle_sticky's own doc comment (toggles rather
+// than taking an explicit target state, since olcore is the only side
+// that tracks it) for why this has no minimized-style "set" variant.
+static void toplevel_toggle_sticky(struct olc_toplevel *toplevel) {
+	toplevel->sticky = !toplevel->sticky;
+	if (!toplevel->sticky) {
+		if (toplevel->output != NULL) {
+			toplevel->workspace_index = toplevel->output->active_workspace;
+		}
+		broadcast_toplevel_workspace(
+			toplevel->server, toplevel->foreign_handle, toplevel->output, toplevel->workspace_index);
+	}
+	update_toplevel_visibility(toplevel);
+	if (toplevel->decoration != NULL) {
+		zopenlook_decoration_v1_send_sticky_changed(toplevel->decoration->resource, toplevel->sticky);
+	}
+}
+
+// Shared by the window menu's Quit item (openlook-decoration's quit
+// request) and the Super+Shift+Q keyboard accelerator below -- see
+// decoration_handle_quit's own doc comment for why grouping is by
+// wl_client rather than app_id.
+static void toplevel_quit(struct olc_toplevel *toplevel) {
+	struct wl_client *target_client =
+		wl_resource_get_client(toplevel->xdg_toplevel->base->surface->resource);
+	struct olc_toplevel *t;
+	wl_list_for_each(t, &toplevel->server->toplevels, link) {
+		struct wl_client *toplevel_client = wl_resource_get_client(t->xdg_toplevel->base->surface->resource);
+		if (toplevel_client == target_client) {
+			wlr_xdg_toplevel_send_close(t->xdg_toplevel);
+		}
+	}
+}
+
 static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) {
 	struct olc_keyboard *keyboard = wl_container_of(listener, keyboard, modifiers);
 	wlr_seat_set_keyboard(keyboard->server->seat, keyboard->wlr_keyboard);
@@ -421,15 +495,68 @@ static void keyboard_handle_modifiers(struct wl_listener *listener, void *data) 
 		&keyboard->wlr_keyboard->modifiers);
 }
 
-static bool handle_keybinding(struct olc_server *server, xkb_keysym_t sym) {
-	switch (sym) {
-	case XKB_KEY_Escape:
+// Window-menu keyboard accelerators (Super+<key>) live here alongside the
+// pre-existing Alt+Escape dev-quit binding -- see docs/DESIGN.md's
+// window-menu-accelerators entry. Super, not Alt, both because Alt is
+// already heavily claimed by applications themselves and because Super
+// is the modifier most modern desktops already reserve for window-
+// management shortcuts (the same reasoning
+// docs/OPENLOOK-REFERENCE.md's ADJUST-button entry went through for a
+// different button) -- a modern-hardware reinterpretation of olwm's own
+// "Mouseless" accelerator mode, not a literal port of it: real olwm used
+// one single modifier for every menu accelerator, the physical "Meta" key
+// Sun keyboards marked with a diamond glyph (confirmed from source --
+// evbind.c's actual default bindings are plain "w+Meta"/"q+Meta", no
+// second modifier -- and menu.c/ol_button.c's olgx_draw_diamond_mark,
+// which draws that diamond next to the accelerator letter whenever a
+// binding includes Meta specifically). What first looked like a
+// screenshot showing `W` for Close but `⇧Q` for Quit was that same small
+// diamond mark next to the Q, not a second Shift modifier -- Super here
+// plays Meta's role for every one of these, uniformly, matching that
+// real convention (see WindowMenuItem::accel_key in shell/src/main.rs for
+// the diamond-mark rendering this implies). Full Size/Back/Stick have no
+// screenshot precedent to match, so F/B/S are this project's own mnemonic
+// picks. Move/Resize (interactive grabs, not a single-keypress action)
+// and Move to Workspace (needs a target workspace, not just a bare
+// keypress) are deliberately not bound here.
+static bool handle_keybinding(struct olc_server *server, uint32_t modifiers, xkb_keysym_t sym) {
+	if ((modifiers & WLR_MODIFIER_ALT) && sym == XKB_KEY_Escape) {
 		wl_display_terminate(server->wl_display);
-		break;
-	default:
-		return false;
+		return true;
 	}
-	return true;
+
+	if (modifiers & WLR_MODIFIER_LOGO) {
+		struct olc_toplevel *toplevel = focused_toplevel(server);
+		if (toplevel == NULL) {
+			return false;
+		}
+		switch (sym) {
+		case XKB_KEY_w:
+		case XKB_KEY_W:
+			toplevel_set_minimized(toplevel, true);
+			return true;
+		case XKB_KEY_f:
+		case XKB_KEY_F:
+			toplevel_set_maximized(toplevel, !toplevel->xdg_toplevel->current.maximized);
+			return true;
+		case XKB_KEY_b:
+		case XKB_KEY_B:
+			toplevel_lower(toplevel);
+			return true;
+		case XKB_KEY_s:
+		case XKB_KEY_S:
+			toplevel_toggle_sticky(toplevel);
+			return true;
+		case XKB_KEY_q:
+		case XKB_KEY_Q:
+			toplevel_quit(toplevel);
+			return true;
+		default:
+			return false;
+		}
+	}
+
+	return false;
 }
 
 static void keyboard_handle_key(struct wl_listener *listener, void *data) {
@@ -444,9 +571,12 @@ static void keyboard_handle_key(struct wl_listener *listener, void *data) {
 
 	bool handled = false;
 	uint32_t modifiers = wlr_keyboard_get_modifiers(keyboard->wlr_keyboard);
-	if ((modifiers & WLR_MODIFIER_ALT) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
+	if ((modifiers & (WLR_MODIFIER_ALT | WLR_MODIFIER_LOGO)) && event->state == WL_KEYBOARD_KEY_STATE_PRESSED) {
 		for (int i = 0; i < nsyms; i++) {
-			handled = handle_keybinding(server, syms[i]);
+			// OR'd rather than overwritten: a dead-key-style press can
+			// resolve to more than one keysym, and one of the others not
+			// matching a binding shouldn't un-set an earlier match.
+			handled = handle_keybinding(server, modifiers, syms[i]) || handled;
 		}
 	}
 
@@ -1112,17 +1242,14 @@ static void toplevel_handle_request_maximize(struct wl_listener *listener, void 
 	struct olc_toplevel *toplevel =
 		wl_container_of(listener, toplevel, foreign_request_maximize);
 	struct wlr_foreign_toplevel_handle_v1_maximized_event *event = data;
-	wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, event->maximized);
-	wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->foreign_handle, event->maximized);
+	toplevel_set_maximized(toplevel, event->maximized);
 }
 
 static void toplevel_handle_request_minimize(struct wl_listener *listener, void *data) {
 	struct olc_toplevel *toplevel =
 		wl_container_of(listener, toplevel, foreign_request_minimize);
 	struct wlr_foreign_toplevel_handle_v1_minimized_event *event = data;
-	toplevel->minimized = event->minimized;
-	update_toplevel_visibility(toplevel);
-	wlr_foreign_toplevel_handle_v1_set_minimized(toplevel->foreign_handle, event->minimized);
+	toplevel_set_minimized(toplevel, event->minimized);
 }
 
 static void toplevel_handle_request_activate(struct wl_listener *listener, void *data) {
@@ -1485,12 +1612,8 @@ static void server_new_xdg_popup(struct wl_listener *listener, void *data) {
 // switching the active workspace and moving a toplevel to/off of it --
 // both can hide whatever currently has focus.
 static void refocus_if_hidden(struct olc_server *server) {
-	struct wlr_surface *focused = server->seat->keyboard_state.focused_surface;
-	struct wlr_xdg_toplevel *focused_xdg_toplevel =
-		focused ? wlr_xdg_toplevel_try_from_wlr_surface(focused) : NULL;
-	struct olc_toplevel *focused_toplevel =
-		focused_xdg_toplevel ? olc_toplevel_from_xdg_toplevel(focused_xdg_toplevel) : NULL;
-	if (focused_toplevel != NULL && toplevel_is_visible(focused_toplevel)) {
+	struct olc_toplevel *focused = focused_toplevel(server);
+	if (focused != NULL && toplevel_is_visible(focused)) {
 		return;
 	}
 	struct olc_toplevel *toplevel;
@@ -1783,10 +1906,7 @@ static void decoration_handle_lower(struct wl_client *client, struct wl_resource
 	if (decoration == NULL || decoration->toplevel == NULL) {
 		return;
 	}
-	struct olc_toplevel *toplevel = decoration->toplevel;
-	wlr_scene_node_lower_to_bottom(&toplevel->scene_tree->node);
-	wl_list_remove(&toplevel->link);
-	wl_list_insert(toplevel->server->toplevels.prev, &toplevel->link);
+	toplevel_lower(decoration->toplevel);
 }
 
 // Toggles rather than taking an explicit target state: olcore doesn't
@@ -1799,24 +1919,7 @@ static void decoration_handle_toggle_sticky(struct wl_client *client, struct wl_
 	if (decoration == NULL || decoration->toplevel == NULL) {
 		return;
 	}
-	struct olc_toplevel *toplevel = decoration->toplevel;
-	toplevel->sticky = !toplevel->sticky;
-	if (!toplevel->sticky) {
-		// Un-sticking commits the toplevel to wherever the user currently
-		// is *on its own output* (sticky never changes which output a
-		// toplevel is on, just whether workspace_index matters for
-		// visibility), rather than snapping back to whatever
-		// workspace_index happened to be from before it was stuck --
-		// likely long forgotten, and surprising to have the window
-		// suddenly vanish to (confirmed live: it is).
-		if (toplevel->output != NULL) {
-			toplevel->workspace_index = toplevel->output->active_workspace;
-		}
-		broadcast_toplevel_workspace(
-			toplevel->server, toplevel->foreign_handle, toplevel->output, toplevel->workspace_index);
-	}
-	update_toplevel_visibility(toplevel);
-	zopenlook_decoration_v1_send_sticky_changed(decoration->resource, toplevel->sticky);
+	toplevel_toggle_sticky(decoration->toplevel);
 }
 
 // Quit's "same application instance" grouping is by wl_client, not app_id:
@@ -1833,17 +1936,7 @@ static void decoration_handle_quit(struct wl_client *client, struct wl_resource 
 	if (decoration == NULL || decoration->toplevel == NULL) {
 		return;
 	}
-	struct wl_client *target_client =
-		wl_resource_get_client(decoration->toplevel->xdg_toplevel->base->surface->resource);
-
-	struct olc_toplevel *toplevel;
-	wl_list_for_each(toplevel, &decoration->toplevel->server->toplevels, link) {
-		struct wl_client *toplevel_client =
-			wl_resource_get_client(toplevel->xdg_toplevel->base->surface->resource);
-		if (toplevel_client == target_client) {
-			wlr_xdg_toplevel_send_close(toplevel->xdg_toplevel);
-		}
-	}
+	toplevel_quit(decoration->toplevel);
 }
 
 static const struct zopenlook_decoration_v1_interface decoration_impl = {

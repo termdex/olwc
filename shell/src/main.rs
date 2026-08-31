@@ -269,6 +269,30 @@ struct WindowMenuItem {
     label: &'static str,
     action: WindowMenuAction,
     disabled: bool,
+    /// Keyboard-accelerator key drawn right-aligned on this row, preceded
+    /// by a small diamond mark (see draw_window_menu and
+    /// DIAMOND_MARK_GLYPH), or None for an item with no binding. The
+    /// binding itself lives in olcore (`handle_keybinding`, `core/
+    /// main.c`) -- olcore intercepts Super+<key> globally before routing
+    /// input to the focused client, since a normal application window
+    /// holds keyboard focus while in use and olshell alone has no way to
+    /// intercept a global shortcut.
+    ///
+    /// The diamond is not decoration: real olwm accelerators used exactly
+    /// one modifier, the physical "Meta" key Sun keyboards marked with a
+    /// diamond glyph, confirmed from source -- `evbind.c`'s actual
+    /// default bindings are plain `w+Meta`/`q+Meta`, and
+    /// `menu.c`/`ol_button.c`'s `olgx_draw_diamond_mark` draws that
+    /// diamond next to the accelerator letter whenever a binding includes
+    /// Meta. What first looked like a screenshot showing `W` for Close
+    /// but a Shift-arrow-prefixed `Q` for Quit was that same small
+    /// diamond next to the Q, not a second modifier -- Super plays Meta's
+    /// role here, uniformly, for every accelerator, matching that real
+    /// convention rather than the mistaken shift-key reading. Close and
+    /// Quit reuse the exact letters the reference screenshots show;
+    /// Full Size/Back/Stick have no screenshot precedent, so are this
+    /// project's own mnemonic picks.
+    accel_key: Option<char>,
 }
 
 // Reference list from docs/OPENLOOK-REFERENCE.md's window menu section,
@@ -296,15 +320,15 @@ struct WindowMenuItem {
 // discoverable menu path for the same action, grouped next to Stick since
 // both are about a window's relationship to workspaces.
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
-    WindowMenuItem { label: "Close", action: WindowMenuAction::Minimize, disabled: false },
-    WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false },
-    WindowMenuItem { label: "Move", action: WindowMenuAction::Move, disabled: false },
-    WindowMenuItem { label: "Resize", action: WindowMenuAction::Resize, disabled: false },
-    WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true },
-    WindowMenuItem { label: "Back", action: WindowMenuAction::Lower, disabled: false },
-    WindowMenuItem { label: "Stick", action: WindowMenuAction::ToggleSticky, disabled: false },
-    WindowMenuItem { label: "Move to Workspace", action: WindowMenuAction::MoveToWorkspace, disabled: false },
-    WindowMenuItem { label: "Quit", action: WindowMenuAction::Quit, disabled: false },
+    WindowMenuItem { label: "Close", action: WindowMenuAction::Minimize, disabled: false, accel_key: Some('W') },
+    WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false, accel_key: Some('F') },
+    WindowMenuItem { label: "Move", action: WindowMenuAction::Move, disabled: false, accel_key: None },
+    WindowMenuItem { label: "Resize", action: WindowMenuAction::Resize, disabled: false, accel_key: None },
+    WindowMenuItem { label: "Properties", action: WindowMenuAction::Unimplemented, disabled: true, accel_key: None },
+    WindowMenuItem { label: "Back", action: WindowMenuAction::Lower, disabled: false, accel_key: Some('B') },
+    WindowMenuItem { label: "Stick", action: WindowMenuAction::ToggleSticky, disabled: false, accel_key: Some('S') },
+    WindowMenuItem { label: "Move to Workspace", action: WindowMenuAction::MoveToWorkspace, disabled: false, accel_key: None },
+    WindowMenuItem { label: "Quit", action: WindowMenuAction::Quit, disabled: false, accel_key: Some('Q') },
 ];
 
 enum IconMenuAction {
@@ -1456,11 +1480,23 @@ impl Olshell {
             .chain(std::iter::once(label_width("Unstick")))
             .max()
             .unwrap_or(0);
+        // Widest accelerator key (see WindowMenuItem::accel_key's doc
+        // comment) plus its diamond mark, reserved on every row the same
+        // way the submenu arrow below is, so the popup doesn't need a
+        // different width depending on which item's accelerator happens
+        // to be widest.
+        let accel_width = DIAMOND_MARK_GLYPH.first().map_or(0, |row| row.len() as i32) + ACCEL_MARK_GAP * 2
+            + WINDOW_MENU_ITEMS
+                .iter()
+                .filter_map(|item| item.accel_key)
+                .map(|c| label_width(&c.to_string()))
+                .max()
+                .unwrap_or(0);
         // The extra MENU_H_PADDING + SUBMENU_ARROW_SIZE is Move to
         // Workspace's submenu-indicator arrow (see draw_window_menu) --
         // reserved on every row, not just that one, so the popup doesn't
         // need a different width depending on which item has it.
-        let width = (max_width + MENU_H_PADDING * 3 + SUBMENU_ARROW_SIZE).max(80) as u32;
+        let width = (max_width + MENU_H_PADDING * 3 + SUBMENU_ARROW_SIZE + accel_width).max(80) as u32;
         let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface.clone(), qh);
@@ -1591,6 +1627,21 @@ impl Olshell {
                 let ay0 = row_y0 + (MENU_ROW_HEIGHT - SUBMENU_ARROW_SIZE) / 2;
                 let ay1 = ay0 + SUBMENU_ARROW_SIZE;
                 draw_submenu_arrow(canvas, buf_width, buf_height, scale, ax0, ay0, ax1, ay1, color);
+            }
+            if let Some(accel_key) = item.accel_key {
+                let key_str = accel_key.to_string();
+                let key_width: i32 =
+                    key_str.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum();
+                let diamond_w = DIAMOND_MARK_GLYPH.first().map_or(0, |row| row.len() as i32);
+                let diamond_h = DIAMOND_MARK_GLYPH.len() as i32;
+                let key_x = width - MENU_H_PADDING - key_width;
+                let diamond_x = key_x - ACCEL_MARK_GAP - diamond_w;
+                let diamond_y = row_y0 + (MENU_ROW_HEIGHT - diamond_h) / 2;
+                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_GLYPH, color);
+                draw_text_row_centered(
+                    canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, key_x,
+                    &key_str, &self.font, MENU_FONT_SIZE, color,
+                );
             }
         }
 
@@ -2530,6 +2581,27 @@ const SUBMENU_ARROW_GLYPH: &[&str] = &[
     "####.......",
     "##.........",
 ];
+
+/// The window-menu accelerator "Meta" mark -- see WindowMenuItem::
+/// accel_key's doc comment for why a diamond, and why it isn't decorative.
+/// Unlike the glyphs above, this isn't traced from OLGlyph: real olwm/
+/// libolgx drew it procedurally (`olgx_draw_diamond_mark`, a six-point
+/// outline, not a bitmap font character), so this is a plain hand-drawn
+/// filled diamond of the same shape rather than a font trace.
+const DIAMOND_MARK_GLYPH: &[&str] = &[
+    "....#....",
+    "...###...",
+    "..#####..",
+    ".#######.",
+    "#########",
+    ".#######.",
+    "..#####..",
+    "...###...",
+    "....#....",
+];
+/// Gap between the diamond mark and the accelerator letter that follows
+/// it, and between the label and the start of the diamond.
+const ACCEL_MARK_GAP: i32 = 4;
 
 // The pill-shaped menu-item highlight below is OLGlyph too (encodings
 // 24-29 for the endcaps, 30/35/40 for the tileable middle segments,

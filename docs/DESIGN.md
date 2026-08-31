@@ -1038,26 +1038,75 @@ with wlroots compositors generally, not just this project.
   content, which is a separate and harder idea -- see the "no live
   content" gap already noted above) avoids needing an ongoing capture
   subscription, just one readback per iconification.
-- Window-menu keyboard accelerators: olwm has a real "Mouseless"/menu-
+- ~~Window-menu keyboard accelerators: olwm has a real "Mouseless"/menu-
   accelerator system (`clients/olwm/evbind.c`, `menu.c` in the
   historical XView/olwm source -- see the window gadget chrome entry's
   OLGlyph paragraph for where that source lives), with actual
   configurable key bindings that surface as the accelerator-key hints
   shown next to some window-menu entries in the reference screenshots
   (e.g. `Close` paired with a `W`-style hint, `Quit` with `⇧Q`) -- not
-  decorative labels, a real bound shortcut. Bigger than a menu-label
-  fix: normal application windows hold keyboard focus while in use, so
-  a global "Super+W closes the focused window" shortcut can't be
-  handled in olshell alone -- it needs olcore (the privileged half) to
-  intercept those key combinations before routing input to the focused
-  client, the same way any compositor's own window-management
-  shortcuts work. Nothing designed yet: which modifier fits modern
-  keyboards (Super is the obvious candidate, same reasoning
-  `docs/OPENLOOK-REFERENCE.md`'s ADJUST-button entry already went
-  through for a different button), which window-menu actions get
-  bindings, and how olcore's interception hands off to the existing
-  decoration-protocol requests (`close`, `quit`, ...) once a binding
-  fires are all still open.
+  decorative labels, a real bound shortcut.~~ resolved: the "⇧Q" reading
+  was a misidentification, corrected below, but the rest held up --
+  `core/main.c` already had exactly the extension point needed,
+  `handle_keybinding` (previously just `Alt+Escape` to quit the
+  compositor, boilerplate carried over from the wlroots tutorial this
+  project was bootstrapped from). Generalized it to also take the active
+  modifier mask, and check the focused toplevel (`focused_toplevel`, the
+  same resolve-from-focused-surface pattern `refocus_if_hidden` already
+  used, now shared) against five `Super+<key>` bindings: `W` Close
+  (minimize), `F` Full Size (toggle maximize), `B` Back (lower), `S`
+  Stick (toggle sticky), `Q` Quit. Super, not Alt, both because Alt is
+  already heavily claimed by applications and because Super is the
+  modifier most modern desktops already reserve for window-management
+  shortcuts (the same reasoning `docs/OPENLOOK-REFERENCE.md`'s
+  ADJUST-button entry went through for a different button) -- a modern-
+  hardware reinterpretation of olwm's own accelerator mode, not a literal
+  port of it. Move/Resize (interactive grabs, not a single-keypress
+  action) and Move to Workspace (needs a target workspace, not just a
+  bare keypress) are deliberately not bound. The five state-changing
+  actions (`toplevel_set_minimized`/`_maximized`, `toplevel_lower`,
+  `toplevel_toggle_sticky`, `toplevel_quit`) are now shared functions
+  called by both the keybinding and the pre-existing
+  wlr-foreign-toplevel-management/openlook-decoration request handlers
+  that used to contain this logic directly -- the keybinding needed the
+  same effects those already produced, and olcore is the compositor
+  running both, so calling internal functions directly needed no new
+  protocol surface at all.
+
+  A live-testing exchange corrected something more interesting than a
+  bug: what looked like Close showing a plain `W` hint but Quit showing
+  a Shift-prefixed `⇧Q` turned out, on closer investigation prompted by
+  the user's own memory of a diamond-like glyph in the screenshots, to
+  be exactly one modifier throughout, not two different ones per item.
+  Confirmed from source: real olwm accelerators are single-modifier,
+  bound to the physical "Meta" key Sun keyboards marked with a diamond
+  glyph (`evbind.c`'s actual defaults are plain `w+Meta`/`q+Meta`, and
+  `menu.c`/`ol_button.c`'s `olgx_draw_diamond_mark` -- a small six-point
+  outline drawn procedurally, not a bitmap font character -- draws that
+  diamond next to the accelerator letter whenever a binding includes
+  Meta). What read as a Shift-arrow before the Q was that same diamond,
+  easy to misidentify at screenshot resolution. Fixed on both sides:
+  Quit's binding changed from Super+Shift+Q to plain Super+Q, matching
+  the other four; and the window menu now draws a small hand-drawn
+  filled-diamond bitmap (`DIAMOND_MARK_GLYPH`, `shell/src/main.rs` --
+  hand-drawn rather than OLGlyph-traced, since the original was
+  procedural too, not a font glyph) before each accelerator letter,
+  rather than a bare letter or a spelled-out modifier name.
+
+  Confirmed live that the code path runs without error (window opens,
+  minimizes, no crashes), but functional verification of the shortcuts
+  themselves hit a real, un-fixable-on-our-end wall: testing happens in
+  a nested olcore running as an ordinary window inside the user's own
+  KWin session, and KWin itself intercepts every one of these Super+<key>
+  combos for its own global shortcuts before the nested compositor ever
+  sees them -- an artifact of testing a compositor-inside-a-compositor,
+  not a bug in this feature. The underlying mechanism is the same code
+  path the pre-existing Alt+Escape binding already used successfully,
+  just generalized, so this is expected to work correctly on a session
+  where the host doesn't grab Super combos (bare metal, a VT-switched
+  session, or a host with those particular shortcuts freed up) -- worth
+  remembering as a standing limitation of this project's nested-in-KWin
+  testing setup, not something to keep re-discovering.
 - ~~Pill-shaped menu-item highlight: hovering a window-menu item (or a
   root-menu item) currently fills a plain rectangle
   (`MENU_HOVER_COLOR`); authentic OPEN LOOK uses an obround/pill shape
