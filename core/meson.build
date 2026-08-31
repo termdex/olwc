@@ -102,6 +102,25 @@ openlook_decoration_code = custom_target(
   command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
 )
 
+# openlook-session is likewise our own protocol; unlike workspaces/
+# decoration it references no foreign objects at all, just a bare exit
+# request, so it needs nothing beyond its own generated header/code.
+openlook_session_xml = files('../protocol/openlook-session-unstable-v1.xml')
+
+openlook_session_header = custom_target(
+  'openlook-session-unstable-v1-protocol.h',
+  input: openlook_session_xml,
+  output: 'openlook-session-unstable-v1-protocol.h',
+  command: [wayland_scanner, 'server-header', '@INPUT@', '@OUTPUT@'],
+)
+
+openlook_session_code = custom_target(
+  'openlook-session-unstable-v1-protocol.c',
+  input: openlook_session_xml,
+  output: 'openlook-session-unstable-v1-protocol.c',
+  command: [wayland_scanner, 'private-code', '@INPUT@', '@OUTPUT@'],
+)
+
 olcore_deps = [
   wayland_server,
   wlroots,
@@ -123,6 +142,8 @@ executable(
   openlook_workspaces_code,
   openlook_decoration_header,
   openlook_decoration_code,
+  openlook_session_header,
+  openlook_session_code,
   wlr_foreign_toplevel_code,
   dependencies: olcore_deps,
   install: true,

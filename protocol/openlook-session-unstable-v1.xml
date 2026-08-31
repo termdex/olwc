@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="openlook_session_unstable_v1">
+  <copyright>
+    Copyright © 2026 olwc contributors
+
+    Permission to use, copy, modify, distribute, and sell this
+    software and its documentation for any purpose is hereby granted
+    without fee, provided that the above copyright notice appear in
+    all copies and that both that copyright notice and this permission
+    notice appear in supporting documentation, and that the name of
+    the copyright holders not be used in advertising or publicity
+    pertaining to distribution of the software without specific,
+    written prior permission.  The copyright holders make no
+    representations about the suitability of this software for any
+    purpose.  It is provided "as is" without express or implied
+    warranty.
+
+    THE COPYRIGHT HOLDERS DISCLAIM ALL WARRANTIES WITH REGARD TO THIS
+    SOFTWARE, INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+    FITNESS, IN NO EVENT SHALL THE COPYRIGHT HOLDERS BE LIABLE FOR ANY
+    SPECIAL, INDIRECT OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+    WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER
+    IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+    ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+    THIS SOFTWARE.
+  </copyright>
+
+  <interface name="zopenlook_session_manager_v1" version="1">
+    <description summary="whole-session actions an unprivileged client can't otherwise reach">
+      Lets olshell ask olcore to perform actions that affect the whole
+      compositor session rather than one toplevel or output -- currently
+      just exit, the Wayland-native equivalent of authentic OPEN LOOK's
+      root ("Workspace") menu Exit... item, which terminated olwm itself
+      (typically returning to a display manager, since olwm was normally
+      the X session's leader). olcore is that same "whole session," so
+      exit here means the same thing: wl_display_terminate(), the
+      compositor's own clean-shutdown path, already used internally for a
+      dev-only Alt+Escape binding -- this is the first way an unprivileged
+      client can reach it at all.
+
+      Interface name and scope are deliberately left room to grow: a
+      request per session-wide fixture (screen lock, suspend, ...) rather
+      than a single generic "session action" request with a string/enum
+      argument, the same one-request-per-concept shape
+      openlook-decoration-unstable-v1 already uses for lower/quit/
+      toggle_sticky.
+
+      Warning! The protocol described in this file is currently in
+      the testing phase. Backward compatible changes may be added
+      together with the corresponding interface version bump.
+      Backward incompatible changes can only be done by bumping the
+      major version number in the protocol and interface names.
+    </description>
+
+    <request name="exit">
+      <description summary="terminate the compositor session">
+        No confirmation, no event, no return -- olcore just calls
+        wl_display_terminate() and the whole session ends, taking every
+        client (including the one that asked) down with it. Any
+        confirmation prompt ("really exit?") is olshell's own
+        responsibility to show before ever sending this, the same way
+        authentic OPEN LOOK's own Exit... menu item's ellipsis signals a
+        confirmation Notice olwm itself displayed before acting.
+      </description>
+    </request>
+
+    <request name="destroy" type="destructor">
+      <description summary="destroy the manager object">
+        Destroys this manager object. Does not affect the session itself.
+      </description>
+    </request>
+  </interface>
+</protocol>

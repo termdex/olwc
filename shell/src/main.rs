@@ -110,6 +110,30 @@ use openlook_decoration::v1::client::{
     zopenlook_decoration_v1::{self, ZopenlookDecorationV1},
 };
 
+// openlook-session references no foreign objects at all (just a bare
+// exit request), so unlike openlook_decoration/openlook_workspaces above
+// its generated code needs nothing from any other protocol module.
+mod openlook_session {
+    pub mod v1 {
+        pub mod client {
+            use wayland_client;
+
+            pub mod __interfaces {
+                wayland_scanner::generate_interfaces!(
+                    "../protocol/openlook-session-unstable-v1.xml"
+                );
+            }
+            use self::__interfaces::*;
+
+            wayland_scanner::generate_client_code!(
+                "../protocol/openlook-session-unstable-v1.xml"
+            );
+        }
+    }
+}
+
+use openlook_session::v1::client::zopenlook_session_manager_v1::{self, ZopenlookSessionManagerV1};
+
 mod menu;
 use menu::{Menu, MenuNode};
 
@@ -844,6 +868,11 @@ fn main() {
         .ok();
     log::info!("openlook-decoration: {}",
         if decoration_manager.is_some() { "bound" } else { "not available" });
+    let session_manager = globals
+        .bind::<ZopenlookSessionManagerV1, _, _>(&qh, 1..=1, ())
+        .ok();
+    log::info!("openlook-session: {}",
+        if session_manager.is_some() { "bound" } else { "not available" });
 
     let font = fontdue::Font::from_bytes(PANEL_FONT_BYTES, fontdue::FontSettings::default())
         .expect("failed to parse embedded panel font");
@@ -863,6 +892,7 @@ fn main() {
         foreign_toplevel_manager,
         workspaces_manager,
         decoration_manager,
+        session_manager,
         toplevels: std::collections::HashMap::new(),
         font,
         menu,
@@ -1035,6 +1065,7 @@ struct Olshell {
     foreign_toplevel_manager: Option<ZwlrForeignToplevelManagerV1>,
     workspaces_manager: Option<ZopenlookWorkspacesManagerV1>,
     decoration_manager: Option<ZopenlookDecorationManagerV1>,
+    session_manager: Option<ZopenlookSessionManagerV1>,
     toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
     font: fontdue::Font,
     menu: Menu,
@@ -4169,6 +4200,7 @@ impl PointerHandler for Olshell {
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
                     let mut command_to_run = None;
+                    let mut exit_requested = false;
                     let mut close_index = None;
 
                     if let Some(i) = popup_index {
@@ -4193,6 +4225,9 @@ impl PointerHandler for Olshell {
                                 MenuNode::Submenu { .. } => {
                                     log::info!("root menu: submenus aren't interactive yet");
                                 }
+                                MenuNode::Exit { .. } => {
+                                    exit_requested = true;
+                                }
                             }
                             if !popup.pinned {
                                 close_index = Some(i);
@@ -4213,6 +4248,14 @@ impl PointerHandler for Olshell {
 
                     if let Some(command) = command_to_run {
                         Self::run_command(&command);
+                    }
+                    // No confirmation Notice yet (see MenuNode::Exit's doc
+                    // comment) -- olcore terminates the whole session the
+                    // moment this arrives, no second chance.
+                    if exit_requested {
+                        if let Some(manager) = self.session_manager.as_ref() {
+                            manager.exit();
+                        }
                     }
                     if let Some(i) = close_index {
                         self.close_menu(i);
@@ -4430,6 +4473,19 @@ impl Dispatch<ZopenlookDecorationManagerV1, ()> for Olshell {
         _state: &mut Self,
         _proxy: &ZopenlookDecorationManagerV1,
         _event: zopenlook_decoration_manager_v1::Event,
+        _data: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+        // No events defined by this interface.
+    }
+}
+
+impl Dispatch<ZopenlookSessionManagerV1, ()> for Olshell {
+    fn event(
+        _state: &mut Self,
+        _proxy: &ZopenlookSessionManagerV1,
+        _event: zopenlook_session_manager_v1::Event,
         _data: &(),
         _conn: &Connection,
         _qh: &QueueHandle<Self>,

@@ -8,6 +8,8 @@
 //   "Label" MENU                      -- opens a submenu; following lines
 //       ...                              are its items, until a line that
 //   END [MENU]                        -- is exactly END (optionally "END MENU")
+//   "Label" EXIT                      -- leaf item; terminates the compositor
+//                                         session (see MenuNode::Exit)
 //
 // Unrecognized directives (DEFAULT, PIN, and friends from the original
 // olwm format) are skipped with a warning rather than treated as a parse
@@ -23,6 +25,17 @@ pub enum MenuNode {
     // on hover yet, see MenuPopup's doc comment.
     #[allow(dead_code)]
     Submenu { label: String, items: Vec<MenuNode> },
+    // Authentic OPEN LOOK: olwm's own default root ("Workspace") menu is
+    // exactly a Programs submenu and this, "Exit..." (confirmed from
+    // source, clients/olwm/openwin-menu in the historical XView/olwm tree
+    // -- see docs/OPENLOOK-REFERENCE.md for where that source lives).
+    // Selecting it asks olcore to terminate the whole compositor session
+    // (openlook-session-unstable-v1's exit request) -- the Wayland-native
+    // equivalent of Exit terminating olwm itself, which (as the X
+    // session's leader) normally returned to a display manager. Distinct
+    // from Item since it isn't a shell command olshell spawns; olcore
+    // does the actual work.
+    Exit { label: String },
 }
 
 impl MenuNode {
@@ -30,6 +43,7 @@ impl MenuNode {
         match self {
             MenuNode::Item { label, .. } => label,
             MenuNode::Submenu { label, .. } => label,
+            MenuNode::Exit { label } => label,
         }
     }
 }
@@ -60,6 +74,10 @@ impl Menu {
             items: vec![
                 MenuNode::Item { label: "Terminal".into(), command: "konsole --separate".into() },
                 MenuNode::Item { label: "Refresh".into(), command: "true".into() },
+                // Matches authentic olwm's own default root menu, which
+                // pairs a Programs submenu with exactly this -- see
+                // MenuNode::Exit's doc comment.
+                MenuNode::Exit { label: "Exit...".into() },
             ],
         }
     }
@@ -130,6 +148,8 @@ fn parse_items<'a, I: Iterator<Item = &'a str>>(
             items.push(MenuNode::Submenu { label, items: children });
         } else if let Some(command) = rest.strip_prefix("exec ") {
             items.push(MenuNode::Item { label, command: command.trim().to_string() });
+        } else if rest == "EXIT" {
+            items.push(MenuNode::Exit { label });
         } else {
             log::warn!("root menu: skipping item {label:?} with unsupported action {rest:?}");
         }
@@ -196,6 +216,20 @@ mod tests {
         assert_eq!(label, "Programs");
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].label(), "XTerm");
+    }
+
+    #[test]
+    fn parses_exit() {
+        let menu = Menu::parse(
+            r#"
+                "Terminal" exec xterm
+                "Exit..." EXIT
+            "#,
+        )
+        .unwrap();
+        assert_eq!(menu.items.len(), 2);
+        assert_eq!(menu.items[1].label(), "Exit...");
+        assert!(matches!(&menu.items[1], MenuNode::Exit { .. }));
     }
 
     #[test]

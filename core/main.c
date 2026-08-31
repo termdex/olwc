@@ -41,6 +41,7 @@
 #include <xkbcommon/xkbcommon.h>
 
 #include "openlook-decoration-unstable-v1-protocol.h"
+#include "openlook-session-unstable-v1-protocol.h"
 #include "openlook-workspaces-unstable-v1-protocol.h"
 
 // Fixed linear workspace count for this scaffold. A real implementation
@@ -89,6 +90,11 @@ struct olc_server {
 	// openlook-decoration: lets olshell attach header chrome to a toplevel
 	// it doesn't own. See protocol/openlook-decoration-unstable-v1.xml.
 	struct wl_global *decoration_manager_global;
+
+	// openlook-session: whole-session actions (currently just exit) an
+	// unprivileged client has no other way to reach. See
+	// protocol/openlook-session-unstable-v1.xml.
+	struct wl_global *session_manager_global;
 
 	// The surface most recently granted focus via openlook-decoration's
 	// grab_keyboard request -- the window menu and its submenus, which
@@ -2141,6 +2147,38 @@ static void decoration_manager_bind(
 	wl_resource_set_implementation(resource, &decoration_manager_impl, server, NULL);
 }
 
+// See protocol/openlook-session-unstable-v1.xml's own doc comment: no
+// confirmation, no event, just the same clean-shutdown path the dev-only
+// Alt+Escape keybinding already uses -- olshell is responsible for any
+// "really exit?" confirmation before ever sending this.
+static void session_manager_handle_exit(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	struct olc_server *server = wl_resource_get_user_data(resource);
+	wl_display_terminate(server->wl_display);
+}
+
+static void session_manager_handle_destroy(struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	wl_resource_destroy(resource);
+}
+
+static const struct zopenlook_session_manager_v1_interface session_manager_impl = {
+	.exit = session_manager_handle_exit,
+	.destroy = session_manager_handle_destroy,
+};
+
+static void session_manager_bind(
+		struct wl_client *client, void *data, uint32_t version, uint32_t id) {
+	struct olc_server *server = data;
+	struct wl_resource *resource =
+		wl_resource_create(client, &zopenlook_session_manager_v1_interface, (int)version, id);
+	if (resource == NULL) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(resource, &session_manager_impl, server, NULL);
+}
+
 int main(int argc, char *argv[]) {
 	wlr_log_init(WLR_DEBUG, NULL);
 	char *startup_cmd = NULL;
@@ -2214,6 +2252,9 @@ int main(int argc, char *argv[]) {
 
 	server.decoration_manager_global = wl_global_create(server.wl_display,
 		&zopenlook_decoration_manager_v1_interface, 1, &server, decoration_manager_bind);
+
+	server.session_manager_global = wl_global_create(server.wl_display,
+		&zopenlook_session_manager_v1_interface, 1, &server, session_manager_bind);
 
 	wl_list_init(&server.layer_surfaces);
 	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);

@@ -617,6 +617,46 @@ with wlroots compositors generally, not just this project.
   (colors, spacing, shapes) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
+- Root menu "Exit..." item: authentic, not a modern addition -- confirmed
+  from source that olwm's actual default root menu
+  (`clients/olwm/openwin-menu` in the historical XView/olwm tree, see
+  `docs/OPENLOOK-REFERENCE.md`) is exactly a `Programs` submenu and
+  `"Exit..."`, an `EXIT` directive. olshell's `.openwin-menu` parser
+  (`shell/src/menu.rs`) now recognizes it (`MenuNode::Exit`), and the
+  built-in default menu includes it alongside Terminal/Refresh. In X11,
+  Exit terminated olwm itself, which (as the session's leader) normally
+  returned control to a display manager; the Wayland-native equivalent is
+  terminating olcore's own `wl_display` -- already the dev-only
+  `Alt+Escape` binding's whole job, just with no way for an unprivileged
+  client to reach it before now. Added a new, deliberately minimal
+  protocol for exactly this, `openlook-session-unstable-v1`
+  (`zopenlook_session_manager_v1`, a single `exit` request) -- scoped to
+  grow into other whole-session actions later (screen lock, suspend, ...)
+  as their own requests, the same one-request-per-concept shape
+  `openlook-decoration-unstable-v1` already uses for `lower`/`quit`/
+  `toggle_sticky`, rather than one generic "session action" request with
+  a string/enum argument.
+
+  Deliberately not built alongside this: a confirmation Notice before
+  actually exiting. The `...` in "Exit..." is itself OPEN LOOK's own
+  convention for "this shows a confirmation" (see the widget vocabulary
+  table's `Notice` entry -- "used specifically for short, must-
+  acknowledge messages"), and real olwm did show one, but building an
+  actual modal confirmation means implementing that widget type from
+  scratch, which nothing in olshell needs yet -- selecting "Exit..." for
+  now terminates the session immediately, no second chance. Worth
+  building once a Notice is needed for anything else too, rather than a
+  one-off modal built just for this.
+
+  Raised the broader question of Sleep/Shutdown/Restart/Session actions
+  (KDE-style, not an OPEN LOOK convention at all) -- deliberately kept
+  separate from this entry rather than folded in, since each is a real,
+  standalone feature: Suspend/Shutdown/Restart need `logind` D-Bus
+  integration (`org.freedesktop.login1`'s `Suspend`/`PowerOff`/`Reboot`),
+  and a lock screen (for Session) needs `ext-session-lock-v1`, a protocol
+  olcore doesn't implement at all yet -- switching users is a bigger
+  scope still (VT switching plus spawning another greeter), likely out of
+  scope for a project this size rather than a near-term to-do.
 - Settings GUI tool: several things olwc already supports or has flagged
   as a real decision have no user-facing way to change them at all today
   -- worth a proper Settings app once enough of them exist to justify one,
