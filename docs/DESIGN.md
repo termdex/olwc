@@ -244,19 +244,45 @@ with wlroots compositors generally, not just this project.
   of whatever was drawn in that memory before instead of true
   transparency.
 
-  Focus is now indicated on the header itself, matching the reference
+  ~~Focus is now indicated on the header itself, matching the reference
   screenshots: the focused window's header fills with a darker gray
   (`DECORATION_FOCUSED_BG_COLOR`) and its bevel flips from raised
   (light top edge, dark bottom edge -- the unfocused, "unpressed"
-  look) to inset (dark top, light bottom), reusing the same
-  raised/inset bevel language `OPENLOOK-REFERENCE.md` already
-  describes for buttons, applied here to focus rather than a press.
-  Driven by state code 2 ("activated") on
-  wlr-foreign-toplevel-management, which `draw_decoration` already
-  had access to; no new protocol needed. The button's unhovered fill
-  now tracks the header's own background color instead of always
-  being the unfocused shade, so it doesn't look mismatched against a
-  focused header.
+  look) to inset (dark top, light bottom)~~ corrected in a later pass:
+  a live closer look at the reference screenshots -- and, more
+  precisely, sampling actual pixel values straight through a real
+  focused and unfocused title bar rather than just eyeballing a
+  screenshot crop, which turned out to be too JPEG/PNG-compressed to
+  show the structure at all -- found that a full-header color swap was
+  never the real effect. `screenshots/sunos551-ow1-scr-03.png`'s
+  focused Calculator window and unfocused File Manager window, scanned
+  column by column: both have the *exact same* light
+  `DECORATION_BG_COLOR` at their own top/bottom margins; the focused
+  one additionally sinks a smaller, darker panel into that margin via a
+  dark-top/light-bottom bevel pair (3px light margin, 1px dark bevel,
+  13px darker fill, 1px light bevel, 5px light margin, at that
+  screenshot's own resolution), while the unfocused one has no such
+  panel, just the thin raised ridge near the bottom this project
+  already had. `DECORATION_HEIGHT` grew from 22 to 28 to fit that
+  structure comfortably around the existing button/title content
+  rather than cramming it into a flat, uniformly-colored bar the way
+  the too-shallow previous version did (`DECORATION_FOCUS_MARGIN_TOP`/
+  `_BOTTOM`, `shell/src/main.rs`, hold the measured margin sizes).
+  Reuses the same raised/inset bevel language `OPENLOOK-REFERENCE.md`
+  already describes for buttons -- what changed is recognizing that
+  language frames a *sub-region* here, not the header's own full
+  extent. Driven by the same state code 2 ("activated") on
+  wlr-foreign-toplevel-management as before; no protocol change
+  needed. The button's unhovered fill tracks whatever color actually
+  sits behind it now (the recessed panel's own fill when focused, the
+  header's plain fill otherwise), not a single "the header's
+  background" value the way it could when that was one color for the
+  whole header. Verified by rendering both states directly through the
+  real drawing code (the same self-verification technique the earlier
+  pill-centering and Notice work used) rather than through a live
+  screenshot, which the floating workspace palette and a maximized
+  test window both ended up overlapping during an attempt to capture
+  one.
 
   The resize-corner glyphs are no longer filled circles. Cross-checking
   `screenshots/sunos551-ow1-scr-01.png`'s Text Editor window at all

@@ -230,18 +230,42 @@ const SUBMENU_ARROW_SIZE: i32 = 8;
 // "Window menu" section -- this is the title bar these constants describe;
 // the window-menu popup that its button is meant to open is follow-up work
 // (see the button-click handler in PointerHandler::pointer_frame below).
-const DECORATION_HEIGHT: u32 = 22;
+// Was 22; grown to fit the focused header's recessed panel (a light
+// margin, a 1px bevel, the darker recessed fill, another 1px bevel, and
+// a second light margin -- see DECORATION_FOCUS_MARGIN_TOP/_BOTTOM)
+// comfortably around the existing button/title content, rather than
+// filling a flat, uniformly-colored 22px bar the way the previous, too-
+// shallow version did.
+const DECORATION_HEIGHT: u32 = 28;
 // Deliberately a shade darker than the panel's (0xBE,0xBE,0xBE) -- same
 // palette family, but visually distinct chrome, matching the reference's
 // "clean thin border separating it from the content area" cue rather than
-// blending into the desktop panel above it.
+// blending into the desktop panel above it. This is the header's *only*
+// fill color regardless of focus now -- see DECORATION_FOCUSED_BG_COLOR's
+// own doc comment for why.
 const DECORATION_BG_COLOR: (u8, u8, u8) = (0xA8, 0xA8, 0xA8);
-// The focused header's fill and bevel direction, per the reference
-// screenshots: the active window's title bar is a darkened, recessed
-// rectangle where unfocused ones are the uniform light gray above --
-// the same "inset = pressed" bevel language OPENLOOK-REFERENCE.md
-// already calls out for buttons, applied here to focus instead.
+// The recessed panel sunk into a *focused* header, not a fill color for
+// the header's own full extent -- confirmed by sampling raw pixel values
+// straight through a real focused and unfocused title bar
+// (screenshots/sunos551-ow1-scr-03.png), not just eyeballing a
+// screenshot crop, which was too JPEG/PNG-compressed to show this
+// structure at all. A focused window's header turned out to be the same
+// light DECORATION_BG_COLOR at its own top/bottom margins as an
+// unfocused one, with a smaller, darker panel inset into it via a dark-
+// top/light-bottom bevel pair (DECORATION_BEVEL_DARK/_LIGHT) -- the same
+// "inset = pressed" bevel language used everywhere else in olshell's
+// chrome, just applied to a sub-region rather than a full-header color
+// swap, which was this constant's entire previous job and didn't read as
+// "recessed" at all, just "a different solid color." An unfocused header
+// has no such panel.
 const DECORATION_FOCUSED_BG_COLOR: (u8, u8, u8) = (0x80, 0x80, 0x80);
+/// Light DECORATION_BG_COLOR margin above the focused header's recessed
+/// panel, before its own top bevel line -- asymmetric with the bottom
+/// margin below to match the exact proportions measured from the
+/// screenshot described in DECORATION_FOCUSED_BG_COLOR's own doc
+/// comment (3px top, 5px bottom).
+const DECORATION_FOCUS_MARGIN_TOP: i32 = 3;
+const DECORATION_FOCUS_MARGIN_BOTTOM: i32 = 5;
 const DECORATION_BEVEL_LIGHT: (u8, u8, u8) = (0xE8, 0xE8, 0xE8);
 const DECORATION_BEVEL_DARK: (u8, u8, u8) = (0x70, 0x70, 0x70);
 const DECORATION_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
@@ -1579,28 +1603,47 @@ impl Olshell {
 
         // state code 2 is "activated" -- see focused_toplevel_handle().
         let focused = info.states.contains(&2);
-        let header_bg = if focused { DECORATION_FOCUSED_BG_COLOR } else { DECORATION_BG_COLOR };
 
-        let (r, g, b) = header_bg;
+        // The header's own fill is always the light, unfocused color now
+        // -- see DECORATION_FOCUSED_BG_COLOR's doc comment for why focus
+        // is a separate recessed panel drawn on top, not a color swap of
+        // this whole fill.
+        let (r, g, b) = DECORATION_BG_COLOR;
         for pixel in canvas.chunks_exact_mut(4) {
             pixel[0] = b;
             pixel[1] = g;
             pixel[2] = r;
             pixel[3] = 0xFF;
         }
-        // 3D beveled shading: raised-unpressed (light top, dark bottom) when
-        // unfocused, per docs/OPENLOOK-REFERENCE.md; flipped to inset when
-        // focused, to match the recessed look of the active window's header
-        // in the reference screenshots.
-        let (bevel_top, bevel_bottom) =
-            if focused { (DECORATION_BEVEL_DARK, DECORATION_BEVEL_LIGHT) } else { (DECORATION_BEVEL_LIGHT, DECORATION_BEVEL_DARK) };
-        // Just inside the top border below -- the bevel row's the focus
-        // indicator, the border's the window edge, and they're not the
-        // same thing (docs/DESIGN.md has the reasoning for each).
-        paint_row(canvas, buf_width, scale, DECORATION_BORDER_WIDTH, bevel_top);
-        if height > 1 {
-            paint_row(canvas, buf_width, scale, height - 1, bevel_bottom);
-        }
+        // content_bg is whatever color actually sits behind the button
+        // and title text below -- the recessed panel's own fill when
+        // focused, or the header's plain fill otherwise -- used so the
+        // button blends into whichever it's actually drawn over rather
+        // than assuming one or the other.
+        let content_bg = if focused {
+            let recessed_top = DECORATION_FOCUS_MARGIN_TOP;
+            let recessed_bottom = height - DECORATION_FOCUS_MARGIN_BOTTOM;
+            fill_rect(
+                canvas, buf_width, buf_height, scale, 0, recessed_top, width, recessed_bottom,
+                DECORATION_FOCUSED_BG_COLOR,
+            );
+            paint_row(canvas, buf_width, scale, recessed_top, DECORATION_BEVEL_DARK);
+            paint_row(canvas, buf_width, scale, recessed_bottom - 1, DECORATION_BEVEL_LIGHT);
+            DECORATION_FOCUSED_BG_COLOR
+        } else {
+            // Unchanged from before this pass: a thin raised ridge (light
+            // top, dark bottom -- OPENLOOK-REFERENCE.md's own raised-
+            // unpressed bevel convention) near the header's own top and
+            // bottom edges. Just inside the top border -- the bevel row
+            // is the focus indicator, the border's the window edge, and
+            // they're not the same thing (docs/DESIGN.md has the
+            // reasoning for each).
+            paint_row(canvas, buf_width, scale, DECORATION_BORDER_WIDTH, DECORATION_BEVEL_LIGHT);
+            if height > 1 {
+                paint_row(canvas, buf_width, scale, height - 1, DECORATION_BEVEL_DARK);
+            }
+            DECORATION_BG_COLOR
+        };
 
         // The plain black frame's top stretch, skipping the two top
         // corners -- their own bracket subsurfaces sit right on top of
@@ -1611,7 +1654,7 @@ impl Olshell {
         fill_rect(canvas, buf_width, buf_height, scale, CORNER_HANDLE_SIZE, 0, width - CORNER_HANDLE_SIZE, DECORATION_BORDER_WIDTH, DECORATION_BORDER_COLOR);
 
         let (bx0, by0, bx1, by1) = dec.button_rect();
-        let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { header_bg };
+        let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { content_bg };
         fill_rect(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, button_color);
         draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, dec.button_hovered, DECORATION_TEXT_COLOR);
 
@@ -1640,20 +1683,20 @@ impl Olshell {
         // header's.
         let (tl_x, tl_y) = dec.corner_handle_position(ResizeRegion::TopLeft);
         dec.top_left.subsurface.set_position(tl_x, tl_y);
-        draw_corner_handle(&mut self.pool, &dec.top_left.surface, scale, dec.top_left.hovered, ResizeRegion::TopLeft, header_bg);
+        draw_corner_handle(&mut self.pool, &dec.top_left.surface, scale, dec.top_left.hovered, ResizeRegion::TopLeft, content_bg);
 
         let (tr_x, tr_y) = dec.corner_handle_position(ResizeRegion::TopRight);
         dec.top_right.subsurface.set_position(tr_x, tr_y);
-        draw_corner_handle(&mut self.pool, &dec.top_right.surface, scale, dec.top_right.hovered, ResizeRegion::TopRight, header_bg);
+        draw_corner_handle(&mut self.pool, &dec.top_right.surface, scale, dec.top_right.hovered, ResizeRegion::TopRight, content_bg);
 
         if dec.toplevel_height > 0 {
             let (bl_x, bl_y) = dec.corner_handle_position(ResizeRegion::BottomLeft);
             dec.bottom_left.subsurface.set_position(bl_x, bl_y);
-            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, scale, dec.bottom_left.hovered, ResizeRegion::BottomLeft, header_bg);
+            draw_corner_handle(&mut self.pool, &dec.bottom_left.surface, scale, dec.bottom_left.hovered, ResizeRegion::BottomLeft, content_bg);
 
             let (br_x, br_y) = dec.corner_handle_position(ResizeRegion::BottomRight);
             dec.bottom_right.subsurface.set_position(br_x, br_y);
-            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, scale, dec.bottom_right.hovered, ResizeRegion::BottomRight, header_bg);
+            draw_corner_handle(&mut self.pool, &dec.bottom_right.surface, scale, dec.bottom_right.hovered, ResizeRegion::BottomRight, content_bg);
 
             let (f_x, f_y, f_width) = dec.footer_rect();
             if f_width > 0 {
