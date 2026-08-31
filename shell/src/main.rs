@@ -601,7 +601,16 @@ impl WindowMenu {
 /// menu and for the same reason -- a plain subsurface has no
 /// wlr-layer-shell Exclusive-interactivity equivalent of its own.
 struct IconMenu {
+    /// The icon actually MENU-clicked to open this menu -- used to
+    /// position it and to recognize a second click on the same icon's
+    /// button as toggle-closed rather than reopen.
     toplevel_id: ObjectId,
+    /// The icons Open/Move actually act on: just `toplevel_id` unless it
+    /// was already part of a multi-selection
+    /// (`BackgroundOutput::selected_icons`) when MENU-clicked, in which
+    /// case the whole selection -- this is what makes ADJUST-click's
+    /// selection mean something (see that field's doc comment).
+    group: Vec<ObjectId>,
     /// Which BackgroundOutput this icon (and so this menu) belongs to --
     /// needed by the Move item to know which background's icon_position
     /// to update and which pointer events (keyed by background surface)
@@ -868,15 +877,22 @@ struct BackgroundOutput {
     /// recompute -- see minimized_toplevels_for_output) of the icon the
     /// pointer is currently over, if any.
     hovered_icon: Option<usize>,
-    /// Toplevel a single SELECT-click most recently selected, if any --
-    /// authentic OPEN LOOK icons need a second click (double-click) to
-    /// restore; a single click just highlights. Cleared by clicking
-    /// elsewhere on the background or restoring the icon. Keyed by the
-    /// toplevel's ObjectId rather than its tray position, since the tray
-    /// is sorted by title and re-sorts as windows are minimized/restored
-    /// -- a position-based selection could silently end up highlighting a
-    /// different icon after such a reshuffle.
-    selected_icon: Option<ObjectId>,
+    /// The current icon selection, keyed by the toplevel's ObjectId rather
+    /// than tray position (the tray is sorted by title and re-sorts as
+    /// windows are minimized/restored -- a position-based selection could
+    /// silently end up highlighting a different icon after such a
+    /// reshuffle). Authentic OPEN LOOK icons need a second click
+    /// (double-click) to restore; a single SELECT-click just replaces this
+    /// with a single-element selection (highlighting it), cleared entirely
+    /// by clicking elsewhere on the background or by restoring an icon.
+    /// ADJUST (middle-click) instead toggles one icon's membership in this
+    /// set without disturbing the rest -- the icon-repositioning entry's
+    /// deferred "what would ADJUST-click even do here" question in
+    /// `docs/OPENLOOK-REFERENCE.md`, now with a real consumer: dragging, or
+    /// the icon menu's Open/Move, act on the *whole* selection when the
+    /// icon they're started from is a member of a multi-icon one (see
+    /// IconDrag's doc comment), and on just that one icon otherwise.
+    selected_icons: Vec<ObjectId>,
     /// (toplevel, event time) of the most recent SELECT-click on an icon,
     /// used to recognize the next click on the *same* icon within
     /// ICON_DOUBLE_CLICK_MS as a double-click rather than two single
@@ -913,7 +929,12 @@ struct BackgroundOutput {
 /// of `pointer_frame`.
 #[derive(Clone)]
 struct IconDrag {
-    id: ObjectId,
+    // The icon actually pressed to start this drag (or, for an armed
+    // menu-triggered move, the icon whose menu it was armed from) --
+    // this is the one double-click detection and a plain (no-threshold-
+    // crossed) Release's resulting single-icon selection always go by,
+    // regardless of how many icons `icons` below is actually moving.
+    primary: ObjectId,
     // The Press event's own time, carried through to Release so double-
     // click detection compares press-to-press intervals (matching
     // last_icon_click's own timestamps) rather than press-to-release.
@@ -927,9 +948,17 @@ struct IconDrag {
     // necessarily anywhere near the icon at the moment Move is clicked,
     // since the click happens on the icon menu's own surface).
     press_pos: Option<(f64, f64)>,
-    // The icon's on-screen top-left at the moment of press (or arming),
-    // before any drag offset is applied.
-    origin: (i32, i32),
+    // Every icon this drag actually moves, each paired with its own
+    // on-screen top-left at the moment of press (or arming), before any
+    // drag offset is applied. A single-element Vec (just `primary`) for
+    // an ordinary drag or Move started from an icon that wasn't part of
+    // a multi-selection; the whole selection (`BackgroundOutput::
+    // selected_icons`) when it was -- ADJUST-click's one real consumer,
+    // see that field's doc comment. Every entry moves by the same delta,
+    // each clamped to the background's bounds independently, so a
+    // group drag can visually spread apart if one member reaches an
+    // edge before the others do.
+    icons: Vec<(ObjectId, (i32, i32))>,
     // Set once the pointer has moved past ICON_DRAG_THRESHOLD (a real
     // drag) or immediately (an armed move, no threshold to cross) --
     // once true, Release ends a real drag rather than acting as a click;
@@ -1065,7 +1094,7 @@ impl Olshell {
         let icon_ids = active_workspace.map(|w| self.minimized_toplevels_for_output(&bg.output, w));
         let icon_rects = icon_ids.as_ref().map(|ids| self.icon_layout(ids, height));
         let hovered_icon = bg.hovered_icon;
-        let selected_icon = bg.selected_icon.clone();
+        let selected_icons = bg.selected_icons.clone();
 
         let (buffer, canvas) = self
             .pool
@@ -1092,7 +1121,7 @@ impl Olshell {
                 }
                 let fill = if hovered_icon == Some(i) {
                     MENU_HOVER_COLOR
-                } else if selected_icon.as_ref() == Some(id) {
+                } else if selected_icons.contains(id) {
                     ICON_SELECTED_COLOR
                 } else {
                     ICON_BG_COLOR
@@ -1565,7 +1594,13 @@ impl Olshell {
     /// exact icon's menu was the one already open (see pointer_frame's
     /// BTN_RIGHT handling), the same pattern open_window_menu's caller
     /// already uses for the header button.
-    fn open_icon_menu(&mut self, qh: &QueueHandle<Self>, background_index: usize, toplevel_id: &ObjectId) {
+    fn open_icon_menu(
+        &mut self,
+        qh: &QueueHandle<Self>,
+        background_index: usize,
+        toplevel_id: &ObjectId,
+        group: Vec<ObjectId>,
+    ) {
         self.close_icon_menu();
 
         let output = self.backgrounds[background_index].output.clone();
@@ -1605,6 +1640,7 @@ impl Olshell {
 
         self.icon_menu = Some(IconMenu {
             toplevel_id: toplevel_id.clone(),
+            group,
             background_index,
             subsurface,
             surface,
@@ -2759,7 +2795,7 @@ impl OutputHandler for Olshell {
             width: 0,
             height: 0,
             hovered_icon: None,
-            selected_icon: None,
+            selected_icons: Vec::new(),
             last_icon_click: None,
             drag: None,
             frame_requested: false,
@@ -3012,7 +3048,24 @@ impl PointerHandler for Olshell {
                     });
                     match clicked_id {
                         Some(id) if icon_menu_toplevel.as_ref() != Some(&id) => {
-                            self.open_icon_menu(qh, i, &id);
+                            // If the clicked icon is already a member of a
+                            // multi-selection (see selected_icons' doc
+                            // comment), Open/Move act on the whole
+                            // selection; otherwise MENU replaces the
+                            // selection with just this one icon, same as a
+                            // plain SELECT-click would.
+                            let is_group_member = {
+                                let selected = &self.backgrounds[i].selected_icons;
+                                selected.len() > 1 && selected.contains(&id)
+                            };
+                            let group = if is_group_member {
+                                self.backgrounds[i].selected_icons.clone()
+                            } else {
+                                self.backgrounds[i].selected_icons = vec![id.clone()];
+                                self.request_background_redraw(qh, i);
+                                vec![id.clone()]
+                            };
+                            self.open_icon_menu(qh, i, &id, group);
                         }
                         Some(_) => {
                             // Toggling closed: the pre-step above already
@@ -3024,6 +3077,35 @@ impl PointerHandler for Olshell {
                         }
                     }
                 }
+                // ADJUST (middle-click) on an icon toggles it in/out of a
+                // multi-selection without disturbing the rest -- see
+                // selected_icons' doc comment for what actually consumes
+                // that selection. Middle-clicking empty background, or an
+                // icon that's already been removed from the tray, is a
+                // no-op: ADJUST only ever modifies an existing selection,
+                // never replaces or clears it the way a plain SELECT-click
+                // on empty background does.
+                PointerEventKind::Press { button, .. } if background_index.is_some() && button == BTN_MIDDLE => {
+                    let i = background_index.unwrap();
+                    let icon_index = self.icon_at(i, event.position.0, event.position.1);
+                    let output = self.backgrounds[i].output.clone();
+                    let active_workspace =
+                        self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
+                    let clicked_id = icon_index.and_then(|idx| {
+                        let w = active_workspace?;
+                        self.minimized_toplevels_for_output(&output, w).get(idx).cloned()
+                    });
+                    if let Some(id) = clicked_id {
+                        let bg = &mut self.backgrounds[i];
+                        match bg.selected_icons.iter().position(|s| *s == id) {
+                            Some(pos) => {
+                                bg.selected_icons.remove(pos);
+                            }
+                            None => bg.selected_icons.push(id),
+                        }
+                        self.request_background_redraw(qh, i);
+                    }
+                }
                 PointerEventKind::Motion { .. } if background_index.is_some() => {
                     let i = background_index.unwrap();
                     // If SELECT is down on an icon, this motion either
@@ -3032,16 +3114,16 @@ impl PointerHandler for Olshell {
                     let drag = self.backgrounds[i]
                         .drag
                         .as_ref()
-                        .map(|d| (d.id.clone(), d.press_pos, d.origin, d.dragging));
-                    if let Some((id, press_pos, origin, already_dragging)) = drag {
+                        .map(|d| (d.icons.clone(), d.press_pos, d.dragging));
+                    if let Some((icons, press_pos, already_dragging)) = drag {
                         let press_pos = match press_pos {
                             Some(p) => p,
                             None => {
                                 // First motion after an armed (menu-
                                 // triggered) move -- establish the
                                 // reference point now, from wherever the
-                                // pointer happens to be, so the icon
-                                // doesn't jump to reflect movement that
+                                // pointer happens to be, so the icon(s)
+                                // don't jump to reflect movement that
                                 // happened before tracking started (the
                                 // click that armed this happened on the
                                 // icon menu's own surface, not
@@ -3058,10 +3140,15 @@ impl PointerHandler for Olshell {
                             let bg = &self.backgrounds[i];
                             let max_x = (bg.width as i32 - ICON_SIZE).max(0);
                             let max_y = (bg.height as i32 - ICON_SIZE - ICON_LABEL_HEIGHT).max(0);
-                            let new_x = (origin.0 + dx.round() as i32).clamp(0, max_x);
-                            let new_y = (origin.1 + dy.round() as i32).clamp(0, max_y);
-                            if let Some(info) = self.toplevels.get_mut(&id) {
-                                info.icon_position = Some((new_x, new_y));
+                            // Every dragged icon moves by the same delta,
+                            // each clamped to the background independently
+                            // -- see IconDrag::icons' doc comment.
+                            for (id, origin) in &icons {
+                                let new_x = (origin.0 + dx.round() as i32).clamp(0, max_x);
+                                let new_y = (origin.1 + dy.round() as i32).clamp(0, max_y);
+                                if let Some(info) = self.toplevels.get_mut(id) {
+                                    info.icon_position = Some((new_x, new_y));
+                                }
                             }
                             let bg = &mut self.backgrounds[i];
                             if let Some(d) = bg.drag.as_mut() {
@@ -3069,8 +3156,10 @@ impl PointerHandler for Olshell {
                             }
                             // Visual "picked up" feedback for as long as the
                             // drag lasts; stays selected after the drop too,
-                            // same as most desktop icon dragging conventions.
-                            bg.selected_icon = Some(id);
+                            // same as most desktop icon dragging conventions
+                            // -- a no-op assignment for a group drag, which
+                            // was already exactly this set.
+                            bg.selected_icons = icons.iter().map(|(id, _)| id.clone()).collect();
                             self.request_background_redraw(qh, i);
                         }
                     } else {
@@ -3106,19 +3195,37 @@ impl PointerHandler for Olshell {
                         let rects = self.icon_layout(ids, height);
                         let id = ids.get(idx)?.clone();
                         let &(x0, y0, ..) = rects.get(idx)?;
-                        Some((id, (x0, y0)))
+                        Some((id, (x0, y0), ids.clone(), rects))
                     });
 
-                    if let Some((id, origin)) = clicked {
+                    if let Some((id, origin, ids, rects)) = clicked {
+                        // If the pressed icon is already part of a multi-
+                        // selection, the whole selection drags together --
+                        // see IconDrag::icons' and selected_icons' doc
+                        // comments.
+                        let selected = self.backgrounds[i].selected_icons.clone();
+                        let icons = if selected.len() > 1 && selected.contains(&id) {
+                            selected
+                                .iter()
+                                .filter_map(|sid| {
+                                    let idx = ids.iter().position(|i| i == sid)?;
+                                    let &(x0, y0, ..) = rects.get(idx)?;
+                                    Some((sid.clone(), (x0, y0)))
+                                })
+                                .collect()
+                        } else {
+                            vec![(id.clone(), origin)]
+                        };
                         self.backgrounds[i].drag = Some(IconDrag {
-                            id,
+                            primary: id,
                             press_time: time,
                             press_pos: Some(event.position),
-                            origin,
+                            icons,
                             dragging: false,
                             armed: false,
                         });
-                    } else if self.backgrounds[i].selected_icon.take().is_some() {
+                    } else if !self.backgrounds[i].selected_icons.is_empty() {
+                        self.backgrounds[i].selected_icons.clear();
                         self.request_background_redraw(qh, i);
                     }
                 }
@@ -3138,22 +3245,29 @@ impl PointerHandler for Olshell {
                     }
                     let is_double_click = match &self.backgrounds[i].last_icon_click {
                         Some((last_id, last_time)) => {
-                            *last_id == drag.id && drag.press_time.wrapping_sub(*last_time) <= ICON_DOUBLE_CLICK_MS
+                            *last_id == drag.primary
+                                && drag.press_time.wrapping_sub(*last_time) <= ICON_DOUBLE_CLICK_MS
                         }
                         None => false,
                     };
                     let bg = &mut self.backgrounds[i];
                     if is_double_click {
-                        bg.selected_icon = None;
+                        bg.selected_icons.clear();
                         bg.last_icon_click = None;
                     } else {
-                        bg.selected_icon = Some(drag.id.clone());
-                        bg.last_icon_click = Some((drag.id.clone(), drag.press_time));
+                        // A plain click, even on an icon that was part of a
+                        // multi-selection, collapses the selection down to
+                        // just this one -- same convention as most desktop
+                        // icon-selection models (a drag is what's needed to
+                        // move the group without disturbing it, see
+                        // IconDrag::icons' doc comment).
+                        bg.selected_icons = vec![drag.primary.clone()];
+                        bg.last_icon_click = Some((drag.primary.clone(), drag.press_time));
                     }
                     self.request_background_redraw(qh, i);
 
                     if is_double_click {
-                        self.restore_toplevel(&drag.id);
+                        self.restore_toplevel(&drag.primary);
                     }
                 }
                 PointerEventKind::Motion { .. } if panel_index.is_some() => {
@@ -3455,14 +3569,21 @@ impl PointerHandler for Olshell {
                 PointerEventKind::Press { button, .. } if on_icon_menu && button == BTN_LEFT => {
                     let selection = self.icon_menu.as_ref().and_then(|im| {
                         im.item_at(event.position.1)
-                            .map(|index| (im.toplevel_id.clone(), im.background_index, index))
+                            .map(|index| (im.toplevel_id.clone(), im.group.clone(), im.background_index, index))
                     });
-                    if let Some((toplevel_id, background_index, index)) = selection {
+                    if let Some((toplevel_id, group, background_index, index)) = selection {
                         let item = &ICON_MENU_ITEMS[index];
                         if !item.disabled {
                             match item.action {
+                                // Acts on the whole group -- just
+                                // toplevel_id unless the menu was opened on
+                                // an icon that was part of a multi-
+                                // selection (see IconMenu::group's doc
+                                // comment).
                                 IconMenuAction::Open => {
-                                    self.restore_toplevel(&toplevel_id);
+                                    for id in &group {
+                                        self.restore_toplevel(id);
+                                    }
                                 }
                                 IconMenuAction::Move => {
                                     let output = self.backgrounds[background_index].output.clone();
@@ -3471,24 +3592,30 @@ impl PointerHandler for Olshell {
                                         .iter()
                                         .find(|p| p.output == output)
                                         .map(|p| p.active_workspace);
-                                    let origin = active_workspace.and_then(|w| {
+                                    let icons = active_workspace.map(|w| {
                                         let ids = self.minimized_toplevels_for_output(&output, w);
-                                        let idx = ids.iter().position(|id| *id == toplevel_id)?;
                                         let height = self.backgrounds[background_index].height as i32;
-                                        let &(x0, y0, ..) = self.icon_layout(&ids, height).get(idx)?;
-                                        Some((x0, y0))
+                                        let rects = self.icon_layout(&ids, height);
+                                        group
+                                            .iter()
+                                            .filter_map(|gid| {
+                                                let idx = ids.iter().position(|id| id == gid)?;
+                                                let &(x0, y0, ..) = rects.get(idx)?;
+                                                Some((gid.clone(), (x0, y0)))
+                                            })
+                                            .collect::<Vec<_>>()
                                     });
-                                    if let Some(origin) = origin {
+                                    if let Some(icons) = icons.filter(|icons| !icons.is_empty()) {
                                         let bg = &mut self.backgrounds[background_index];
                                         bg.drag = Some(IconDrag {
-                                            id: toplevel_id.clone(),
+                                            primary: toplevel_id,
                                             press_time: 0,
                                             press_pos: None,
-                                            origin,
+                                            icons,
                                             dragging: true,
                                             armed: true,
                                         });
-                                        bg.selected_icon = Some(toplevel_id);
+                                        bg.selected_icons = group;
                                         self.request_background_redraw(qh, background_index);
                                     }
                                 }

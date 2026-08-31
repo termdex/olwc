@@ -819,7 +819,7 @@ with wlroots compositors generally, not just this project.
   grab, which never delivers its own confirming click to whatever's
   underneath either).
 
-  A per-icon menu is also the one place in olshell an ADJUST-click
+  ~~A per-icon menu is also the one place in olshell an ADJUST-click
   extend-selection gesture (see `docs/OPENLOOK-REFERENCE.md`'s open
   questions) would have a real surface to attach to now -- ADJUST-click
   toggling an icon in/out of a multi-selection without disturbing the
@@ -827,7 +827,31 @@ with wlroots compositors generally, not just this project.
   not built alongside the menu itself: no batch action exists yet to
   consume that selection, so it would be speculative scope with nothing
   to show for it -- still a candidate for later, now that the surface
-  for it actually exists.
+  for it actually exists.~~ resolved: `BackgroundOutput::selected_icon`
+  generalized from a single `Option<ObjectId>` to `selected_icons:
+  Vec<ObjectId>`. A plain SELECT-click still replaces it wholesale (same
+  single-icon behavior as before); ADJUST (middle-click) on an icon
+  toggles just that one icon's membership without touching the rest.
+  The batch action that selection needed to be worth building: dragging
+  an icon that's already a member of a multi-selection now moves the
+  *whole* selection together (`IconDrag::icons`, generalized the same
+  way from a single id to a Vec of `(id, origin)` pairs, one drag delta
+  applied to all of them, each clamped to the background independently);
+  MENU-clicking a member opens the icon menu scoped to the whole
+  selection (`IconMenu::group`) instead of just the clicked icon, so
+  `Open` restores every selected icon at once and `Move` arms a group
+  move. MENU-clicking an icon that *isn't* a member replaces the
+  selection with just that one first, matching a plain SELECT-click's
+  own replace behavior, so the menu's batch actions never silently act
+  on a stale selection the user didn't intend. Confirmed live, with a
+  pleasant side effect the same as `icon_position`'s own note above and
+  for the identical reason: since `selected_icons` is keyed by the
+  toplevel's ObjectId rather than tray position, restoring a whole
+  multi-selected group via the icon menu's `Open` and later re-
+  iconifying those windows individually brings them back into the tray
+  still marked as members of that same selection, rather than resetting
+  -- unplanned, but reads as expected selection permanence rather than a
+  bug.
 - ~~Icon restore gesture~~ resolved: authentic OPEN LOOK/olwm icons are
   double-click (SELECT) to restore, not single-click -- a single click
   just selects/highlights, and a real icon's own MENU-click popup
