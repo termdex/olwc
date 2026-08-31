@@ -1082,31 +1082,57 @@ with wlroots compositors generally, not just this project.
   press/motion/release handling doesn't attempt; a drag that reaches the
   edge of its starting output's background today just clamps there, the
   same as any other out-of-bounds attempt.
-- Icon thumbnail glyph: a postage-stamp-sized static screenshot of the
+- ~~Icon thumbnail glyph: a postage-stamp-sized static screenshot of the
   window, taken at the moment it's iconified, in place of the current
-  generic first-letter glyph. Not an authentic OPEN LOOK convention --
-  real OPEN LOOK/olwm icons were simple bitmap glyphs (an app-supplied
-  pixmap or a generic default), never a snapshot of window content;
-  window-thumbnail icons postdate OPEN LOOK by a couple of decades
-  (macOS Dock, Windows taskbar previews, GNOME/KDE switchers), so this
-  would be a deliberate modern departure like the workspace strip or
-  ADJUST-move-to-workspace already are, not a spec conflict, just not
-  authentic. olshell can't do the capture itself -- it only holds a
-  *foreign* toplevel handle, and Wayland deliberately gives no client
-  access to another client's buffer contents (the same restriction that
-  forced `openlook-decoration` to exist for header chrome at all) -- so
-  this needs a new olcore-side protocol request, on the model of
-  `wlr-screencopy`: read the toplevel's current texture back via
-  `wlr_surface_get_texture()`, render it into a small offscreen buffer
-  at icon resolution, and hand the result to olshell as an SHM buffer.
-  One favorable fact: minimizing in olcore is our own scene-graph
-  visibility toggle (`update_toplevel_visibility`), not a real unmap, so
-  the toplevel's texture stays live the whole time it's minimized --
-  there's no race to capture it in the one frame before it disappears.
-  Freezing it as a single static snapshot (rather than live-updating
-  content, which is a separate and harder idea -- see the "no live
-  content" gap already noted above) avoids needing an ongoing capture
-  subscription, just one readback per iconification.
+  generic first-letter glyph.~~ superseded by a different, more authentic
+  fix: a live window screenshot was never an OPEN LOOK convention (real
+  icons were simple bitmap glyphs, an app-supplied pixmap or a generic
+  default, never a snapshot of window content -- window-thumbnail icons
+  postdate OPEN LOOK by decades), and would have needed a new olcore-side
+  screencopy-style protocol just to read another client's buffer
+  contents. Using each app's own real icon in place of the generic
+  first-letter glyph gets the same practical win (a tray full of
+  identical letter tiles becomes visually distinct) *and* is the
+  authentic behavior this replaced was standing in for all along -- no
+  olcore changes needed at all, since it's resolved entirely client-side
+  from information olshell already has (`app_id`).
+
+  New `shell/src/icon_theme.rs`: `app_id` -> matching `.desktop` file
+  (exact-match search across `$XDG_DATA_HOME`/`$XDG_DATA_DIRS`) -> its
+  `Icon=` key -> resolved to an actual file via a bounded, lenient subset
+  of the freedesktop Icon Theme spec (no `index.theme` parsing or theme-
+  inheritance chains -- just a fixed list of theme roots and sizes tried
+  directly, same "lenient subset, not full reimplementation" philosophy
+  `menu.rs`'s own `.openwin-menu` parser already takes). PNG only, a new
+  `image` crate dependency (`default-features = false, features =
+  ["png"]`, a small, focused tree -- no SVG rasterizer, a much heavier
+  dependency this project's lean-toolkit ethos argued against). An app
+  with no icon of its own, or one this can't find, falls back to the
+  standard `application-x-executable` icon through the exact same
+  pipeline (no special-casing, and no licensing question the way hand-
+  picking a specific logo as the fallback would raise) -- only the
+  fallback *itself* being unfindable ever drops back to the original
+  first-letter glyph now, as an ultimate safety net.
+
+  `ICON_THEMES` searches `hicolor` (the spec's own universal fallback,
+  guaranteed on any conformant install) plus `AdwaitaLegacy`/`Adwaita`,
+  found while testing this on the project's own dev system to carry PNG
+  copies hicolor itself lacked for icons like Konsole's own
+  (`utilities-terminal`) and the `application-x-executable` fallback --
+  not a spec requirement, just an empirically useful pair. Real gap this
+  leaves, called out going in and confirmed rather than glossed over:
+  PNG-only coverage is genuinely incomplete, since many modern themes
+  (Breeze, current non-Legacy Adwaita) ship a given icon only as SVG --
+  those fall through to the generic fallback or the letter glyph rather
+  than the app's own icon. `draw_icon_image` scales uniformly to fit (an
+  app icon is almost never square, so independently stretching each axis
+  would distort it, the same reasoning `draw_glyph_bitmap` already
+  follows) and alpha-composites over the icon box's own fill color.
+  Verified end-to-end against the real filesystem (not just synthetic
+  test fixtures): resolved and rendered Konsole's actual icon, confirming
+  the whole pipeline -- desktop-entry lookup, theme resolution, PNG
+  decode, scale-to-fit, alpha-composite -- works correctly before ever
+  wiring it into a live redraw.
 - ~~Window-menu keyboard accelerators: olwm has a real "Mouseless"/menu-
   accelerator system (`clients/olwm/evbind.c`, `menu.c` in the
   historical XView/olwm source -- see the window gadget chrome entry's

@@ -137,6 +137,8 @@ use openlook_session::v1::client::zopenlook_session_manager_v1::{self, Zopenlook
 mod menu;
 use menu::{Menu, MenuNode};
 
+mod icon_theme;
+
 const PANEL_HEIGHT: u32 = 28;
 const PANEL_FONT_SIZE: f32 = 20.0;
 const PANEL_TEXT_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
@@ -173,6 +175,11 @@ const ICON_MARGIN_BOTTOM: i32 = 14;
 const ICON_LABEL_HEIGHT: i32 = 16;
 const ICON_FONT_SIZE: f32 = 13.0;
 const ICON_GLYPH_FONT_SIZE: f32 = 22.0;
+/// Padding between an icon's own border (already drawn by draw_background)
+/// and where its app icon image is actually drawn -- app icons, unlike
+/// the centered-by-font-metrics letter glyph they replace, would
+/// otherwise touch the border on their longer axis.
+const ICON_CONTENT_INSET: i32 = 5;
 const ICON_BG_COLOR: (u8, u8, u8) = DECORATION_BG_COLOR;
 const ICON_BORDER_COLOR: (u8, u8, u8) = DECORATION_BORDER_COLOR;
 const ICON_TEXT_COLOR: (u8, u8, u8) = WORKSPACE_ACTIVE_TEXT_COLOR;
@@ -974,6 +981,7 @@ fn main() {
         window_menu: None,
         icon_menu: None,
         notice: None,
+        icon_cache: std::collections::HashMap::new(),
     };
 
     while !state.exit {
@@ -1154,6 +1162,11 @@ struct Olshell {
     window_menu: Option<WindowMenu>,
     icon_menu: Option<IconMenu>,
     notice: Option<Notice>,
+    /// One app's icon, decoded and cached by app_id -- None means "looked
+    /// up, not found" (including the application-x-executable fallback
+    /// failing too), cached the same as a real find so a permanently-
+    /// missing icon isn't re-searched on every redraw. See app_icon.
+    icon_cache: std::collections::HashMap<String, Option<image::RgbaImage>>,
 }
 
 impl Olshell {
@@ -1222,6 +1235,37 @@ impl Olshell {
         panel.layer.commit();
     }
 
+    /// This app's own icon, decoded and cached by app_id -- authentic OPEN
+    /// LOOK, not a departure: real olwm/OPEN LOOK icons were app-supplied
+    /// bitmaps (X11's WM_HINTS icon pixmap), not a generic glyph, which is
+    /// what draw_background fell back to before this (and still does, for
+    /// an app this can't find anything for at all). Resolution goes
+    /// through icon_theme's lenient freedesktop lookup (.desktop's Icon=,
+    /// then the Icon Theme spec's directory conventions); on any failure
+    /// -- no .desktop file, no icon under any of the themes searched, a
+    /// corrupt file -- falls back to the standard generic
+    /// "application-x-executable" icon through that exact same pipeline,
+    /// not a special case, so only a virtually-guaranteed-broken install
+    /// (that fallback itself missing) ever returns None here.
+    fn app_icon(&mut self, app_id: &str) -> Option<&image::RgbaImage> {
+        self.icon_cache.entry(app_id.to_string()).or_insert_with(|| Self::load_app_icon(app_id)).as_ref()
+    }
+
+    fn load_app_icon(app_id: &str) -> Option<image::RgbaImage> {
+        let icon_name = icon_theme::desktop_icon_name(app_id);
+        let path = icon_name
+            .as_deref()
+            .and_then(icon_theme::find_icon_file)
+            .or_else(|| icon_theme::find_icon_file("application-x-executable"))?;
+        match image::open(&path) {
+            Ok(img) => Some(img.to_rgba8()),
+            Err(e) => {
+                log::warn!("icon: failed to decode {}: {e}", path.display());
+                None
+            }
+        }
+    }
+
     /// Draws one output's background, including its icon tray (see
     /// BackgroundOutput's doc comment on why there's one of these per
     /// output rather than a single shared one, and
@@ -1249,6 +1293,22 @@ impl Olshell {
         let icon_rects = icon_ids.as_ref().map(|ids| self.icon_layout(ids, height));
         let hovered_icon = bg.hovered_icon;
         let selected_icons = bg.selected_icons.clone();
+
+        // Ensures every icon about to be drawn is already resolved in
+        // icon_cache -- has to happen before pool.create_buffer below,
+        // since app_icon needs &mut self (to populate the cache on a
+        // miss) and the canvas returned from create_buffer holds a
+        // borrow of self.pool for the rest of this function, which
+        // would otherwise conflict with that. The drawing loop itself
+        // only ever reads icon_cache directly (a plain field access,
+        // not a method call), which doesn't conflict with canvas's
+        // borrow of the (different) pool field.
+        if let Some(icon_ids) = &icon_ids {
+            for id in icon_ids {
+                let app_id = self.toplevels[id].app_id.clone();
+                self.app_icon(&app_id);
+            }
+        }
 
         let (buffer, canvas) = self
             .pool
@@ -1286,23 +1346,44 @@ impl Olshell {
                 fill_rect(canvas, buf_width, buf_height, scale, x0, y0, x0 + 1, y1, ICON_BORDER_COLOR);
                 fill_rect(canvas, buf_width, buf_height, scale, x1 - 1, y0, x1, y1, ICON_BORDER_COLOR);
 
-                let info = &self.toplevels[id];
-                let glyph = info
-                    .app_id
-                    .chars()
-                    .next()
-                    .or_else(|| info.title.chars().next())
-                    .unwrap_or('?')
-                    .to_uppercase()
-                    .next()
-                    .unwrap();
-                let glyph_width = self.font.metrics(glyph, ICON_GLYPH_FONT_SIZE).advance_width.round() as i32;
-                draw_text_row_centered(
-                    canvas, buf_width, scale, y0, y1 - y0, x0 + (x1 - x0 - glyph_width) / 2,
-                    &glyph.to_string(), &self.font, ICON_GLYPH_FONT_SIZE, ICON_TEXT_COLOR,
-                );
+                // Owned, not borrowed from self.toplevels: app_icon below
+                // needs &mut self (to populate icon_cache on a miss),
+                // which can't happen while a borrow through self.toplevels
+                // is still alive.
+                let (app_id, title) = {
+                    let info = &self.toplevels[id];
+                    (info.app_id.clone(), info.title.clone())
+                };
 
-                let label = if info.title.is_empty() { &info.app_id } else { &info.title };
+                // A plain field read, not app_icon() -- see the pre-cache
+                // pass above for why this can't be a method call here.
+                if let Some(icon) = self.icon_cache.get(&app_id).and_then(|opt| opt.as_ref()) {
+                    draw_icon_image(
+                        canvas, buf_width, buf_height, scale,
+                        x0 + ICON_CONTENT_INSET, y0 + ICON_CONTENT_INSET,
+                        x1 - ICON_CONTENT_INSET, y1 - ICON_CONTENT_INSET,
+                        icon,
+                    );
+                } else {
+                    // Ultimate fallback if even the generic application-x-
+                    // executable icon can't be found anywhere -- the
+                    // pre-existing first-letter glyph.
+                    let glyph = app_id
+                        .chars()
+                        .next()
+                        .or_else(|| title.chars().next())
+                        .unwrap_or('?')
+                        .to_uppercase()
+                        .next()
+                        .unwrap();
+                    let glyph_width = self.font.metrics(glyph, ICON_GLYPH_FONT_SIZE).advance_width.round() as i32;
+                    draw_text_row_centered(
+                        canvas, buf_width, scale, y0, y1 - y0, x0 + (x1 - x0 - glyph_width) / 2,
+                        &glyph.to_string(), &self.font, ICON_GLYPH_FONT_SIZE, ICON_TEXT_COLOR,
+                    );
+                }
+
+                let label = if title.is_empty() { &app_id } else { &title };
                 let label_width: i32 =
                     label.chars().map(|c| self.font.metrics(c, ICON_FONT_SIZE).advance_width.round() as i32).sum();
                 let label_x = (x0 + x1) / 2 - label_width / 2;
@@ -3263,6 +3344,57 @@ fn draw_glyph_bitmap(
             canvas[idx + 1] = g;
             canvas[idx + 2] = r;
             canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
+/// Draws an app's own icon (see app_icon's doc comment) within box
+/// (x0,y0)-(x1,y1): uniformly scaled to fit (same reasoning as
+/// draw_glyph_bitmap -- an app icon is almost never exactly square, so
+/// independently stretching each axis would distort it) and centered,
+/// then alpha-composited over whatever's already in the canvas (the
+/// icon box's own fill color) pixel by pixel, the same blending math
+/// draw_text_at already uses for antialiased glyph edges.
+#[allow(clippy::too_many_arguments)]
+fn draw_icon_image(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    scale: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    image: &image::RgbaImage,
+) {
+    let (x0, y0, x1, y1) = (x0 * scale, y0 * scale, x1 * scale, y1 * scale);
+    let box_w = x1 - x0;
+    let box_h = y1 - y0;
+    if box_w <= 0 || box_h <= 0 || image.width() == 0 || image.height() == 0 {
+        return;
+    }
+    let fit = (box_w as f64 / image.width() as f64).min(box_h as f64 / image.height() as f64);
+    let dst_w = ((image.width() as f64) * fit).round().max(1.0) as u32;
+    let dst_h = ((image.height() as f64) * fit).round().max(1.0) as u32;
+    let resized = image::imageops::resize(image, dst_w, dst_h, image::imageops::FilterType::Triangle);
+    let off_x = x0 + (box_w - dst_w as i32) / 2;
+    let off_y = y0 + (box_h - dst_h as i32) / 2;
+
+    for (dx, dy, pixel) in resized.enumerate_pixels() {
+        let [r, g, b, a] = pixel.0;
+        if a == 0 {
+            continue;
+        }
+        let px = off_x + dx as i32;
+        let py = off_y + dy as i32;
+        if px < 0 || py < 0 || px >= canvas_width || py >= canvas_height {
+            continue;
+        }
+        let idx = ((py * canvas_width + px) * 4) as usize;
+        let a = a as u32;
+        for (i, fg) in [b, g, r].into_iter().enumerate() {
+            let bg = canvas[idx + i] as u32;
+            canvas[idx + i] = ((fg as u32 * a + bg * (255 - a)) / 255) as u8;
         }
     }
 }
