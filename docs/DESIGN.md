@@ -617,6 +617,42 @@ with wlroots compositors generally, not just this project.
   (colors, spacing, shapes) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
+- Settings GUI tool: several things olwc already supports or has flagged
+  as a real decision have no user-facing way to change them at all today
+  -- worth a proper Settings app once enough of them exist to justify one,
+  the way Plasma/GNOME each have. Candidates already identified: output
+  scale (the HiDPI entry below only has a startup-only debug env var,
+  `OLC_TEST_OUTPUT_SCALE` -- there's no protocol-level way to change a
+  real monitor's scale/resolution/position at runtime at all yet, dev
+  knob or not; that needs olcore to implement `wlr-output-management-
+  unstable-v1`, the standard wlroots protocol for exactly this, before a
+  Displays pane could do anything), workspace count (`OLC_WORKSPACE_COUNT`
+  in `core/main.c` is a compile-time `#define`, not configurable), cursor
+  theme/size (`wlr_xcursor_manager_create(NULL, 24)` in `core/main.c`
+  hardcodes both), the ADJUST-button mapping question (three-button-as-is
+  vs. modifier+click for modern hardware, still open in
+  `docs/OPENLOOK-REFERENCE.md`), theming (see the entry above), and
+  window-menu keyboard accelerators (see that entry below) once built.
+  Root-menu contents (`.openwin-menu`) deliberately left off this list --
+  that's a config file by design, same as i3/sway, not obviously a GUI
+  settings item.
+
+  Toolkit choice for building it: lean toward growing olshell's own
+  drawing primitives and widget vocabulary (the OLGlyph button/pushpin/
+  arrow tracings, obround/beveled chrome, menu/popup click-and-hover
+  handling) into a small shared crate, rather than adopting GTK or Qt --
+  neither looks like OPEN LOOK out of the box (Adwaita or a modern QStyle
+  would need heavy re-theming to get obround buttons and top-left-light/
+  bottom-right-dark bevels back), and both pull a large dependency graph
+  into a codebase that's been deliberately lean everywhere else (fontdue
+  instead of a full text-shaping stack, hand-rolled pixel drawing instead
+  of Cairo/Skia). olshell has already organically grown a good chunk of a
+  minimal toolkit to get its own chrome right; finishing that internally
+  -- an informal "libolgx-in-Rust" underneath both olshell and a future
+  Settings app, the same relationship real OPEN LOOK's `libolgx` had to
+  every application built on it -- is less total work than re-fighting a
+  borrowed one, and keeps every future app visually consistent with the
+  compositor's own look for free.
 - ~~HiDPI / output scale support: `CompositorHandler::scale_factor_changed`
   (`shell/src/main.rs`) is currently a no-op stub -- every surface olshell
   draws renders at 1x regardless of the output's real scale.~~ resolved:
