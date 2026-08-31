@@ -769,6 +769,11 @@ impl WorkspaceSubmenu {
 /// pinned per output (or several on the same one) at once.
 struct MenuPopup {
     layer: LayerSurface,
+    /// Which output this popup was opened on -- needed by the Exit...
+    /// item to know which output to center the confirmation Notice on
+    /// (see open_notice), since a Notice has no click position of its own
+    /// to anchor to the way this popup did.
+    output: wl_output::WlOutput,
     items: Vec<MenuNode>,
     title: Option<String>,
     width: u32,
@@ -821,6 +826,72 @@ impl MenuPopup {
         }
         let row = ((y - header_h) / MENU_ROW_HEIGHT as f64) as usize;
         (row < self.items.len()).then_some(row)
+    }
+}
+
+// Authentic OPEN LOOK, confirmed from source: real olwm's Exit... item
+// (services.c's ExitFunc) shows exactly this message and these two
+// buttons, Cancel as the safe default -- see Notice's own doc comment.
+const NOTICE_MESSAGE: &str = "Please confirm exit from window system";
+const NOTICE_BUTTONS: &[&str] = &["Exit", "Cancel"];
+const NOTICE_DEFAULT_BUTTON: usize = 1;
+/// Margin between the Notice's outer beveled frame and its content.
+const NOTICE_PADDING: i32 = 16;
+/// Thickness of the Notice's own outer bevel frame -- unlike the menu
+/// popups (which have no frame at all), a Notice is meant to read as its
+/// own distinct "boxed" element, matching real olwm's `olgx_draw_box`
+/// frame (simplified here to one bevel layer rather than the original's
+/// nested chiseled double-box).
+const NOTICE_BORDER_WIDTH: i32 = 3;
+const NOTICE_BUTTON_GAP: i32 = 16;
+const NOTICE_BUTTON_VGAP: i32 = 20;
+const NOTICE_BUTTON_HEIGHT: i32 = MENU_ROW_HEIGHT;
+const NOTICE_BUTTON_H_PADDING: i32 = 16;
+
+/// OPEN LOOK's "Notice" widget (see the widget vocabulary table: "used
+/// specifically for short, must-acknowledge messages"), currently used
+/// only for confirming the root menu's Exit... item -- see
+/// NOTICE_MESSAGE's doc comment for the authentic source behind its
+/// exact wording and buttons. A real wlr-layer-shell top-level surface
+/// (`Layer::Overlay`), not a subsurface -- unlike the window/icon menus,
+/// a Notice isn't tied to any particular decoration or icon to hang off
+/// of. Deliberately given no anchor at all when created (see open_notice)
+/// -- wlr-layer-shell centers an unanchored surface on its output for
+/// free, which is exactly where a modal confirmation belongs, with none
+/// of the pixel-precise "under the click" positioning math the root menu
+/// itself needs.
+///
+/// Modal: pointer_frame swallows every pointer event that isn't on this
+/// surface while one is open (see its own pre-check, mirroring the armed-
+/// icon-drag swallow-check above it), and Escape/Return both dismiss it
+/// without acting -- authentic, since Cancel (NOTICE_DEFAULT_BUTTON) is
+/// the default button a real Notice's own Return-key handling
+/// (`ACTION_EXEC_DEFAULT`) would trigger anyway.
+struct Notice {
+    layer: LayerSurface,
+    width: u32,
+    height: u32,
+    scale: i32,
+    /// SELECT is down on this button and the pointer is still over it --
+    /// drawn in the recessed/invoked state until Release, matching
+    /// olwm's own drawButton(OLGX_INVOKED) while a notice button is held.
+    /// No separate hover-highlight state deliberately: real olwm's own
+    /// noticeInterposer only ever changes a button's appearance on press/
+    /// release (or keyboard focus, in Mouseless mode, which olshell
+    /// doesn't implement), never on plain mouse-over.
+    pressed: Option<usize>,
+    /// (x0, y0, x1, y1) for each of NOTICE_BUTTONS, computed once in
+    /// open_notice and shared by drawing and hit-testing (same pattern
+    /// icon_layout/workspace_segment_x already use elsewhere) -- static
+    /// once the Notice is sized, unlike an icon's position, so there's no
+    /// need to recompute this on every draw or click the way those do.
+    button_rects: Vec<(i32, i32, i32, i32)>,
+}
+
+impl Notice {
+    fn button_at(&self, x: f64, y: f64) -> Option<usize> {
+        let (x, y) = (x as i32, y as i32);
+        self.button_rects.iter().position(|&(x0, y0, x1, y1)| x >= x0 && x < x1 && y >= y0 && y < y1)
     }
 }
 
@@ -902,6 +973,7 @@ fn main() {
         popups: Vec::new(),
         window_menu: None,
         icon_menu: None,
+        notice: None,
     };
 
     while !state.exit {
@@ -1081,6 +1153,7 @@ struct Olshell {
     popups: Vec<MenuPopup>,
     window_menu: Option<WindowMenu>,
     icon_menu: Option<IconMenu>,
+    notice: Option<Notice>,
 }
 
 impl Olshell {
@@ -2053,7 +2126,17 @@ impl Olshell {
         layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
         layer.commit();
 
-        self.popups.push(MenuPopup { layer, items, title, width, height, scale: 1, hovered: None, pinned: false });
+        self.popups.push(MenuPopup {
+            layer,
+            output: output.clone(),
+            items,
+            title,
+            width,
+            height,
+            scale: 1,
+            hovered: None,
+            pinned: false,
+        });
     }
 
     /// Closes one popup by index. Just drops it -- sctk's LayerSurface::Drop
@@ -2069,6 +2152,119 @@ impl Olshell {
         if self.keyboard_focus.as_ref() == Some(popup.layer.wl_surface()) {
             self.keyboard_focus = None;
         }
+    }
+
+    /// Opens the Exit... confirmation Notice, centered on `output` -- see
+    /// Notice's own doc comment for why no anchor is set at all. A no-op
+    /// if one's already open (there's only ever one thing to confirm
+    /// right now, so this shouldn't be reachable, but replacing it out
+    /// from under an in-progress confirmation would be a worse failure
+    /// mode than just ignoring the second request).
+    fn open_notice(&mut self, qh: &QueueHandle<Self>, output: &wl_output::WlOutput) {
+        if self.notice.is_some() {
+            return;
+        }
+
+        let message_width: i32 =
+            NOTICE_MESSAGE.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum();
+        let button_label_width = |label: &str| -> i32 {
+            label.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum()
+        };
+        let button_widths: Vec<i32> =
+            NOTICE_BUTTONS.iter().map(|label| button_label_width(label) + NOTICE_BUTTON_H_PADDING * 2).collect();
+        let total_button_width: i32 =
+            button_widths.iter().sum::<i32>() + NOTICE_BUTTON_GAP * (NOTICE_BUTTONS.len() as i32 - 1);
+
+        let content_width = message_width.max(total_button_width);
+        let width = (content_width + (NOTICE_PADDING + NOTICE_BORDER_WIDTH) * 2).max(200) as u32;
+        let message_row_height = MENU_FONT_SIZE.ceil() as i32;
+        let height = (message_row_height + NOTICE_BUTTON_VGAP + NOTICE_BUTTON_HEIGHT
+            + (NOTICE_PADDING + NOTICE_BORDER_WIDTH) * 2) as u32;
+
+        // Buttons form one centered row below the message -- same
+        // reasoning as drawNoticeBox's own buttonX/buttonY math.
+        let button_row_y0 = height as i32 - NOTICE_BORDER_WIDTH - NOTICE_PADDING - NOTICE_BUTTON_HEIGHT;
+        let mut button_x = (width as i32 - total_button_width) / 2;
+        let button_rects: Vec<(i32, i32, i32, i32)> = button_widths
+            .iter()
+            .map(|&w| {
+                let rect = (button_x, button_row_y0, button_x + w, button_row_y0 + NOTICE_BUTTON_HEIGHT);
+                button_x += w + NOTICE_BUTTON_GAP;
+                rect
+            })
+            .collect();
+
+        let surface = self.compositor.create_surface(qh);
+        let layer =
+            self.layer_shell.create_layer_surface(qh, surface, Layer::Overlay, Some("olshell-notice"), Some(output));
+        layer.set_size(width, height);
+        // No anchor at all -- see Notice's own doc comment on why that's
+        // what centers this on the output.
+        layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
+        layer.commit();
+
+        self.notice = Some(Notice { layer, width, height, scale: 1, pressed: None, button_rects });
+    }
+
+    fn close_notice(&mut self) {
+        if let Some(notice) = self.notice.take() {
+            if self.keyboard_focus.as_ref() == Some(notice.layer.wl_surface()) {
+                self.keyboard_focus = None;
+            }
+        }
+    }
+
+    fn draw_notice(&mut self) {
+        let Some(notice) = self.notice.as_ref() else {
+            return;
+        };
+        let width = notice.width as i32;
+        let height = notice.height as i32;
+        let scale = notice.scale;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+
+        let (r, g, b) = MENU_BG_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+
+        // Outer beveled frame -- see NOTICE_BORDER_WIDTH's doc comment on
+        // why this is one bevel layer rather than real olwm's nested
+        // chiseled double-box. Raised (light top/left, dark bottom/
+        // right), same convention as everywhere else in olshell's chrome.
+        let bw = NOTICE_BORDER_WIDTH;
+        fill_rect(canvas, buf_width, buf_height, scale, 0, 0, width, bw, DECORATION_BEVEL_LIGHT);
+        fill_rect(canvas, buf_width, buf_height, scale, 0, 0, bw, height, DECORATION_BEVEL_LIGHT);
+        fill_rect(canvas, buf_width, buf_height, scale, 0, height - bw, width, height, DECORATION_BEVEL_DARK);
+        fill_rect(canvas, buf_width, buf_height, scale, width - bw, 0, width, height, DECORATION_BEVEL_DARK);
+
+        // Message, left-aligned near the top -- matches drawNoticeBox's
+        // own "REMIND: all strings are along the left edge" layout.
+        draw_text_row_centered(
+            canvas, buf_width, scale, NOTICE_PADDING + NOTICE_BORDER_WIDTH, MENU_FONT_SIZE.ceil() as i32,
+            NOTICE_PADDING + NOTICE_BORDER_WIDTH, NOTICE_MESSAGE, &self.font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
+        );
+
+        for (i, &(x0, y0, x1, y1)) in notice.button_rects.iter().enumerate() {
+            let pressed = notice.pressed == Some(i);
+            draw_button(canvas, buf_width, buf_height, scale, x0, y0, x1, y1, NOTICE_BUTTONS[i], &self.font, pressed);
+        }
+
+        let wl_surface = notice.layer.wl_surface();
+        buffer.attach_to(wl_surface).expect("failed to attach buffer");
+        wl_surface.set_buffer_scale(scale);
+        wl_surface.damage_buffer(0, 0, buf_width, buf_height);
+        notice.layer.commit();
     }
 
     /// The toplevel whose decoration surface `surface` is, if any.
@@ -2878,6 +3074,11 @@ fn blit_bitmap(
 /// on bottom, i.e. recessed/inset, the same convention
 /// DECORATION_BEVEL_DARK/_LIGHT already use for a focused header.
 #[allow(clippy::too_many_arguments)]
+/// Menu-item hover highlight: the recessed/"invoked" coloring
+/// (`OLGX_INVOKED`'s `BG3` top/`WHITE` bottom/`BG2` fill) `olgx_draw_
+/// accel_button` uses, via the same shared `draw_pill` a real standalone
+/// button (see draw_button below, used by the Notice's own buttons) draws
+/// with too -- see draw_pill's doc comment for the shape itself.
 fn draw_pill_highlight(
     canvas: &mut [u8],
     canvas_width: i32,
@@ -2887,6 +3088,35 @@ fn draw_pill_highlight(
     y0: i32,
     x1: i32,
     y1: i32,
+) {
+    draw_pill(
+        canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1,
+        DECORATION_BEVEL_DARK, DECORATION_BEVEL_LIGHT, MENU_HOVER_COLOR,
+    );
+}
+
+/// The obround (pill) shape shared by the menu-item hover highlight above
+/// and a real standalone button (draw_button, below) -- both are
+/// `olgx_draw_button`/`olgx_draw_accel_button` in real OPEN LOOK, the same
+/// stretchable-glyph composite, just with different colors for different
+/// states (raised/unpressed vs. recessed/invoked) and, for a menu-item
+/// highlight, with a caller-drawn label rather than one centered inside
+/// the shape itself. See PILL_LEFT_TOP_ARC's doc comment for what each
+/// layer actually traces and why three separate colors compose into one
+/// shape.
+#[allow(clippy::too_many_arguments)]
+fn draw_pill(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    scale: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    top_color: (u8, u8, u8),
+    bottom_color: (u8, u8, u8),
+    fill_color: (u8, u8, u8),
 ) {
     let tiles = (x1 - x0 - 2 * PILL_ENDCAP_WIDTH).max(0);
     // Centering purely on PILL_HEIGHT within the row leaves the pill
@@ -2905,23 +3135,63 @@ fn draw_pill_highlight(
     let y = y0 + ((y1 - y0) - PILL_HEIGHT) / 2 + PILL_VERTICAL_BIAS;
     let right_x = x0 + PILL_ENDCAP_WIDTH + tiles;
 
-    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_TOP_ARC, DECORATION_BEVEL_DARK);
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_TOP_ARC, top_color);
     for i in 0..tiles {
-        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_TOP_TILE, DECORATION_BEVEL_DARK);
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_TOP_TILE, top_color);
     }
-    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_TOP_ARC, DECORATION_BEVEL_DARK);
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_TOP_ARC, top_color);
 
-    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_BOTTOM_ARC, DECORATION_BEVEL_LIGHT);
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_BOTTOM_ARC, bottom_color);
     for i in 0..tiles {
-        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_BOTTOM_TILE, DECORATION_BEVEL_LIGHT);
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_BOTTOM_TILE, bottom_color);
     }
-    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_BOTTOM_ARC, DECORATION_BEVEL_LIGHT);
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_BOTTOM_ARC, bottom_color);
 
-    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_FILL, MENU_HOVER_COLOR);
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_FILL, fill_color);
     for i in 0..tiles {
-        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_FILL_TILE, MENU_HOVER_COLOR);
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_FILL_TILE, fill_color);
     }
-    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_FILL, MENU_HOVER_COLOR);
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_FILL, fill_color);
+}
+
+/// A standalone clickable button, the "oblong button" from the widget
+/// vocabulary table -- unlike draw_pill_highlight (a highlight drawn
+/// *under* a label the caller draws separately, left-aligned), this draws
+/// its own label centered inside the shape, and its coloring reflects
+/// pressed state rather than always being the recessed/invoked look:
+/// raised (light top/dark bottom) unless `pressed`, matching the same
+/// raised-unless-invoked convention used throughout olshell's chrome
+/// (see the window decoration header's own focus-bevel paragraph in
+/// docs/DESIGN.md). Currently only the Notice's Exit/Cancel buttons use
+/// this; MENU_BG_COLOR as the normal fill blends into the Notice's own
+/// background, reading as a raised bump on it, matching real OPEN LOOK's
+/// `OLGX_BG1` fill for a normal (non-menu-item) button.
+#[allow(clippy::too_many_arguments)]
+fn draw_button(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    scale: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+    label: &str,
+    font: &fontdue::Font,
+    pressed: bool,
+) {
+    let (top_color, bottom_color, fill_color) = if pressed {
+        (DECORATION_BEVEL_DARK, DECORATION_BEVEL_LIGHT, MENU_HOVER_COLOR)
+    } else {
+        (DECORATION_BEVEL_LIGHT, DECORATION_BEVEL_DARK, MENU_BG_COLOR)
+    };
+    draw_pill(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, top_color, bottom_color, fill_color);
+    let label_width: i32 =
+        label.chars().map(|c| font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum();
+    let label_x = x0 + ((x1 - x0) - label_width) / 2;
+    draw_text_row_centered(
+        canvas, canvas_width, scale, y0, y1 - y0, label_x, label, font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
+    );
 }
 
 /// Renders one of the bitmaps above into box (x0,y0)-(x1,y1): scaled
@@ -3383,6 +3653,8 @@ impl LayerShellHandler for Olshell {
             }
         } else if let Some(index) = self.popup_at(layer.wl_surface()) {
             self.close_menu(index);
+        } else if self.notice.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
+            self.close_notice();
         }
     }
 
@@ -3417,6 +3689,21 @@ impl LayerShellHandler for Olshell {
                 popup.height = configure.new_size.1;
             }
             draw_popup(&mut self.pool, &self.font, popup);
+        } else if self.notice.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
+            // button_rects were computed from the size we requested in
+            // open_notice and stay valid as long as the compositor just
+            // echoes it back, which wlr-layer-shell always does for an
+            // explicitly-sized surface like this one -- width/height are
+            // updated defensively, but nothing recomputes button_rects.
+            if let Some(notice) = self.notice.as_mut() {
+                if configure.new_size.0 > 0 {
+                    notice.width = configure.new_size.0;
+                }
+                if configure.new_size.1 > 0 {
+                    notice.height = configure.new_size.1;
+                }
+            }
+            self.draw_notice();
         }
     }
 }
@@ -3493,6 +3780,17 @@ impl PointerHandler for Olshell {
                 .and_then(|wm| wm.workspace_submenu.as_ref())
                 .is_some_and(|sm| event.surface == sm.surface);
             let on_icon_menu = self.icon_menu.as_ref().is_some_and(|im| event.surface == im.surface);
+            let on_notice = self.notice.as_ref().is_some_and(|n| event.surface == *n.layer.wl_surface());
+
+            // A Notice is modal (see its own doc comment) -- while one's
+            // open, every pointer event on any other surface is swallowed
+            // outright, before any of the usual per-surface handling below
+            // even runs. Checked ahead of the armed-drag/window-menu/icon-
+            // menu pre-steps below too, since none of those should still
+            // react to a click while a confirmation is pending either.
+            if self.notice.is_some() && !on_notice {
+                continue;
+            }
             // Captured before the "click elsewhere closes it" step below
             // clears it, so the button-click handler can tell a second
             // click on the button that opened this exact menu (which
@@ -4135,6 +4433,51 @@ impl PointerHandler for Olshell {
                     }
                     self.close_icon_menu();
                 }
+                // Mouse-over alone never changes a notice button's
+                // appearance in real olwm (see Notice::pressed's doc
+                // comment) -- this only matters while a button is already
+                // held (`pressed.is_some()`), to cancel the press if the
+                // pointer leaves it before Release, matching
+                // noticeInterposer's own MotionNotify handling.
+                PointerEventKind::Motion { .. } if on_notice => {
+                    if let Some(notice) = self.notice.as_mut() {
+                        if let Some(pressed) = notice.pressed {
+                            if notice.button_at(event.position.0, event.position.1) != Some(pressed) {
+                                notice.pressed = None;
+                                self.draw_notice();
+                            }
+                        }
+                    }
+                }
+                PointerEventKind::Press { button, .. } if on_notice && button == BTN_LEFT => {
+                    if let Some(notice) = self.notice.as_mut() {
+                        if let Some(index) = notice.button_at(event.position.0, event.position.1) {
+                            notice.pressed = Some(index);
+                            self.draw_notice();
+                        }
+                    }
+                }
+                // Only a button that's still depressed (pressed.is_some())
+                // and still under the pointer counts as clicked, matching
+                // noticeInterposer's own ButtonRelease handling -- Motion
+                // above already cleared `pressed` if the pointer left the
+                // button first, so reaching here with a match means this
+                // release really did land on the same button it started
+                // on.
+                PointerEventKind::Release { button, .. } if on_notice && button == BTN_LEFT => {
+                    let selection = self.notice.as_ref().and_then(|notice| {
+                        let index = notice.button_at(event.position.0, event.position.1)?;
+                        (notice.pressed == Some(index)).then_some(index)
+                    });
+                    if let Some(0) = selection {
+                        if let Some(manager) = self.session_manager.as_ref() {
+                            manager.exit();
+                        }
+                    }
+                    if selection.is_some() {
+                        self.close_notice();
+                    }
+                }
                 PointerEventKind::Motion { .. } if on_workspace_submenu => {
                     let changed = if let Some(sm) =
                         self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
@@ -4200,7 +4543,7 @@ impl PointerHandler for Olshell {
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
                     let mut command_to_run = None;
-                    let mut exit_requested = false;
+                    let mut exit_requested_on = None;
                     let mut close_index = None;
 
                     if let Some(i) = popup_index {
@@ -4226,7 +4569,7 @@ impl PointerHandler for Olshell {
                                     log::info!("root menu: submenus aren't interactive yet");
                                 }
                                 MenuNode::Exit { .. } => {
-                                    exit_requested = true;
+                                    exit_requested_on = Some(popup.output.clone());
                                 }
                             }
                             if !popup.pinned {
@@ -4249,13 +4592,12 @@ impl PointerHandler for Olshell {
                     if let Some(command) = command_to_run {
                         Self::run_command(&command);
                     }
-                    // No confirmation Notice yet (see MenuNode::Exit's doc
-                    // comment) -- olcore terminates the whole session the
-                    // moment this arrives, no second chance.
-                    if exit_requested {
-                        if let Some(manager) = self.session_manager.as_ref() {
-                            manager.exit();
-                        }
+                    // Doesn't terminate anything itself -- opens the
+                    // confirmation Notice (see its own doc comment), which
+                    // is what actually sends session_manager.exit() if its
+                    // Exit button is clicked.
+                    if let Some(output) = exit_requested_on {
+                        self.open_notice(qh, &output);
                     }
                     if let Some(i) = close_index {
                         self.close_menu(i);
@@ -4329,6 +4671,28 @@ impl KeyboardHandler for Olshell {
                 }
             } else if self.icon_menu.as_ref().is_some_and(|im| im.surface == *surface) {
                 self.close_icon_menu();
+            } else if self.notice.as_ref().is_some_and(|n| *n.layer.wl_surface() == *surface) {
+                // Matches ACTION_CANCEL in noticeInterposer -- dismisses
+                // without acting, same as Return does just below (since
+                // NOTICE_DEFAULT_BUTTON is Cancel here too).
+                self.close_notice();
+            }
+        } else if event.keysym == Keysym::Return {
+            // Matches ACTION_EXEC_DEFAULT in noticeInterposer: Return
+            // always triggers the *default* button, not necessarily the
+            // one being hovered/pressed -- NOTICE_DEFAULT_BUTTON is
+            // Cancel, so this just dismisses, same as Escape.
+            if self
+                .keyboard_focus
+                .as_ref()
+                .is_some_and(|surface| self.notice.as_ref().is_some_and(|n| n.layer.wl_surface() == surface))
+            {
+                if NOTICE_DEFAULT_BUTTON == 0 {
+                    if let Some(manager) = self.session_manager.as_ref() {
+                        manager.exit();
+                    }
+                }
+                self.close_notice();
             }
         }
     }

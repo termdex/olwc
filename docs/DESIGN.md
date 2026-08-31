@@ -637,16 +637,45 @@ with wlroots compositors generally, not just this project.
   `toggle_sticky`, rather than one generic "session action" request with
   a string/enum argument.
 
-  Deliberately not built alongside this: a confirmation Notice before
-  actually exiting. The `...` in "Exit..." is itself OPEN LOOK's own
-  convention for "this shows a confirmation" (see the widget vocabulary
-  table's `Notice` entry -- "used specifically for short, must-
-  acknowledge messages"), and real olwm did show one, but building an
-  actual modal confirmation means implementing that widget type from
-  scratch, which nothing in olshell needs yet -- selecting "Exit..." for
-  now terminates the session immediately, no second chance. Worth
-  building once a Notice is needed for anything else too, rather than a
-  one-off modal built just for this.
+  ~~Deliberately not built alongside this: a confirmation Notice before
+  actually exiting.~~ resolved: the `...` in "Exit..." is itself OPEN
+  LOOK's own convention for "this shows a confirmation" (see the widget
+  vocabulary table's `Notice` entry -- "used specifically for short,
+  must-acknowledge messages"), and confirmed from source
+  (`clients/olwm/notice.c`, `services.c`'s `ExitFunc`) that real olwm's
+  own Exit confirmation shows exactly the message "Please confirm exit
+  from window system" with `Exit`/`Cancel` buttons, `Cancel` the safe
+  default -- used verbatim. `open_notice`/`draw_notice`
+  (`shell/src/main.rs`) build a real `Notice` (a genuine wlr-layer-shell
+  top-level surface, not a subsurface -- unlike the window/icon menus, a
+  Notice isn't tied to any decoration or icon to hang off of; deliberately
+  given no anchor at all, which is what centers it on the output for
+  free, and `Exclusive` keyboard interactivity for focus). Fully modal:
+  `pointer_frame` swallows every pointer event on any other surface while
+  one's open (mirroring the armed-icon-drag swallow-check's own
+  precedent), and Escape/Return both dismiss without acting, matching
+  `NOTICE_DEFAULT_BUTTON` being `Cancel`.
+
+  The Notice's buttons turned out to be a natural second use for the
+  pill-tiling machinery the menu-item highlight entry above already
+  built: real OPEN LOOK's standalone "oblong button" and its menu-item
+  highlight are the same `olgx_draw_button`/`olgx_draw_accel_button`
+  composite, just different colors and, for a real button, a centered
+  label instead of one the caller draws separately. `draw_pill_highlight`
+  is now a thin wrapper around a colors-parameterized `draw_pill`, and a
+  new `draw_button` draws a real clickable button on top of it (raised,
+  light-top/dark-bottom, unless pressed, matching the same raised-unless-
+  invoked convention used throughout olshell's chrome) -- confirmed by
+  rendering the whole Notice directly through the actual drawing
+  primitives before wiring up live interaction, the same self-
+  verification technique the pill-centering bug used.
+
+  One deliberate simplification, not full fidelity: real olwm's frame is
+  a nested "chiseled" double `olgx_draw_box` (a recessed outer box around
+  a raised inner one); the Notice here uses a single bevel layer instead
+  -- distinct enough to read as its own "boxed" element (no existing
+  olshell popup has a frame at all), without needing a second widget-
+  drawing technique built just for one dialog's border.
 
   Raised the broader question of Sleep/Shutdown/Restart/Session actions
   (KDE-style, not an OPEN LOOK convention at all) -- deliberately kept

@@ -29,12 +29,14 @@ pub enum MenuNode {
     // exactly a Programs submenu and this, "Exit..." (confirmed from
     // source, clients/olwm/openwin-menu in the historical XView/olwm tree
     // -- see docs/OPENLOOK-REFERENCE.md for where that source lives).
-    // Selecting it asks olcore to terminate the whole compositor session
-    // (openlook-session-unstable-v1's exit request) -- the Wayland-native
-    // equivalent of Exit terminating olwm itself, which (as the X
-    // session's leader) normally returned to a display manager. Distinct
-    // from Item since it isn't a shell command olshell spawns; olcore
-    // does the actual work.
+    // Selecting it opens a confirmation Notice (see Notice's own doc
+    // comment in shell/src/main.rs), which is what actually asks olcore
+    // to terminate the whole compositor session
+    // (openlook-session-unstable-v1's exit request) if confirmed -- the
+    // Wayland-native equivalent of Exit terminating olwm itself, which
+    // (as the X session's leader) normally returned to a display
+    // manager. Distinct from Item since it isn't a shell command olshell
+    // spawns; olcore does the actual work.
     Exit { label: String },
 }
 
