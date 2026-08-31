@@ -686,6 +686,55 @@ with wlroots compositors generally, not just this project.
   olcore doesn't implement at all yet -- switching users is a bigger
   scope still (VT switching plus spawning another greeter), likely out of
   scope for a project this size rather than a near-term to-do.
+- ~~Workspace switcher as a persistent full-width edge bar~~ resolved: the
+  most visibly non-authentic piece of chrome left in olwc, on reflection
+  -- a permanent screen-edge strip reserving space (`set_exclusive_zone`)
+  is a GNOME/Windows-taskbar-era convention, not an OPEN LOOK one at all.
+  `WorkspacePanel` is now a small floating palette instead: sized to its
+  own content (`workspace_count` segments) rather than the output's
+  width, anchored to just the top-left corner rather than spanning
+  `TOP|LEFT|RIGHT`, and carrying no exclusive zone at all -- windows get
+  the full output underneath it now. The closer authentic precedent,
+  confirmed from source (`clients/olvwm-4.1/olvwm.man`): olvwm's own VDM
+  (Virtual Desktop Manager) was a real, freely positionable window
+  (`VirtualGeometry`, default `+0+0`, used as this palette's own default
+  position) and even iconifiable (`VirtualIconGeometry`) -- a spatial
+  panner over a 2D virtual desktop (`VirtualDesktop` defaults to `3x2`
+  screens), not a linear workspace list, so the *content* doesn't map
+  over (olwc deliberately kept its own linear, per-output workspace
+  model, established when multi-monitor support was built above), but
+  the *presentation* -- a small, movable palette, not edge-docked chrome
+  -- does.
+
+  Draggable: SELECT-press-and-drag anywhere on it repositions the whole
+  palette, reusing the exact same click-vs-drag ambiguous-until-
+  threshold pattern already established for icon dragging (`PanelDrag`,
+  `shell/src/main.rs`), clamped to stay fully on the output. A plain
+  click (released before crossing the threshold) still switches
+  workspace, unchanged; ADJUST-click (move the focused window to a
+  segment) is untouched either way. One real subtlety a moving *surface*
+  creates that a moving *icon* (drawn within an unmoving background
+  surface) never had to deal with: each motion event's own coordinates
+  are reported local to wherever the surface currently is, which keeps
+  changing mid-drag as this very gesture repositions it -- comparing
+  local coordinates directly across events, the way icon dragging safely
+  can, would be wrong here. Fixed by converting each event's local
+  position to output-absolute coordinates *using the panel's position as
+  of that specific event* (always correct, since that's what the
+  compositor actually used to compute it) before doing the same origin-
+  plus-total-delta math icon dragging already does.
+
+  Confirmed live: a screenshot shows the palette rendering as a compact
+  box near the corner rather than the old full-width strip, with the
+  background filling the whole output beneath it. Dragging itself needs
+  a live hand to test (no synthetic pointer input available), so that
+  part is unverified beyond the code and math above.
+
+  Deliberately not built alongside this: any visual frame/border to read
+  more distinctly as "a little window" the way the Exit confirmation
+  Notice's own beveled frame does -- right now it's still just a bare
+  cluster of squares, floating. Worth a follow-up if the bare-squares
+  look doesn't feel enough like a window once seen dragged around live.
 - Settings GUI tool: several things olwc already supports or has flagged
   as a real decision have no user-facing way to change them at all today
   -- worth a proper Settings app once enough of them exist to justify one,

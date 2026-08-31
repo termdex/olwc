@@ -197,6 +197,7 @@ const ICON_DOUBLE_CLICK_MS: u32 = 400;
 // this, a press-then-release is a click (select or double-click-restore);
 // at or past it, the icon follows the pointer instead.
 const ICON_DRAG_THRESHOLD: f64 = 4.0;
+const PANEL_DRAG_THRESHOLD: f64 = 4.0;
 
 const MENU_FONT_SIZE: f32 = 18.0;
 const MENU_ROW_HEIGHT: i32 = 26;
@@ -1000,6 +1001,20 @@ fn main() {
 /// workspace_count/active_workspace/hovered_workspace -- all the state
 /// that used to be flat fields on Olshell itself back when there was
 /// only ever one panel.
+/// The workspace switcher -- a small floating, freely-repositionable
+/// palette rather than a persistent full-width edge bar (see the doc
+/// comment on the earlier design's own DESIGN.md entry). Sized to its own
+/// content (workspace_count segments), not the output's width, and
+/// carries no exclusive zone at all -- windows get the full output
+/// underneath it, since a permanent screen-edge reservation was never an
+/// OPEN LOOK convention in the first place, just a later (GNOME/Windows-
+/// taskbar-era) one. The closer authentic precedent is olvwm's own VDM
+/// (Virtual Desktop Manager): confirmed from source
+/// (`clients/olvwm-4.1/olvwm.man`) that it was a real, freely
+/// positionable window (`VirtualGeometry`, default `+0+0`) -- a spatial
+/// panner over a 2D virtual desktop, not a linear workspace list, so the
+/// content itself doesn't map over, but the *presentation* (a small,
+/// movable palette, not edge-docked chrome) does.
 struct WorkspacePanel {
     output: wl_output::WlOutput,
     layer: LayerSurface,
@@ -1008,9 +1023,43 @@ struct WorkspacePanel {
     height: u32,
     /// Integer buffer_scale, updated by scale_factor_changed.
     scale: i32,
+    /// Background-surface-local top-left position -- the layer surface's
+    /// own `Anchor::TOP|LEFT` position is expressed via `set_margin`,
+    /// kept in sync with this by every place that changes it. Starts
+    /// near the top-left corner, the closest equivalent to real olvwm's
+    /// own `VirtualGeometry` default of `+0+0`.
+    position: (i32, i32),
+    /// SELECT is down on the palette and we're still deciding whether
+    /// this is a plain click (switch workspace, unchanged from before)
+    /// or a drag (reposition the whole palette) -- same ambiguous-
+    /// until-threshold pattern IconDrag already established for icons.
+    drag: Option<PanelDrag>,
     workspace_count: u32,
     active_workspace: u32,
     hovered_workspace: Option<u32>,
+}
+
+/// See WorkspacePanel::drag's doc comment.
+#[derive(Clone, Copy)]
+struct PanelDrag {
+    /// Pointer position in output-absolute coordinates (background-
+    /// surface-local, since the background is fullscreen on its own
+    /// output) at the moment of press -- computed by adding the press
+    /// event's own surface-local position to the panel's position as of
+    /// then. This sidesteps a real subtlety a moving surface creates:
+    /// each subsequent motion event is reported local to wherever the
+    /// surface *currently* is, which keeps changing as this very drag
+    /// repositions it, so comparing local coordinates directly across
+    /// events (the way a fixed, non-moving surface like the background
+    /// can for icon dragging) would be wrong. Converting to absolute
+    /// using the panel's position *as of each individual event* is
+    /// always correct, since that's what the compositor actually used to
+    /// compute that event's own local coordinate in the first place --
+    /// the rest of the math is exactly IconDrag's own origin-plus-total-
+    /// delta pattern.
+    press_abs: (f64, f64),
+    origin: (i32, i32),
+    dragging: bool,
 }
 
 /// One monitor's desktop background, which doubles as the OPEN LOOK "root
@@ -3715,6 +3764,17 @@ impl OutputHandler for Olshell {
             return;
         };
 
+        // Anchored to just the top-left corner, not spanning the output
+        // width the way the old full-width bar did -- a floating palette
+        // sized to its own content, not the screen. No exclusive zone at
+        // all (the default when it's never set): this reserves no screen
+        // space, unlike the bar it replaces. The real width isn't known
+        // until workspace_count arrives (see the Event::WorkspaceCount
+        // handler below), so this starts as a small placeholder the same
+        // size as the palette's own height -- draw_panel's existing
+        // `width == 0` guard means nothing tries to paint into it before
+        // that first proper resize lands anyway.
+        let position = (WORKSPACE_STRIP_MARGIN, WORKSPACE_STRIP_MARGIN);
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
             qh,
@@ -3723,9 +3783,9 @@ impl OutputHandler for Olshell {
             Some("olshell-panel"),
             Some(&output),
         );
-        layer.set_anchor(Anchor::TOP | Anchor::LEFT | Anchor::RIGHT);
-        layer.set_size(0, PANEL_HEIGHT);
-        layer.set_exclusive_zone(PANEL_HEIGHT as i32);
+        layer.set_anchor(Anchor::TOP | Anchor::LEFT);
+        layer.set_margin(position.1, 0, 0, position.0);
+        layer.set_size(PANEL_HEIGHT, PANEL_HEIGHT);
         layer.set_keyboard_interactivity(KeyboardInteractivity::None);
         layer.commit();
 
@@ -3738,6 +3798,8 @@ impl OutputHandler for Olshell {
             width: 0,
             height: PANEL_HEIGHT,
             scale: 1,
+            position,
+            drag: None,
             workspace_count: 0,
             active_workspace: 0,
             hovered_workspace: None,
@@ -4208,12 +4270,44 @@ impl PointerHandler for Olshell {
                         self.restore_toplevel(&drag.primary);
                     }
                 }
+                // If SELECT is down, this motion either starts or
+                // continues a drag (reposition the whole palette) rather
+                // than updating hover -- see PanelDrag's doc comment.
                 PointerEventKind::Motion { .. } if panel_index.is_some() => {
                     let i = panel_index.unwrap();
-                    let hovered = Olshell::workspace_at(event.position.0, self.panels[i].workspace_count);
-                    if self.panels[i].hovered_workspace != hovered {
-                        self.panels[i].hovered_workspace = hovered;
-                        self.draw_panel(i);
+                    let drag = self.panels[i].drag.map(|d| (d.press_abs, d.origin, d.dragging));
+                    if let Some((press_abs, origin, already_dragging)) = drag {
+                        let panel_pos = self.panels[i].position;
+                        let abs =
+                            (panel_pos.0 as f64 + event.position.0, panel_pos.1 as f64 + event.position.1);
+                        let dx = abs.0 - press_abs.0;
+                        let dy = abs.1 - press_abs.1;
+                        if already_dragging || dx.hypot(dy) >= PANEL_DRAG_THRESHOLD {
+                            let output = self.panels[i].output.clone();
+                            let bg_size = self
+                                .backgrounds
+                                .iter()
+                                .find(|bg| bg.output == output)
+                                .map(|bg| (bg.width as i32, bg.height as i32));
+                            if let Some((bg_w, bg_h)) = bg_size {
+                                let max_x = (bg_w - self.panels[i].width as i32).max(0);
+                                let max_y = (bg_h - self.panels[i].height as i32).max(0);
+                                let new_x = (origin.0 + dx.round() as i32).clamp(0, max_x);
+                                let new_y = (origin.1 + dy.round() as i32).clamp(0, max_y);
+                                self.panels[i].position = (new_x, new_y);
+                                self.panels[i].layer.set_margin(new_y, 0, 0, new_x);
+                                self.panels[i].layer.commit();
+                            }
+                            if let Some(d) = self.panels[i].drag.as_mut() {
+                                d.dragging = true;
+                            }
+                        }
+                    } else {
+                        let hovered = Olshell::workspace_at(event.position.0, self.panels[i].workspace_count);
+                        if self.panels[i].hovered_workspace != hovered {
+                            self.panels[i].hovered_workspace = hovered;
+                            self.draw_panel(i);
+                        }
                     }
                 }
                 PointerEventKind::Leave { .. } if panel_index.is_some() => {
@@ -4222,10 +4316,31 @@ impl PointerHandler for Olshell {
                         self.draw_panel(i);
                     }
                 }
+                // SELECT press starts tracking a possible drag or click,
+                // same ambiguity-until-threshold-or-release pattern
+                // icon dragging already uses -- which one this turns out
+                // to be isn't decided until Release, below.
                 PointerEventKind::Press { button, .. } if panel_index.is_some() && button == BTN_LEFT => {
-                    let panel = &self.panels[panel_index.unwrap()];
-                    if let Some(index) = Olshell::workspace_at(event.position.0, panel.workspace_count) {
-                        panel.workspaces.switch_to(index);
+                    let i = panel_index.unwrap();
+                    let origin = self.panels[i].position;
+                    let press_abs = (origin.0 as f64 + event.position.0, origin.1 as f64 + event.position.1);
+                    self.panels[i].drag = Some(PanelDrag { press_abs, origin, dragging: false });
+                }
+                // Ends whatever the matching Press started. A drag that
+                // already moved the palette (see Motion above) just lets
+                // go -- it's already where it needs to be. Otherwise this
+                // was a plain click: switch workspace, unchanged from
+                // before this was draggable at all.
+                PointerEventKind::Release { button, .. } if panel_index.is_some() && button == BTN_LEFT => {
+                    let i = panel_index.unwrap();
+                    let Some(drag) = self.panels[i].drag.take() else {
+                        continue;
+                    };
+                    if drag.dragging {
+                        continue;
+                    }
+                    if let Some(index) = Olshell::workspace_at(event.position.0, self.panels[i].workspace_count) {
+                        self.panels[i].workspaces.switch_to(index);
                     }
                 }
                 // ADJUST (middle-click) a segment to move the focused
@@ -5093,6 +5208,17 @@ impl Dispatch<ZopenlookWorkspacesOutputV1, ()> for Olshell {
         match event {
             Event::WorkspaceCount { count } => {
                 state.panels[index].workspace_count = count;
+                // The palette is sized to its own content now, not the
+                // output's width -- (re)request the size that actually
+                // fits `count` segments; draw_panel picks up the real
+                // negotiated width once the resulting configure arrives
+                // (same lazy `width == 0`-guarded pattern every other
+                // content-sized popup already uses).
+                let width = (WORKSPACE_STRIP_MARGIN * 2 + count as i32 * WORKSPACE_SEGMENT_WIDTH
+                    - WORKSPACE_SEGMENT_GAP)
+                    .max(1) as u32;
+                state.panels[index].layer.set_size(width, PANEL_HEIGHT);
+                state.panels[index].layer.commit();
                 log::info!("workspaces: panel {index}: {count} available");
                 state.draw_panel(index);
             }
