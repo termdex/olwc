@@ -1573,7 +1573,7 @@ impl Olshell {
                 // Equivalent to the manual per-pixel loop this replaced,
                 // now via fill_rect so the scale multiplication happens in
                 // one place rather than needing its own here too.
-                fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
             }
             let color = if disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             let label = if matches!(item.action, WindowMenuAction::ToggleSticky) && sticky {
@@ -1725,7 +1725,7 @@ impl Olshell {
         for (i, item) in ICON_MENU_ITEMS.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
             if !item.disabled && im.hovered == Some(i) {
-                fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
             }
             let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             draw_text_row_centered(
@@ -1895,7 +1895,7 @@ impl Olshell {
             let hovered = matches!(row, WorkspaceSubmenuRow::Workspace { current: false, .. })
                 && sm.hovered == Some(i);
             if hovered {
-                fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
             }
             let (label, color) = match row {
                 WorkspaceSubmenuRow::OutputHeader { name } => (name.clone(), MENU_TITLE_COLOR),
@@ -2323,7 +2323,7 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
     for (i, item) in popup.items.iter().enumerate() {
         let row_y0 = (row + i as i32) * MENU_ROW_HEIGHT;
         if popup.hovered == Some(i) {
-            fill_rect(canvas, buf_width, buf_height, scale, 0, row_y0, width, row_y0 + MENU_ROW_HEIGHT, MENU_HOVER_COLOR);
+            draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
         }
         draw_text_row_centered(
             canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
@@ -2530,6 +2530,296 @@ const SUBMENU_ARROW_GLYPH: &[&str] = &[
     "####.......",
     "##.........",
 ];
+
+// The pill-shaped menu-item highlight below is OLGlyph too (encodings
+// 24-29 for the endcaps, 30/35/40 for the tileable middle segments,
+// `ol_button.c`'s BUTTON_UL/_LL/_LEFT_ENDCAP_FILL/_LR/_UR/_RIGHT_ENDCAP_FILL/
+// _TOP_1/_BOTTOM_1/_FILL_1), confirmed from source (see
+// docs/OPENLOOK-REFERENCE.md) that olwm's window menu and XView's own menu
+// widget both call the same olgx_draw_accel_button (libolgx) for this --
+// no "Sun vs olvwm" design split, one shape both share. Unlike the fixed-
+// size button/pushpin/arrow glyphs above, a menu-item highlight has to
+// stretch to whatever width a row's text needs -- OPEN LOOK's own
+// technique is fixed endcap glyphs plus a 1-pixel-wide middle glyph
+// repeated exactly enough times to reach the needed width (see
+// draw_pill_highlight), rather than draw_glyph_bitmap's smooth aspect-fit
+// scaling used for the fixed-size glyphs above.
+//
+// Each endcap is really two glyphs, not one: comparing them confirms the
+// convention used throughout olshell's chrome (light source upper-left) --
+// PILL_LEFT_TOP_ARC (encoding 24) traces *most* of the left edge (the lit
+// majority), leaving just the final few rows at the bottom-left tip to
+// PILL_LEFT_BOTTOM_ARC (encoding 25, the shadowed minority); the right
+// endcap is the mirror image, PILL_RIGHT_BOTTOM_ARC (encoding 27) tracing
+// most of it and PILL_RIGHT_TOP_ARC (encoding 28) just the lit tip at the
+// very top. Both pairs are drawn in two different colors (top_color/
+// bottom_color in draw_pill_highlight) to actually produce that split.
+//
+// All nine share the same top row once BDF's per-glyph vertical offset
+// (BBX's yoff, which differs slightly between them) is accounted for --
+// confirmed by computing each glyph's absolute top row from its own BBX
+// height/yoff pair, which comes out identical (-1) for all nine, meaning
+// they're already correctly relatively aligned index-for-index as written
+// below with no extra shifting needed.
+const PILL_LEFT_TOP_ARC: &[&str] = &[
+    ".......####",
+    ".....##....",
+    "....#......",
+    "...#.......",
+    "..#........",
+    ".#.........",
+    ".#.........",
+    "#..........",
+    "#..........",
+    "#..........",
+    "#..........",
+    "#..........",
+    "#..........",
+    "#..........",
+    ".#.........",
+    ".#.........",
+    "..#........",
+    "...#.......",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+];
+const PILL_LEFT_BOTTOM_ARC: &[&str] = &[
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "....#......",
+    ".....##....",
+    ".......####",
+];
+// Solid filled endcap for the fill layer, drawn last -- one native pixel
+// inset from the outline arcs above on every edge (20 rows tall vs. their
+// 21-22), an authentic detail: the fill never touches the outline stroke,
+// leaving it visible all the way around rather than being drawn over.
+const PILL_LEFT_FILL: &[&str] = &[
+    "...........",
+    ".......####",
+    ".....######",
+    "....#######",
+    "...########",
+    "..#########",
+    "..#########",
+    ".##########",
+    ".##########",
+    ".##########",
+    ".##########",
+    ".##########",
+    ".##########",
+    ".##########",
+    "..#########",
+    "..#########",
+    "...########",
+    "....#######",
+    ".....######",
+    ".......####",
+];
+const PILL_RIGHT_BOTTOM_ARC: &[&str] = &[
+    "...........",
+    "...........",
+    "...........",
+    ".......#...",
+    "........#..",
+    ".........#.",
+    ".........#.",
+    "..........#",
+    "..........#",
+    "..........#",
+    "..........#",
+    "..........#",
+    "..........#",
+    "..........#",
+    ".........#.",
+    ".........#.",
+    "........#..",
+    ".......#...",
+    "......#....",
+    "....##.....",
+    "####.......",
+];
+const PILL_RIGHT_TOP_ARC: &[&str] = &[
+    "####.......",
+    "....##.....",
+    "......#....",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+];
+const PILL_RIGHT_FILL: &[&str] = &[
+    "...........",
+    "####.......",
+    "######.....",
+    "#######....",
+    "########...",
+    "#########..",
+    "#########..",
+    "##########.",
+    "##########.",
+    "##########.",
+    "##########.",
+    "##########.",
+    "##########.",
+    "##########.",
+    "#########..",
+    "#########..",
+    "########...",
+    "#######....",
+    "######.....",
+    "####.......",
+];
+// The three tileable middle segments, each just 1 native pixel wide --
+// repeated exactly (needed_width - 2*endcap_width) times in
+// draw_pill_highlight, which always divides evenly since the tile is
+// exactly 1 pixel wide, unlike a smooth scale factor would.
+const PILL_TOP_TILE: &[&str] = &["#", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "."];
+const PILL_BOTTOM_TILE: &[&str] = &["." , ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "#"];
+const PILL_FILL_TILE: &[&str] = &[".", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "#", "."];
+
+/// Native pixel width of each pill endcap glyph above (all eleven wide).
+const PILL_ENDCAP_WIDTH: i32 = 11;
+/// Native pixel height of the tallest pill glyph (PILL_LEFT_TOP_ARC) --
+/// the overall height every layer is composited within.
+const PILL_HEIGHT: i32 = 22;
+/// Inset from a menu row's own left/right edges before the pill starts --
+/// so it reads as a highlight sitting just inside the row rather than
+/// touching the menu's own outer border.
+const MENU_PILL_MARGIN: i32 = 2;
+/// Downward nudge from pure geometric centering -- see draw_pill_
+/// highlight's doc comment on why the text drawn over this glyph needs
+/// it to actually look centered.
+const PILL_VERTICAL_BIAS: i32 = 2;
+
+/// Blits `bitmap` ('#' = on) at native pixel size (times `scale` for
+/// HiDPI), top-left at logical (x0, y0) -- unlike draw_glyph_bitmap, no
+/// fit-to-box scaling: draw_pill_highlight's endcap and tile pieces have
+/// to stay at native pixel size and tile edge-to-edge exactly, not be
+/// independently stretched to fill some box.
+#[allow(clippy::too_many_arguments)]
+fn blit_bitmap(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    scale: i32,
+    x0: i32,
+    y0: i32,
+    bitmap: &[&str],
+    color: (u8, u8, u8),
+) {
+    let (r, g, b) = color;
+    for (row, line) in bitmap.iter().enumerate() {
+        for (col, ch) in line.bytes().enumerate() {
+            if ch != b'#' {
+                continue;
+            }
+            let px0 = (x0 + col as i32) * scale;
+            let py0 = (y0 + row as i32) * scale;
+            for py in py0.max(0)..(py0 + scale).min(canvas_height) {
+                for px in px0.max(0)..(px0 + scale).min(canvas_width) {
+                    let idx = ((py * canvas_width + px) * 4) as usize;
+                    canvas[idx] = b;
+                    canvas[idx + 1] = g;
+                    canvas[idx + 2] = r;
+                    canvas[idx + 3] = 0xFF;
+                }
+            }
+        }
+    }
+}
+
+/// Draws the window-menu/root-menu/icon-menu item hover highlight: an
+/// obround (pill) shape, not the plain rectangle this replaces --
+/// authentic OPEN LOOK, per the OLGlyph provenance and stretchable-glyph
+/// technique described above. Three layers, each a left endcap, N tiles,
+/// and a right endcap composited at the same origin (matching
+/// ol_button.c's own three-XDrawText-calls approach): top_color drawn
+/// first (the lit majority of the left arc, the lit minority of the right
+/// one), then bottom_color (the mirror image), then fill_color last on
+/// top -- safe because the fill glyphs are inset by construction and
+/// never overwrite the outline pixels either arc layer drew. Colors match
+/// olgx_draw_button's "invoked" (hovered) 3D coloring: dark on top, light
+/// on bottom, i.e. recessed/inset, the same convention
+/// DECORATION_BEVEL_DARK/_LIGHT already use for a focused header.
+#[allow(clippy::too_many_arguments)]
+fn draw_pill_highlight(
+    canvas: &mut [u8],
+    canvas_width: i32,
+    canvas_height: i32,
+    scale: i32,
+    x0: i32,
+    y0: i32,
+    x1: i32,
+    y1: i32,
+) {
+    let tiles = (x1 - x0 - 2 * PILL_ENDCAP_WIDTH).max(0);
+    // Centering purely on PILL_HEIGHT within the row leaves the pill
+    // sitting a couple pixels higher than the text drawn over it --
+    // confirmed live (a screenshot showed visibly more empty pill above
+    // "Close" than below it) and measured precisely by rendering the real
+    // glyphs and this glyph together and comparing their pixel centers
+    // (1.5 logical pixels apart) rather than guessing: draw_text_row_
+    // centered's own baseline formula (row-center plus a downward bias of
+    // size/3, tuned for its many other plain-rectangle callers) sits text
+    // slightly lower than this glyph's own geometric center, invisible
+    // against the flat rectangle this replaced but obvious against a
+    // shape with a visible top/bottom edge. PILL_VERTICAL_BIAS closes
+    // that gap empirically rather than deriving it from font metrics,
+    // matching how OPEN LOOK's own bitmap chrome was tuned by eye too.
+    let y = y0 + ((y1 - y0) - PILL_HEIGHT) / 2 + PILL_VERTICAL_BIAS;
+    let right_x = x0 + PILL_ENDCAP_WIDTH + tiles;
+
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_TOP_ARC, DECORATION_BEVEL_DARK);
+    for i in 0..tiles {
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_TOP_TILE, DECORATION_BEVEL_DARK);
+    }
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_TOP_ARC, DECORATION_BEVEL_DARK);
+
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_BOTTOM_ARC, DECORATION_BEVEL_LIGHT);
+    for i in 0..tiles {
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_BOTTOM_TILE, DECORATION_BEVEL_LIGHT);
+    }
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_BOTTOM_ARC, DECORATION_BEVEL_LIGHT);
+
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, PILL_LEFT_FILL, MENU_HOVER_COLOR);
+    for i in 0..tiles {
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, PILL_FILL_TILE, MENU_HOVER_COLOR);
+    }
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, PILL_RIGHT_FILL, MENU_HOVER_COLOR);
+}
 
 /// Renders one of the bitmaps above into box (x0,y0)-(x1,y1): scaled
 /// *uniformly* (the same factor on both axes, so the glyph's own

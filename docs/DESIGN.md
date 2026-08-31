@@ -1058,37 +1058,67 @@ with wlroots compositors generally, not just this project.
   bindings, and how olcore's interception hands off to the existing
   decoration-protocol requests (`close`, `quit`, ...) once a binding
   fires are all still open.
-- Pill-shaped menu-item highlight: hovering a window-menu item (or a
+- ~~Pill-shaped menu-item highlight: hovering a window-menu item (or a
   root-menu item) currently fills a plain rectangle
   (`MENU_HOVER_COLOR`); authentic OPEN LOOK uses an obround/pill shape
-  instead, per both reference screenshot families. This is core, not a
-  theme variant -- confirmed from source that `olwm`'s window menu and
-  XView's own menu widget call the same `olgx_draw_accel_button`
-  (`libolgx`) for this, so there's no "Sun vs olvwm" design split to
-  arbitrate, just one shape both share. What *does* differ between the
-  two reference screenshots -- olvwm's beveled/recessed fill vs. the
-  Sun screenshot's flat black outline -- is the same `info->three_d`
-  runtime 2D/3D split already found twice this session (the pushpin's
-  flat-vs-bevel-composite glyphs, the resize corners): `olgx_draw_
-  accel_button`'s `OLGX_INVOKED` state fills with a beveled pill
-  (`BG3` top / `WHITE` bottom / `BG2` fill) in 3D mode, or a single
-  solid black outline in 2D mode, no design choice involved, just
-  which mode a given display/screenshot happened to render in. Default
-  to the 3D beveled version (consistent with the raised/inset bevel
-  convention already used throughout olshell's chrome -- see the
-  window gadget chrome entry's focus-indication paragraph), and note
-  the flat 2D version as a concrete first candidate for the theming
-  entry above once that exists, rather than building a switch for it
-  now.
+  instead, per both reference screenshot families.~~ resolved: traced
+  from the same OLGlyph font (`olgl14.bdf`) as the button/pushpin/arrow
+  glyphs, this time `ol_button.c`'s stretchable-button encodings (24-29
+  for the two endcaps, 30/35/40 for the tileable middle segments --
+  `BUTTON_UL`/`_LL`/`_LEFT_ENDCAP_FILL`/`_LR`/`_UR`/`_RIGHT_ENDCAP_FILL`/
+  `_TOP_1`/`_BOTTOM_1`/`_FILL_1`). Confirmed from source that `olwm`'s
+  window menu and XView's own menu widget both call the same
+  `olgx_draw_accel_button` (`libolgx`) for this, so there's no "Sun vs
+  olvwm" design split to arbitrate -- one shape both share. What *does*
+  differ between the two reference screenshots -- olvwm's beveled/
+  recessed fill vs. the Sun screenshot's flat black outline -- is the
+  same `info->three_d` runtime 2D/3D split found twice earlier this
+  session (the pushpin's flat-vs-bevel-composite glyphs, the resize
+  corners): `olgx_draw_accel_button`'s `OLGX_INVOKED` state fills with a
+  beveled pill (`BG3` top / `WHITE` bottom / `BG2` fill) in 3D mode, or a
+  single solid black outline in 2D mode. Built the 3D beveled version
+  (consistent with the raised/inset bevel convention already used
+  throughout olshell's chrome), mapped to the same
+  `DECORATION_BEVEL_DARK`/`_LIGHT` colors the decoration header's own
+  focus bevel uses rather than introducing new ones, with
+  `MENU_HOVER_COLOR` kept as the fill so the existing look isn't changed
+  along with the shape; the flat 2D version stays a concrete first
+  candidate for the theming entry above once that exists.
 
-  Bigger lift than the fixed-size button/pushpin/arrow glyphs already
-  traced: those are small icons blitted at a fixed size, but a menu-
-  item highlight has to stretch to whatever width that row's text
-  needs. OPEN LOOK's own technique for this (visible in
-  `olgx_draw_button`'s glyph names -- `BUTTON_UL`/`_LR` endcaps, a
-  `_TOP_1`/`_BOTTOM_1`/`_FILL_1` middle segment repeated
-  `calc_add_ins()` times to fill the needed width) is stretchable font
-  glyphs: fixed-shape endcap characters plus a middle character tiled
-  to fill the width, all from the same OLGlyph font already traced
-  from -- a new technique for olshell (tiling/repeating a glyph
-  segment, not just scaling one), not yet attempted.
+  Genuinely a bigger lift than the fixed-size button/pushpin/arrow
+  glyphs already traced, since a menu-item highlight has to stretch to
+  whatever width a row's text needs rather than blit once at a fixed
+  size -- `draw_pill_highlight` (`shell/src/main.rs`) uses OPEN LOOK's
+  own technique for this: fixed endcap glyphs plus a 1-native-pixel-wide
+  middle glyph (`PILL_TOP_TILE`/`_BOTTOM_TILE`/`_FILL_TILE`) repeated
+  exactly `needed_width - 2*endcap_width` times via a new `blit_bitmap`
+  primitive (unlike `draw_glyph_bitmap`'s smooth aspect-fit scaling used
+  for the fixed-size glyphs, blitting at native pixel size times `scale`
+  only) -- since the tile is exactly 1 pixel wide, this always divides
+  evenly, with no fractional-tiling remainder to handle the way a smooth
+  scale factor would leave. Three layers (top_color/bottom_color/
+  fill_color, each an endcap-tiles-endcap run) composited at the same
+  origin, matching `ol_button.c`'s own three-`XDrawText`-calls approach;
+  the fill layer is drawn last but never overwrites the outline above it,
+  since (confirmed by computing each glyph's absolute row position from
+  its own BDF `BBX` height/`yoff` pair) the fill glyphs are one native
+  pixel inset from the outline on every edge by construction.
+
+  Live testing surfaced a real, if minor, bug: centering the pill purely
+  on its own native height within the row left it sitting visibly higher
+  than the text drawn over it -- invisible against the flat rectangle
+  this replaced, obvious once there was a shape with a visible top/bottom
+  edge to compare against. Rather than guess a pixel offset from a
+  screenshot, rendered the real glyph and the real text together (a
+  throwaway `#[test]` exercising the actual functions, removed before
+  committing) and compared their pixel centers directly: text sat about
+  1.5 logical pixels below the pill's geometric center, closed with a
+  small documented `PILL_VERTICAL_BIAS` constant. A second bug from the
+  same testing pass: the root menu's own hover highlight (`draw_popup`)
+  turned out not to have been converted to `draw_pill_highlight` at all
+  on the first attempt, still showing the old flat rectangle -- a
+  same-text-different-indentation `replace_all` edit silently skipped it
+  since its exact leading whitespace didn't match the other three
+  (differently-nested) call sites it was written against, a real gap
+  worth remembering to double-check with a fresh grep rather than trusting
+  a "successfully replaced" result to mean *every* intended call site.
