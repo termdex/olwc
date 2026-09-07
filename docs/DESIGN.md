@@ -1416,3 +1416,28 @@ with wlroots compositors generally, not just this project.
   might want to review or redact first. Nothing built yet -- needs a
   design pass on exactly what to collect vs. what to leave out by
   default.
+- Wayland session integration for distribution: the release tarball's
+  README covers building/installing olwc, but using it as a primary
+  desktop also needs a `olwc.desktop` file under
+  `/usr/share/wayland-sessions/` so display/login managers (GDM/SDDM/
+  lightdm) can list and launch it, plus a small launcher script that file
+  execs to start olcore and olshell together as one reproducible unit and
+  set the `XDG_CURRENT_DESKTOP`/`XDG_SESSION_TYPE` env vars other apps
+  rely on to detect they're in a Wayland session. Without this, someone
+  has to hand-launch both binaries from a TTY -- fine for testers, a hard
+  blocker for daily-driver use. Session/login-manager integration
+  (logind seat handling, etc.) is somewhat separate from compositor
+  development itself and likely deserves its own short design pass
+  rather than being bundled in as an afterthought; nothing built yet.
+- Distro package repos beyond a source tarball: AUR (a self-maintained
+  `PKGBUILD`, no approval gatekeeping) and COPR (a spec file, Fedora
+  builds it) are both low-lift and worth doing early -- AUR especially,
+  since it matches the project's own dev platform. A PPA is a bigger
+  step up (proper `.deb` packaging, dependency version pinning across
+  Ubuntu releases, Launchpad's upload/signing requirements) and carries
+  more risk than lift during alpha/beta: this is software people log
+  into daily, and a broken build landing in someone's login session via
+  a "packaged, should be stable" channel is a worse first impression
+  than a source tarball a developer chose to build themselves knowing
+  it's early. Lean toward AUR/COPR now, hold the PPA (and similar wider-
+  reach convenience repos) for post-v1.0 once breakage is rarer.
