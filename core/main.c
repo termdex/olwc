@@ -30,6 +30,7 @@
 #include <wlr/types/wlr_layer_shell_v1.h>
 #include <wlr/types/wlr_output.h>
 #include <wlr/types/wlr_output_layout.h>
+#include <wlr/types/wlr_output_management_v1.h>
 #include <wlr/types/wlr_pointer.h>
 #include <wlr/types/wlr_scene.h>
 #include <wlr/types/wlr_seat.h>
@@ -148,6 +149,10 @@ struct olc_server {
 	struct wl_list outputs; // olc_output::link
 	struct wl_listener new_output;
 	struct wl_event_source *render_timer;
+
+	struct wlr_output_manager_v1 *output_manager;
+	struct wl_listener output_manager_apply;
+	struct wl_listener output_manager_test;
 };
 
 struct olc_output {
@@ -308,6 +313,11 @@ static struct olc_output *output_from_wlr_output(
 	struct olc_server *server, struct wlr_output *wlr_output);
 static void broadcast_toplevel_workspace(struct olc_server *server,
 	struct wlr_foreign_toplevel_handle_v1 *handle, struct olc_output *output, uint32_t index);
+// Also needed early: output_request_state and output_destroy both report
+// their state change to any wlr-output-management-v1 client, but the
+// helper that rebuilds and broadcasts the current configuration is only
+// defined much further down, alongside server_new_output.
+static void broadcast_output_configuration(struct olc_server *server);
 
 static struct olc_toplevel *olc_toplevel_from_xdg_toplevel(struct wlr_xdg_toplevel *xdg_toplevel) {
 	struct wlr_scene_tree *tree = xdg_toplevel->base->data;
@@ -877,6 +887,17 @@ static void server_cursor_frame(struct wl_listener *listener, void *data) {
 }
 
 static void render_output(struct olc_output *output) {
+	// A wlr-output-management-v1 client can disable an output (e.g.
+	// `wlr-randr --off`) while it stays fully present in server->outputs --
+	// unlike an actual unplug (output_destroy), which removes it from this
+	// list entirely. Before that was possible, every output reachable here
+	// was always enabled; skip disabled ones now; attaching a buffer to one
+	// fails at the wlroots level (logged as "Tried to set buffer on a
+	// disabled output"), and the render timer would otherwise retry it
+	// every OLC_RENDER_INTERVAL_MS forever.
+	if (!output->wlr_output->enabled) {
+		return;
+	}
 	struct wlr_scene_output *scene_output =
 		wlr_scene_get_scene_output(output->server->scene, output->wlr_output);
 	if (scene_output == NULL) {
@@ -910,6 +931,13 @@ static void output_request_state(struct wl_listener *listener, void *data) {
 	struct olc_output *output = wl_container_of(listener, output, request_state);
 	const struct wlr_output_event_request_state *event = data;
 	wlr_output_commit_state(output->wlr_output, event->state);
+	// Backend-initiated state change (e.g. hotplug renegotiation), not one
+	// wlr-output-management-v1 client requested itself -- still needs
+	// reflecting to any such client watching.
+	broadcast_output_configuration(output->server);
+	// Might have changed scale; see the matching call in server_new_output
+	// for why this is needed at all.
+	wlr_xcursor_manager_load(output->server->cursor_mgr, output->wlr_output->scale);
 }
 
 static void output_destroy(struct wl_listener *listener, void *data) {
@@ -953,6 +981,12 @@ static void output_destroy(struct wl_listener *listener, void *data) {
 	}
 
 	free(output);
+
+	// The head's own internal wlroots listener already dropped it from
+	// wlr_output_manager_v1::heads, but broadcasting is never automatic
+	// (see broadcast_output_configuration's own doc comment) -- clients
+	// still need to be told the manager's list actually changed.
+	broadcast_output_configuration(server);
 }
 
 static void server_new_output(struct wl_listener *listener, void *data) {
@@ -983,6 +1017,17 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 	wlr_output_commit_state(wlr_output, &state);
 	wlr_output_state_finish(&state);
 
+	// wlr_xcursor_manager_create only allocates the manager; per its own
+	// header doc comment, a cursor theme at any given scale factor is only
+	// actually loaded (and thus renderable via wlr_cursor_set_xcursor,
+	// which picks per-output images from whatever the manager already has
+	// loaded) once wlr_xcursor_manager_load has been called for that scale
+	// -- needed here so a newly-connected output at a scale no earlier
+	// output used (e.g. a second, HiDPI monitor) gets a correctly-sized
+	// cursor instead of silently falling back to whatever scale happened
+	// to be loaded first.
+	wlr_xcursor_manager_load(server->cursor_mgr, scale);
+
 	struct olc_output *output = calloc(1, sizeof(*output));
 	output->wlr_output = wlr_output;
 	output->server = server;
@@ -1003,6 +1048,107 @@ static void server_new_output(struct wl_listener *listener, void *data) {
 		wlr_output_layout_add_auto(server->output_layout, wlr_output);
 	struct wlr_scene_output *scene_output = wlr_scene_output_create(server->scene, wlr_output);
 	wlr_scene_output_layout_add_output(server->scene_layout, l_output, scene_output);
+
+	broadcast_output_configuration(server);
+}
+
+// Rebuilds the current output configuration from scratch and broadcasts it
+// to every wlr-output-management-v1 client. Per wlr_output_manager_v1_create's
+// own doc comment, the manager never tracks this automatically -- the
+// compositor must call wlr_output_manager_v1_set_configuration() itself
+// whenever anything about the current outputs changes, so this is called
+// from every place that's true: a new output connecting, one disconnecting,
+// a backend-driven state change, and a successful client-requested apply.
+static void broadcast_output_configuration(struct olc_server *server) {
+	struct wlr_output_configuration_v1 *config = wlr_output_configuration_v1_create();
+	struct olc_output *output;
+	wl_list_for_each(output, &server->outputs, link) {
+		struct wlr_output_configuration_head_v1 *head =
+			wlr_output_configuration_head_v1_create(config, output->wlr_output);
+		// wlr_output_configuration_head_v1_create only pre-fills from the
+		// wlr_output itself (enabled/mode/transform/scale); position is a
+		// wlr_output_layout concept, not a wlr_output one, so it's read
+		// back from the layout explicitly here.
+		struct wlr_output_layout_output *l_output =
+			wlr_output_layout_get(server->output_layout, output->wlr_output);
+		if (l_output != NULL) {
+			head->state.x = l_output->x;
+			head->state.y = l_output->y;
+		}
+	}
+	wlr_output_manager_v1_set_configuration(server->output_manager, config);
+}
+
+// A wlr-output-management-v1 client asked to validate a configuration
+// without applying it -- run it through the backend's own test path only;
+// nothing about the compositor's actual state changes either way.
+static void output_manager_test(struct wl_listener *listener, void *data) {
+	struct olc_server *server = wl_container_of(listener, server, output_manager_test);
+	struct wlr_output_configuration_v1 *config = data;
+
+	size_t states_len = 0;
+	struct wlr_backend_output_state *states =
+		wlr_output_configuration_v1_build_state(config, &states_len);
+	bool ok = states != NULL && wlr_backend_test(server->backend, states, states_len);
+	free(states);
+
+	if (ok) {
+		wlr_output_configuration_v1_send_succeeded(config);
+	} else {
+		wlr_output_configuration_v1_send_failed(config);
+	}
+	wlr_output_configuration_v1_destroy(config);
+}
+
+// A wlr-output-management-v1 client asked to apply a configuration (e.g.
+// `wlr-randr --output ... --scale 2`). Tests first (wlr_backend_commit's own
+// doc comment recommends this), commits the whole output array in one
+// backend call rather than per-output (the protocol requires every existing
+// head to appear in the configuration, so a partial per-head commit loop
+// could leave outputs inconsistent with each other on failure), then -- only
+// once hardware state actually changed -- updates olcore's own layout
+// bookkeeping and re-broadcasts the new current configuration.
+static void output_manager_apply(struct wl_listener *listener, void *data) {
+	struct olc_server *server = wl_container_of(listener, server, output_manager_apply);
+	struct wlr_output_configuration_v1 *config = data;
+
+	size_t states_len = 0;
+	struct wlr_backend_output_state *states =
+		wlr_output_configuration_v1_build_state(config, &states_len);
+	bool ok = states != NULL && wlr_backend_test(server->backend, states, states_len);
+	if (ok) {
+		ok = wlr_backend_commit(server->backend, states, states_len);
+	}
+	free(states);
+
+	if (ok) {
+		// Position isn't part of the wlr_output_state the backend just
+		// committed (same reason broadcast_output_configuration reads it
+		// back from the layout above, not the output) -- applied here
+		// instead, only now that the commit itself is known to have
+		// succeeded, so a failed commit never leaves the layout
+		// inconsistent with real hardware state.
+		struct wlr_output_configuration_head_v1 *head;
+		wl_list_for_each(head, &config->heads, link) {
+			if (head->state.enabled) {
+				wlr_output_layout_add(server->output_layout, head->state.output,
+					head->state.x, head->state.y);
+				// A client-requested scale change (e.g. `wlr-randr --scale`)
+				// needs a matching cursor theme loaded too -- see
+				// server_new_output's matching call for why.
+				wlr_xcursor_manager_load(server->cursor_mgr, head->state.scale);
+			} else {
+				// Per the protocol: "a disabled head is not mapped to a
+				// region of the global compositor space."
+				wlr_output_layout_remove(server->output_layout, head->state.output);
+			}
+		}
+		wlr_output_configuration_v1_send_succeeded(config);
+		broadcast_output_configuration(server);
+	} else {
+		wlr_output_configuration_v1_send_failed(config);
+	}
+	wlr_output_configuration_v1_destroy(config);
 }
 
 static struct olc_output *output_from_wlr_output(
@@ -2226,6 +2372,12 @@ int main(int argc, char *argv[]) {
 	wlr_data_device_manager_create(server.wl_display);
 
 	server.output_layout = wlr_output_layout_create(server.wl_display);
+
+	server.output_manager = wlr_output_manager_v1_create(server.wl_display);
+	server.output_manager_apply.notify = output_manager_apply;
+	wl_signal_add(&server.output_manager->events.apply, &server.output_manager_apply);
+	server.output_manager_test.notify = output_manager_test;
+	wl_signal_add(&server.output_manager->events.test, &server.output_manager_test);
 
 	wl_list_init(&server.outputs);
 	server.new_output.notify = server_new_output;

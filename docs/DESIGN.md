@@ -1341,3 +1341,63 @@ with wlroots compositors generally, not just this project.
   (differently-nested) call sites it was written against, a real gap
   worth remembering to double-check with a fresh grep rather than trusting
   a "successfully replaced" result to mean *every* intended call site.
+- ~~wlr-output-management-v1 support: the Settings GUI tool entry above
+  names this as the real blocker for a Displays pane -- olcore only ever
+  auto-configured each output once, at connect time, with no
+  protocol-level way for anything (a future Settings app, or a standard
+  tool like `wlr-randr`/`wdisplays` today) to change mode/position/
+  transform/scale/enabled state at runtime.~~ resolved: implemented via
+  wlroots' own `wlr_output_manager_v1` helper (`core/main.c`). A new
+  `broadcast_output_configuration` helper rebuilds and re-sends the full
+  current configuration (per-output enabled/mode/transform/scale from
+  `struct wlr_output` itself, position read back from `wlr_output_layout`
+  separately, since that's a layout concept, not an output one) any time
+  it changes -- a new output connecting, one disconnecting, a
+  backend-driven state change, or a successful client-requested apply.
+  `apply`/`test` requests commit the whole output array in one
+  `wlr_backend_test`/`wlr_backend_commit` call (per the protocol, a
+  configuration must include every existing head, so a per-head commit
+  loop could leave outputs inconsistent with each other on partial
+  failure) rather than looping per-head.
+
+  Live testing against `wlr-randr` (nested test session, same recipe used
+  all session) surfaced a real bug: disabling a head left it still
+  present in `server->outputs` (unlike an actual unplug), but the
+  pre-existing render timer (`render_timer_handle`, `OLC_RENDER_INTERVAL_MS`)
+  had no reason before now to ever see a still-tracked-but-disabled
+  output, and kept trying to attach a buffer to it 60+ times/second,
+  spamming wlroots' own "tried to set buffer on a disabled output"
+  rejection and (via the resulting event-loop churn) taking olshell down
+  with it. Fixed by having `render_output` skip disabled outputs outright.
+
+  Separately, *not* a bug: disabling a head turned out to remove its
+  `wl_output` global entirely (confirmed via `WAYLAND_DEBUG=1` on olshell,
+  which showed a `wl_registry.global_remove` event immediately preceding
+  its own shutdown), re-advertised as a new global on re-enable -- correct
+  per the base `wl_output` protocol, which has no notion of "present but
+  disabled." olshell's existing `output_destroyed` handling (a background
+  closing takes the whole shell down only once every last one is gone)
+  already does exactly the right thing with this in both directions: on a
+  system with other outputs still enabled, only that one's background/
+  panel would be torn down; here, with only one output in the nested test
+  setup, disabling it makes olshell correctly decide there's nothing left
+  to draw on and exit -- confirmed live that re-enabling afterward
+  advertises a fresh global a newly-launched olshell binds and renders on
+  normally. A session manager relaunching shell components when an output
+  comes back is a separate, later concern, not this feature's.
+
+  A follow-on conversation about mixed-DPI multi-monitor setups (a laptop's
+  HiDPI panel alongside a lower-DPI desktop monitor) surfaced one real gap
+  this now made reachable: `wlr_xcursor_manager_create(NULL, 24)` only
+  allocates the manager -- per its own header doc comment, a compositor
+  must separately call `wlr_xcursor_manager_load()` for every distinct
+  output scale factor it'll show the cursor on, or `wlr_cursor_set_xcursor`
+  (which picks per-output images from whatever the manager already has
+  loaded) has nothing correctly-sized to pick for a scale nothing loaded
+  yet. Fixed by loading the relevant scale at every point this entry's own
+  `broadcast_output_configuration` already runs from: a newly-connected
+  output, a backend-driven state change, and a successful client-requested
+  apply. Confirmed live (nested test session): `OLC_TEST_OUTPUT_SCALE=2`
+  at startup logs `Loaded cursor theme 'default' at size 48` (24 base x
+  2), and a live `wlr-randr --scale 3` afterward logs a second load at
+  size 72 -- both call sites confirmed working, not just the startup one.
