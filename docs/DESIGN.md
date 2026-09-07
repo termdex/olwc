@@ -1401,3 +1401,18 @@ with wlroots compositors generally, not just this project.
   at startup logs `Loaded cursor theme 'default' at size 48` (24 base x
   2), and a live `wlr-randr --scale 3` afterward logs a second load at
   size 72 -- both call sites confirmed working, not just the startup one.
+- Diagnostic pack tool for alpha/beta bug reports: as olwc moves toward a
+  v1.0 release, testers will hit issues without the benefit of a
+  developer's own debugging setup already in place. Worth a small CLI
+  tool that collects the things a bug report would otherwise need asked
+  for one at a time -- olcore/olshell's own log output, any
+  `coredumpctl` entry for a crashed olcore/olshell, `.openwin-menu`, and
+  version info (wlroots, kernel, GPU/DRM driver) -- into a single tarball
+  a user can attach to an issue. Leaning toward a plain, readable shell
+  script rather than a compiled tool: something a user runs specifically
+  because something already went wrong benefits more from being
+  trivially inspectable before upload than from any polish, especially
+  since logs can incidentally contain window titles or file paths a user
+  might want to review or redact first. Nothing built yet -- needs a
+  design pass on exactly what to collect vs. what to leave out by
+  default.
