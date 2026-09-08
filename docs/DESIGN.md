@@ -1441,3 +1441,28 @@ with wlroots compositors generally, not just this project.
   than a source tarball a developer chose to build themselves knowing
   it's early. Lean toward AUR/COPR now, hold the PPA (and similar wider-
   reach convenience repos) for post-v1.0 once breakage is rarer.
+- Window menu: default-action click vs. right-click-to-open, and
+  right-click-on-title-bar as a second gesture. Confirmed live against
+  real olvwm/XView (running from source on a FreeBSD 12.1 reference VM,
+  see the "Window gadget chrome" entry above for how olcore/olshell's own
+  v1 was built) that authentic olwm's header button does *not* open the
+  menu on a plain click the way olwc's does today -- a left-click
+  instead invokes the menu's default action directly (`winbutton.c`'s
+  `eventButtonRelease`, `SELECT` case: `DoDefaultMenuAction`, falling
+  back to `ClientOpenCloseToggle` if no default item exists), a quick
+  "Close" shortcut. Only a right-click on the button
+  (`eventButtonPress`'s `ACTION_MENU` case) actually shows the menu, via
+  `ShowStandardMenuSync`. Separately, a right-click anywhere else on the
+  title bar (`wingframe.c`'s `ACTION_MENU` case -> `winframe.c`'s
+  `menuPressFrame` -> `ShowStandardMenu`, confirmed to be a thin wrapper
+  around that same `ShowStandardMenuSync`) is a legitimate second gesture
+  to the *same* menu, not a different one. Both confirmed deliberate
+  OPEN LOOK convention, not an artifact of olvwm's own implementation.
+  Nothing built yet on olwc's side -- would need: (1) the header button's
+  click handling split into a default-action path (probably `Close`,
+  matching the reference) vs. a right-click-opens-the-menu path, in
+  place of today's open-on-any-click, and (2) the header's
+  decoration-drag handling (`docs/DESIGN.md`'s "Window gadget chrome"
+  entry: "dragging the header (outside the button) moves the window")
+  gaining a right-click case routed to the same window-menu-open path,
+  rather than (or in addition to) the move grab.
