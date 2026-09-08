@@ -1466,3 +1466,18 @@ with wlroots compositors generally, not just this project.
   entry: "dragging the header (outside the button) moves the window")
   gaining a right-click case routed to the same window-menu-open path,
   rather than (or in addition to) the move grab.
+- "Owner?" -- trace a pinned menu back to the window that spawned it.
+  Confirmed live against real olvwm/XView (same FreeBSD 12.1 reference
+  VM as the entries above) that pinning the root menu into its own
+  standalone window reveals an extra entry, "Owner?", not present in the
+  transient popup form. Traced to `client.c`'s `ClientFlashOwner`: once
+  pinned, a menu is an independent floating window disconnected from
+  whatever spawned it, so this finds that window's group leader, raises
+  it, and flashes its title bar -- answering "which application does
+  this pinned menu actually belong to?" (also bound as a genuine keyboard
+  accelerator in `evbind.c`/`kbdfuncs.c`'s `KeyOwner`, not just a menu
+  item). olwc already has some pin-to-persist mechanism for its root
+  menu (the pushpin gesture referenced in earlier entries above); a
+  similar "flash the owning window" action would be a natural,
+  authenticity-matching addition once/if window-menu pinning exists on
+  olwc's side too. Nothing built yet.
