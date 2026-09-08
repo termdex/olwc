@@ -1496,3 +1496,61 @@ with wlroots compositors generally, not just this project.
   similar "flash the owning window" action would be a natural,
   authenticity-matching addition once/if window-menu pinning exists on
   olwc's side too. Nothing built yet.
+- ~~Pushpin: flat single-color glyphs instead of real 3D bevel
+  shading.~~ resolved: side-by-side screenshots against the real olvwm/
+  XView reference desktop showed genuine light/shadow shading (a top-
+  left highlight, bottom-right shadow) on the pushpin, while olshell drew
+  each state as one flat glyph. `PUSHPIN_GLYPH_UNPINNED`/`_PINNED`'s own
+  doc comment recorded an earlier, deliberate decision to avoid real
+  olgx's 3D bevel encodings (100-105) after they "rendered as a
+  compressed-looking blob" -- re-reading the actual source this time
+  (`lib/libolgx/ol_misc.c` in the staged XView distfile) showed why: those
+  six encodings aren't overlapping outline variants meant to be unioned,
+  they're three complementary, non-overlapping shapes (top/highlight,
+  bottom/shadow, middle/fill), each meant to be drawn once in one flat
+  color -- the same top/fill/bottom three-color technique `draw_button`
+  already uses successfully. All six retraced from the real font
+  (`fonts/bdf/misc/olgl14.bdf`) and cross-checked against the already-
+  trusted `PUSHPIN_GLYPH_UNPINNED` constant, which matched byte-for-byte,
+  confirming the extraction method. Real olgx uses identical bevel colors
+  for both pin states -- shape alone signals pinned vs. unpinned -- so the
+  previous `PUSHPIN_PINNED_COLOR` dark-red accent (no basis in the
+  reference) was dropped in favor of the same neutral palette for both.
+
+  Two real bugs surfaced only through live, pixel-level comparison against
+  reference screenshots, not visible from source alone:
+
+  1. First attempt supplied a caller-matched background color for the
+     fill layer, modeled on `draw_button`'s own "blend into the
+     surrounding background" fill -- but that's real olgx's `OLGX_BG1`
+     convention for a plain button, a *different* named color from the
+     pushpin's actual fill, `OLGX_BG2`. Using the same color as the
+     background made the fill (and anything it overwrote) read as empty
+     space. Fixed by giving the fill a fixed, distinct mid-tone
+     (`DECORATION_BG_COLOR`, already used elsewhere in olshell's chrome)
+     matching real olgx's own fixed-regardless-of-context fill, dropping
+     the `fill_color` parameter entirely.
+  2. Real olgx blits these as unscaled, pixel-perfect X11 bitmaps;
+     `draw_glyph_bitmap` scales each layer to fit its box, and even the
+     slight (~0.93x) shrink involved means some destination pixels sample
+     a source region straddling the boundary between two complementary
+     shapes, so more than one layer's draw call can see "some source
+     pixel on" for the same destination pixel, with whichever is drawn
+     last winning. Fill is the largest/densest region; drawing it last
+     (matching real olgx's literal draw order) eroded the much thinner
+     top/bottom accent lines at every shared boundary -- confirmed live
+     as the highlight layer disappearing almost entirely, with pixel-
+     level analysis of screenshots (comparing exact RGB values against
+     the known bevel constants) confirming zero highlight-colored pixels
+     were being drawn at all. Fixed by drawing fill first as the base,
+     then the accent lines on top of it -- a deliberate deviation from
+     real olgx's literal draw order, necessitated by the two
+     implementations' different rendering models (scaled bitmap blit vs.
+     unscaled native font rendering), not a deviation from matching the
+     same visual result.
+
+  Two minor, inherent limits remain, not chased further: the unpinned
+  glyphs are natively 28px wide against a 26px menu pushpin box (a small,
+  layout-constant-driven compression), and the pinned glyphs' native
+  15x15 size is small enough that one fine gradient partially aliases
+  away rather than being a code defect to fix.

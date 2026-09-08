@@ -219,8 +219,6 @@ const MENU_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
 const STICKY_PUSHPIN_SIZE: i32 = 15;
 const POPUP_PUSHPIN_WIDTH: i32 = 26;
 const POPUP_PUSHPIN_HEIGHT: i32 = 14;
-const PUSHPIN_UNPINNED_COLOR: (u8, u8, u8) = MENU_TITLE_COLOR;
-const PUSHPIN_PINNED_COLOR: (u8, u8, u8) = (0xA8, 0x30, 0x28);
 
 // Rightward wedge marking a window-menu item that opens a submenu
 // (currently just Move to Workspace) rather than acting immediately.
@@ -1667,7 +1665,7 @@ impl Olshell {
 
         if dec.sticky {
             let (px0, py0, px1, py1) = dec.sticky_pushpin_rect();
-            draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, true, PUSHPIN_PINNED_COLOR);
+            draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, true);
         }
 
         let wl_surface = &dec.surface;
@@ -2774,8 +2772,7 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
             title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
         );
     }
-    let pushpin_color = if popup.pinned { PUSHPIN_PINNED_COLOR } else { PUSHPIN_UNPINNED_COLOR };
-    draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, popup.pinned, pushpin_color);
+    draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, popup.pinned);
     let row = popup.header_rows();
 
     for (i, item) in popup.items.iter().enumerate() {
@@ -2913,57 +2910,136 @@ const BUTTON_GLYPH_PRESSED: &[&str] = &[
     "..###############.",
 ];
 
-// olgx_draw_pushpin actually has two distinct designs for these states, not
-// one: encodings 100-105 are three-layer bevel composites (highlight/fill/
-// shadow in three different colors) meant only for 3D rendering, and don't
-// flatten cleanly to a single color -- tried first, and confirmed live to
-// render as a compressed-looking blob, since a naive union of three bevel
-// outlines is thicker and blockier than any one of them alone. olgx has a
-// second, purpose-built flat single-color version of each for its 2D
-// rendering path (`pupinout`/`pupinin` below) -- these are the ones that
-// actually belong here, the same way the button glyph already uses its own
-// flat variant (OLG_ABBREV_MENU_BUTTON) rather than the 3D bevel layers
-// abbrev_button uses in 3D mode.
+// olgx_draw_pushpin's 3D rendering path (real 3D mode, confirmed live
+// against real olvwm/XView on a FreeBSD 12.1 reference VM -- see
+// ~/code/freebsd-olvwm-ports/NOTES.md) draws each state as three
+// complementary, non-overlapping glyphs -- top/highlight, bottom/shadow,
+// middle/fill (encodings 100-105) -- each in its own flat color, the same
+// top/fill/bottom three-color layering technique draw_button already
+// uses. An earlier attempt at this apparently mistook those three
+// encodings for overlapping outline variants meant to be unioned into
+// one shape, which does render as a compressed-looking blob; that isn't
+// what they are. All six traced from fonts/bdf/misc/olgl14.bdf in the
+// same XView distfile as every other OLGlyph tracing in this project.
+// Both pin states use identical bevel colors in real olgx -- shape alone
+// (not color) signals pinned vs. unpinned, so these six carry no color of
+// their own; draw_pushpin below supplies it.
 
-/// Pushpin, unpinned ("pushpin out") state -- olgx's flat single-color
-/// glyph (encoding 19, `pupinout`): the pin lying on its side, head and
-/// shaft outlined.
-const PUSHPIN_GLYPH_UNPINNED: &[&str] = &[
-    "...............###...........",
-    "...............#..#.......##.",
-    "...............#..#......#..#",
-    "...............#..########..#",
-    "...............#..#......#..#",
-    "...............#..#......#..#",
-    ".....###########..#......#..#",
-    "......##########..#......#..#",
-    "...............#..#......#..#",
-    "...............#..########..#",
-    ".##............#..###########",
-    "#..#...........####......####",
-    "#..#...........####.......##.",
-    ".##............###...........",
+/// Pushpin, unpinned state, top/highlight layer -- olgx encoding 100
+/// (`PUSHPIN_OUT_TOP`).
+const PUSHPIN_GLYPH_UNPINNED_TOP: &[&str] = &[
+    "...............###..........",
+    "...............#.........##.",
+    "...............#........#...",
+    "...............#...######...",
+    "...............#........#...",
+    "...............#........#...",
+    ".....###########........#...",
+    "...............#........#...",
+    "...............#........#...",
+    "...............#........#...",
+    "...............#............",
+    "...#...........#............",
+    "...#...........#............",
+    ".##............#............",
 ];
 
-/// Pushpin, pinned ("pushpin in") state -- olgx's flat single-color glyph
-/// (encoding 20, `pupinin`): the pin pushed straight into the board, seen
-/// at an angle, outlined.
-const PUSHPIN_GLYPH_PINNED: &[&str] = &[
+/// Pushpin, unpinned state, bottom/shadow layer -- olgx encoding 101
+/// (`PUSHPIN_OUT_BOTTOM`).
+const PUSHPIN_GLYPH_UNPINNED_BOTTOM: &[&str] = &[
+    "............................",
+    "..................#.........",
+    "..................#........#",
+    "..................#........#",
+    "..................#........#",
+    "..................#........#",
+    "..................#........#",
+    "......#########...#.....#..#",
+    "..................#######..#",
+    "..................##########",
+    ".##...............#.....####",
+    "#...............###......##.",
+    "#...............###.........",
+    "................##..........",
+];
+
+/// Pushpin, unpinned state, middle/fill layer -- olgx encoding 102
+/// (`PUSHPIN_OUT_MIDDLE`).
+const PUSHPIN_GLYPH_UNPINNED_MIDDLE: &[&str] = &[
+    "............................",
+    "................##..........",
+    "................##.......##.",
+    "................##.......##.",
+    "................##.#####.##.",
+    "................##.#####.##.",
+    "................##.#####.##.",
+    "................##.#####.##.",
+    "................##.#####.##.",
+    "................##.......##.",
+    "................##..........",
+    ".##.........................",
+    ".##.........................",
+    "............................",
+];
+
+/// Pushpin, pinned state, top/highlight layer -- olgx encoding 103
+/// (`PUSHPIN_IN_TOP`).
+const PUSHPIN_GLYPH_PINNED_TOP: &[&str] = &[
     "........###....",
-    ".....###...##..",
-    "...###.......#.",
-    "..#..#.......#.",
-    ".#..#.........#",
-    ".#..#.........#",
-    "#...#.........#",
-    "#...##.......##",
-    "#....#.......#.",
-    "##...###...###.",
-    ".#....#######..",
-    ".##.....#####..",
-    ".####....###...",
-    "###########....",
+    ".....###...#...",
+    "...###.........",
+    "..#..#.........",
+    ".#..#..........",
+    ".#..#..........",
+    "#...#..........",
+    "#...##.........",
+    "#..............",
     "##.............",
+    ".#.............",
+    ".#.............",
+    ".#.............",
+    "#..............",
+    "...............",
+];
+
+/// Pushpin, pinned state, bottom/shadow layer -- olgx encoding 104
+/// (`PUSHPIN_IN_BOTTOM`).
+const PUSHPIN_GLYPH_PINNED_BOTTOM: &[&str] = &[
+    "...............",
+    "............#..",
+    ".............#.",
+    ".............#.",
+    "..............#",
+    "..............#",
+    "..............#",
+    ".............##",
+    ".....#.......#.",
+    ".....###...###.",
+    "......#######..",
+    "..#.....#####..",
+    "..###....###...",
+    ".##########....",
+    "##...####......",
+];
+
+/// Pushpin, pinned state, middle/fill layer -- olgx encoding 105
+/// (`PUSHPIN_IN_MIDDLE`).
+const PUSHPIN_GLYPH_PINNED_MIDDLE: &[&str] = &[
+    "...............",
+    "........###....",
+    "......#######..",
+    "...##.#######..",
+    "..##.#########.",
+    "..##.#########.",
+    ".###.#########.",
+    ".###..#######..",
+    ".####.#######..",
+    "..###...###....",
+    "..####.........",
+    "...#####.......",
+    ".....####......",
+    "...............",
+    "...............",
 ];
 
 /// Submenu ("pullright") indicator -- olgx's "menu mark" glyph
@@ -3498,9 +3574,20 @@ fn draw_icon_image(
     }
 }
 
-/// Draws the pushpin glyph within box (x0,y0)-(x1,y1): the pinned or
-/// unpinned OLGlyph shape (see PUSHPIN_GLYPH_PINNED/UNPINNED), scaled to
-/// fit.
+/// Draws the pushpin within box (x0,y0)-(x1,y1) as three layered glyphs
+/// (top/highlight, bottom/shadow, middle/fill), matching real
+/// olgx_draw_pushpin's 3D rendering path exactly -- three complementary,
+/// non-overlapping shapes, each drawn once in one flat color, not
+/// overlapping outlines. Safe to layer despite each being its own
+/// draw_glyph_bitmap call: all three glyphs within one pin state share
+/// identical native dimensions, so they independently scale and center
+/// identically and land in perfect alignment. Both pin states, and every
+/// caller, use the same three fixed colors -- unlike draw_button's own
+/// fill (which matches its surrounding background so it reads as a bump
+/// on the same surface, real OLGX_BG1), the pushpin's fill is real
+/// olgx's OLGX_BG2, a color distinct from any particular background,
+/// since the pin always reads as its own solid object regardless of what
+/// it's drawn on.
 #[allow(clippy::too_many_arguments)]
 fn draw_pushpin(
     canvas: &mut [u8],
@@ -3512,10 +3599,33 @@ fn draw_pushpin(
     x1: i32,
     y1: i32,
     pinned: bool,
-    color: (u8, u8, u8),
 ) {
-    let bitmap = if pinned { PUSHPIN_GLYPH_PINNED } else { PUSHPIN_GLYPH_UNPINNED };
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, bitmap, color);
+    let (top, bottom, middle) = if pinned {
+        (PUSHPIN_GLYPH_PINNED_TOP, PUSHPIN_GLYPH_PINNED_BOTTOM, PUSHPIN_GLYPH_PINNED_MIDDLE)
+    } else {
+        (PUSHPIN_GLYPH_UNPINNED_TOP, PUSHPIN_GLYPH_UNPINNED_BOTTOM, PUSHPIN_GLYPH_UNPINNED_MIDDLE)
+    };
+    // Middle/fill drawn first, not last (real olgx draws top/bottom/fill
+    // in that order, but real olgx also blits these as unscaled, pixel-
+    // perfect X11 bitmaps with zero ambiguity -- draw_glyph_bitmap scales
+    // each layer to fit this box, and even the slight (~0.93x) shrink
+    // that takes means some destination pixels sample a source region
+    // straddling the boundary between two complementary shapes, so both
+    // layers' calls see "some source pixel on" there and whichever is
+    // drawn last wins. Fill is by far the largest/densest region, so
+    // drawing it last erodes the much thinner top/bottom accent lines at
+    // every shared boundary -- confirmed live as the highlight layer
+    // disappearing almost entirely. Drawing fill first instead means the
+    // accent lines, drawn after, are what wins at every boundary, which
+    // is what actually needs to stay crisp.
+    // A fixed mid-tone, not caller-supplied: real olgx's pushpin fill
+    // (OLGX_BG2) is a distinct color from a plain button's background-
+    // matching fill (OLGX_BG1, see draw_button's own doc comment) -- the
+    // pin's body always reads as its own solid object, not a blend into
+    // whatever surface it sits on, regardless of context.
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, middle, DECORATION_BG_COLOR);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, bottom, DECORATION_BEVEL_DARK);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, top, DECORATION_BEVEL_LIGHT);
 }
 
 /// Fills one full-width logical row of `canvas` with an opaque color --
