@@ -1729,7 +1729,7 @@ impl Olshell {
     /// Opens the window menu for `toplevel_id`'s decoration, replacing any
     /// other one already open. A subsurface of the decoration's own
     /// surface, positioned just below the header.
-    fn open_window_menu(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId) {
+    fn open_window_menu(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId, at: (f64, f64)) {
         self.close_window_menu();
 
         let Some(dec_surface) = self
@@ -1777,7 +1777,14 @@ impl Olshell {
         let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface.clone(), qh);
-        subsurface.set_position(0, DECORATION_HEIGHT as i32);
+        // Real olvwm renders the window menu at wherever the triggering
+        // click landed, not anchored to a fixed spot -- true whether that
+        // click was on the header button or elsewhere on the title bar
+        // (confirmed live against real olvwm/XView; see docs/DESIGN.md's
+        // window-menu entry). `at` is the click position in the header
+        // surface's own coordinate space already, so it can be used
+        // directly as the subsurface offset.
+        subsurface.set_position(at.0.round() as i32, at.1.round() as i32);
         // Desync so the menu's own commits apply immediately rather than
         // waiting on the header's next commit -- every other surface here
         // behaves that way too, and there's no reason this one shouldn't.
@@ -4428,7 +4435,7 @@ impl PointerHandler for Olshell {
                     }
                 }
                 PointerEventKind::Press { button, .. }
-                    if decoration_toplevel.is_some() && button == BTN_LEFT =>
+                    if decoration_toplevel.is_some() && (button == BTN_LEFT || button == BTN_RIGHT) =>
                 {
                     let id = decoration_toplevel.unwrap();
                     let on_button = self
@@ -4436,22 +4443,34 @@ impl PointerHandler for Olshell {
                         .get(&id)
                         .and_then(|info| info.decoration.as_ref())
                         .is_some_and(|dec| dec.is_on_button(event.position.0, event.position.1));
-                    if on_button {
-                        // A second click on the button that opened the
-                        // currently-showing menu toggles it closed instead
-                        // of reopening it -- the pre-step above already
-                        // closed it since this press isn't on the menu
-                        // itself, so there's nothing more to do here.
+                    if button == BTN_RIGHT {
+                        // Right-click is the real menu-open gesture -- both
+                        // on the button and anywhere else on the title bar
+                        // (real olvwm treats both as the same gesture to
+                        // the same menu). A second right-click on the
+                        // toplevel whose own menu the pre-step above just
+                        // closed toggles it closed instead of reopening it,
+                        // same convention the icon menu already uses.
                         if window_menu_toplevel.as_ref() != Some(&id) {
-                            self.open_window_menu(qh, &id);
+                            self.open_window_menu(qh, &id, event.position);
+                        }
+                    } else if on_button {
+                        // Left-click on the button invokes the default
+                        // action directly instead of opening the menu,
+                        // matching real olvwm -- mirrors WINDOW_MENU_ITEMS[0]
+                        // ("Close" -> Minimize); move with it if that ever
+                        // changes.
+                        if let Some(handle) = self.toplevels.get(&id).and_then(|i| i.handle.as_ref()) {
+                            handle.set_minimized();
                         }
                     } else if let Some(dec) =
                         self.toplevels.get(&id).and_then(|info| info.decoration.as_ref())
                     {
-                        // A press anywhere else on the header drags the
-                        // window, same as a real title bar. held=1: this
-                        // fires from the press itself, so the button is
-                        // still down -- the move ends when it's released.
+                        // A left-click-drag anywhere else on the header
+                        // still moves the window, same as a real title bar.
+                        // held=1: this fires from the press itself, so the
+                        // button is still down -- the move ends when it's
+                        // released.
                         dec.object._move(1);
                     }
                 }

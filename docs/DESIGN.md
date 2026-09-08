@@ -1441,31 +1441,46 @@ with wlroots compositors generally, not just this project.
   than a source tarball a developer chose to build themselves knowing
   it's early. Lean toward AUR/COPR now, hold the PPA (and similar wider-
   reach convenience repos) for post-v1.0 once breakage is rarer.
-- Window menu: default-action click vs. right-click-to-open, and
-  right-click-on-title-bar as a second gesture. Confirmed live against
-  real olvwm/XView (running from source on a FreeBSD 12.1 reference VM,
-  see the "Window gadget chrome" entry above for how olcore/olshell's own
-  v1 was built) that authentic olwm's header button does *not* open the
-  menu on a plain click the way olwc's does today -- a left-click
-  instead invokes the menu's default action directly (`winbutton.c`'s
-  `eventButtonRelease`, `SELECT` case: `DoDefaultMenuAction`, falling
-  back to `ClientOpenCloseToggle` if no default item exists), a quick
-  "Close" shortcut. Only a right-click on the button
-  (`eventButtonPress`'s `ACTION_MENU` case) actually shows the menu, via
-  `ShowStandardMenuSync`. Separately, a right-click anywhere else on the
-  title bar (`wingframe.c`'s `ACTION_MENU` case -> `winframe.c`'s
-  `menuPressFrame` -> `ShowStandardMenu`, confirmed to be a thin wrapper
-  around that same `ShowStandardMenuSync`) is a legitimate second gesture
-  to the *same* menu, not a different one. Both confirmed deliberate
-  OPEN LOOK convention, not an artifact of olvwm's own implementation.
-  Nothing built yet on olwc's side -- would need: (1) the header button's
-  click handling split into a default-action path (probably `Close`,
-  matching the reference) vs. a right-click-opens-the-menu path, in
-  place of today's open-on-any-click, and (2) the header's
-  decoration-drag handling (`docs/DESIGN.md`'s "Window gadget chrome"
-  entry: "dragging the header (outside the button) moves the window")
-  gaining a right-click case routed to the same window-menu-open path,
-  rather than (or in addition to) the move grab.
+- ~~Window menu: default-action click vs. right-click-to-open, and
+  right-click-on-title-bar as a second gesture.~~ resolved: confirmed
+  live against real olvwm/XView (running from source on a FreeBSD 12.1
+  reference VM, see the "Window gadget chrome" entry above for how
+  olcore/olshell's own v1 was built) that authentic olwm's header button
+  does *not* open the menu on a plain click the way olwc's did before
+  this -- a left-click instead invokes the menu's default action
+  directly (`winbutton.c`'s `eventButtonRelease`, `SELECT` case:
+  `DoDefaultMenuAction`, falling back to `ClientOpenCloseToggle` if no
+  default item exists), a quick "Close" shortcut. Only a right-click on
+  the button (`eventButtonPress`'s `ACTION_MENU` case) actually shows the
+  menu, via `ShowStandardMenuSync`. Separately, a right-click anywhere
+  else on the title bar (`wingframe.c`'s `ACTION_MENU` case ->
+  `winframe.c`'s `menuPressFrame` -> `ShowStandardMenu`, confirmed to be
+  a thin wrapper around that same `ShowStandardMenuSync`) is a legitimate
+  second gesture to the *same* menu, not a different one. Both confirmed
+  deliberate OPEN LOOK convention, not an artifact of olvwm's own
+  implementation.
+
+  `shell/src/main.rs`'s single header `PointerEventKind::Press` match arm
+  (previously gated on left-click only) now branches on button first:
+  right-click (on the button or anywhere else on the header) opens the
+  window menu, reusing the same toggle-closed-on-a-second-click check the
+  icon menu already relies on; left-click on the button invokes
+  `handle.set_minimized()` directly (mirroring `WINDOW_MENU_ITEMS[0]`,
+  "Close"); left-click elsewhere on the header still drags the window,
+  unchanged. No protocol or olcore changes needed -- every action
+  involved already existed, this only changed which gesture triggers
+  which one.
+
+  Live testing surfaced a real bug the plan hadn't anticipated: the menu
+  was still opening anchored to the button's fixed position
+  (`subsurface.set_position(0, DECORATION_HEIGHT)`) regardless of where
+  the triggering right-click actually landed, so a title-bar click far
+  from the button opened the menu correctly but at the wrong spot,
+  forcing a trip back to the corner to pick an item -- not what "renders
+  relative to cursor location" (confirmed from the reference) means.
+  Fixed by having `open_window_menu` take the click position and use it
+  directly as the subsurface offset, since it's already in the header
+  surface's own coordinate space.
 - "Owner?" -- trace a pinned menu back to the window that spawned it.
   Confirmed live against real olvwm/XView (same FreeBSD 12.1 reference
   VM as the entries above) that pinning the root menu into its own
