@@ -1663,3 +1663,102 @@ with wlroots compositors generally, not just this project.
   a second field, `button_left_down: bool`, tracking "is a left press
   actually in flight" independently of the housing's current visual
   state, and gating `Motion`/`Leave` on it instead.
+- Keyboard "Mouseless" menu navigation, and the location-cursor arrow:
+  resolved. FreeBSD reference-desktop testing had flagged (in
+  `freebsd-olvwm-ports/NOTES.md`) a black arrow shown next to a menu's
+  keyboard-highlighted item, unverified against source at the time.
+  Confirmed genuine from `/tmp/olvwm-src/menu.c`/`evbind.c`: real olvwm
+  is a strict two-input-source model -- plain arrow keys map directly to
+  `ACTION_UP`/`_DOWN`/`_LEFT`/`_RIGHT`, `space` to `ACTION_SELECT`,
+  `Return`/`KP_Enter` to `ACTION_EXEC_DEFAULT`, no modifiers -- and olwc
+  had no keyboard menu navigation at all before this, `press_key` only
+  ever handling Escape and Return-for-the-Notice.
+
+  Every one of olwc's four menu types (window menu, icon menu, its
+  workspace submenu, and the root-menu popup) already shared the exact
+  same shape -- `hovered: Option<usize>`, `item_at(y)`, a per-type
+  "is this index selectable" check, and an identical `draw_pill_highlight`
+  call per row -- so this is one mechanism applied four times, not four
+  designs. Added a `loc_cursor: bool` sibling to each `hovered` field
+  (true only when the highlight was last moved by a key, not a mouse --
+  every existing Motion/Leave handler now clears it, mirroring real
+  olvwm's `menuHandleMotion` explicitly erasing the location cursor the
+  instant the mouse takes the highlight back over) and a shared
+  `step_selectable` helper (`nextItem`/`prevItem`'s wrap-and-skip-
+  disabled logic). `DrawLocCursor`'s own arrow isn't an OLGlyph bitmap --
+  real source computes its `XFillPolygon` at fixed relative offsets
+  directly -- so `draw_loc_cursor` rasterizes the same triangle
+  geometrically instead of forcing it through the usual glyph-bitmap
+  path.
+
+  Item *execution* (previously inlined in each menu's own mouse handler)
+  was factored into shared `execute_window_menu_item`/
+  `execute_icon_menu_item`/`execute_popup_item`/
+  `execute_workspace_submenu_row` methods, called by both the existing
+  mouse handlers and the new keyboard Space/Return path
+  (`execute_focused_menu_item`, dispatched via a new `focused_menu()` --
+  the same three-way surface check `press_key`'s Escape handling already
+  did, now shared). Notably, `WindowMenuAction::Move`/`Resize` already
+  called `dec.object._move(0)`/`resize(..., 0)` -- discrete-click form,
+  not tied to a held pointer button -- so keyboard execution needed no
+  special-casing for them at all. One deliberate departure from source:
+  Space/Return does nothing (not even closing the menu) if nothing is
+  currently highlighted, rather than falling back to a `buttonDefault`
+  olwc's item lists don't model.
+
+  Two real bugs found only by live comparison against
+  `screenshots/Olvwm-desktop.jpg`-style reference behavior, not visible
+  from reading source alone:
+
+  1. The arrow overlapped the first character of an item's label
+     (`share/pill-arrow.png`) -- real olvwm reserves the arrow's space on
+     *every* row's text start unconditionally, not just a row that
+     happens to be highlighted right now (`share/pill-arrow-bsd.png`
+     shows every label, highlighted or not, starting at the same
+     indent). Fixed with a new `MENU_ITEM_TEXT_INSET` constant, used as
+     every menu's item-label `start_x` in place of the smaller
+     `MENU_H_PADDING`, with each menu's own width formula bumped by the
+     same difference so nothing gets cramped.
+  2. Even after that fix, the arrow sat entirely inside the pill
+     highlight's own left edge, where real olvwm's arrow straddles the
+     pill's left border -- part poking out to the left, only its tip
+     actually inside (`share/pill-arrow-wide.png` vs. `share/pill-arrow-
+     bsd.png`). The pill's left edge had never actually moved (still
+     `MENU_PILL_MARGIN`, well left of the arrow's own inset) -- it had
+     just gone unnoticed until the arrow existed to reveal it. Fixed
+     with a new `MENU_PILL_LEFT_INSET` (arrow inset plus half its width)
+     used as the pill's left edge specifically, unconditionally, same
+     reasoning as the text inset: mouse hover and keyboard nav share the
+     exact same pill.
+
+  Confirmed live afterward: Up/Down wrapping past both ends and skipping
+  disabled items, Right opening the workspace submenu with a starting
+  highlight and Left closing just it (not the whole window menu), and
+  Space/Return executing the highlighted item identically to a mouse
+  click, across all four menu types.
+- To-do, noted during keyboard-menu-navigation testing but not acted on
+  yet: the submenu ("pullright") indicator on "Move to Workspace"
+  (`SUBMENU_ARROW_GLYPH`/`draw_submenu_arrow`) is still a flat, single-
+  color triangle. Its own doc comment says this deliberately traces
+  XView's real 2D-mode rendering (`olgx_draw_menu_mark`'s `!info->
+  three_d` branch, both outline layers merged into one flat fill) --
+  but `screenshots/Olvwm-desktop.jpg` was flagged live as showing a
+  beveled arrow, the same three-layer treatment the window-menu button's
+  own chevron mark (`MENU_MARK_TOP`/`_BOTTOM`/`_FILL`) already got
+  earlier this session. Worth revisiting with the same live-pixel-
+  comparison discipline used for the pushpin/button bevel fixes, since
+  this looks like the same "assumed flat 2D instead of real 3D" mistake
+  in a third place -- not yet confirmed which of the doc comment's
+  two-branch claim or the screenshot is right, or whether the real
+  answer depends on some `olwm.info` 3D-mode setting neither traces
+  captured.
+- To-do, noted during the same testing pass, also not acted on yet: the
+  icon menu (`open_icon_menu`) can extend past the bottom of its
+  output entirely uncorrected (`share/icon-menu-conceal.png`), unlike
+  real olvwm, which always keeps a popup menu fully on-screen,
+  repositioning it if the spot that would normally anchor it doesn't
+  leave enough room. None of olwc's four menu popups
+  (window menu, icon menu, workspace submenu, root menu) currently clamp
+  their position to their output's bounds -- worth a dedicated pass
+  across all of them together rather than just the icon menu, since
+  they'd all share the same fix.

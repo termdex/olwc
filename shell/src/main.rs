@@ -224,6 +224,38 @@ const POPUP_PUSHPIN_HEIGHT: i32 = 14;
 // (currently just Move to Workspace) rather than acting immediately.
 const SUBMENU_ARROW_SIZE: i32 = 8;
 
+// The "Mouseless" keyboard-navigation location cursor (see
+// draw_loc_cursor): a solid right-pointing triangle, traced directly
+// from real olvwm's DrawLocCursor (menu.c) -- XFillPolygon at relative
+// offsets (17,y)/(6,y-6)/(6,y+6), i.e. 11 wide, 12 tall, its flat edge
+// inset 6px from the row's left edge. Not an OLGlyph bitmap (real
+// source computes it directly too), so these are pixel offsets to
+// rasterize geometrically, not a font-derived size -- tune against a
+// live reference screenshot if the proportions look off once rendered,
+// same as every other traced glyph this session.
+const LOC_CURSOR_INSET: i32 = 6;
+const LOC_CURSOR_WIDTH: i32 = 11;
+const LOC_CURSOR_HEIGHT: i32 = 12;
+
+// Left inset for a menu item's own label text, reserved on every row
+// uniformly -- not just a row that happens to be keyboard-highlighted
+// right now -- so the location-cursor arrow never overlaps the first
+// character once it appears. Confirmed live: real olvwm reserves this
+// room on every row regardless of highlight state (share/pill-arrow-
+// bsd.png shows every label, highlighted or not, starting at the same
+// indent), rather than shifting text only when the arrow is shown.
+const MENU_ITEM_TEXT_INSET: i32 = MENU_PILL_MARGIN + LOC_CURSOR_INSET + LOC_CURSOR_WIDTH + 3;
+
+// The pill highlight's own left edge, for a row that might carry a
+// location-cursor arrow -- deliberately short of the arrow's full
+// inset so the arrow straddles the pill's left border rather than
+// sitting entirely inside it, matching real olvwm (confirmed live:
+// share/pill-arrow-bsd.png shows the arrow's base poking out past the
+// pill, only its tip actually inside). Applies to the pill unconditionally,
+// not just while an arrow happens to be showing, since mouse hover and
+// keyboard nav share the exact same pill.
+const MENU_PILL_LEFT_INSET: i32 = LOC_CURSOR_INSET + LOC_CURSOR_WIDTH / 2;
+
 // Window decoration (header/title bar). See docs/OPENLOOK-REFERENCE.md's
 // "Window menu" section -- this is the title bar these constants describe;
 // the window-menu popup that its button is meant to open is follow-up work
@@ -513,6 +545,20 @@ enum ButtonPress {
     MenuOpen,
 }
 
+/// Which menu currently holds `keyboard_focus`, if any -- resolved the
+/// same way `press_key`'s Escape handling already tells them apart
+/// (`Olshell::focused_menu`). Backs keyboard Up/Down/Left/Right/Space
+/// navigation (see `navigate_focused_menu`/`execute_focused_menu_item`),
+/// so a workspace submenu is distinguished from its parent window menu
+/// even though the two share one keyboard-focused surface (see
+/// WindowMenu's doc comment).
+enum FocusedMenu {
+    Popup(usize),
+    WindowMenu,
+    WorkspaceSubmenu,
+    IconMenu,
+}
+
 /// A resize handle: a small subsurface of the header (same trick as the
 /// window menu -- both are olshell-owned surfaces, so no protocol
 /// extension needed) positioned at one edge or corner of the toplevel.
@@ -700,6 +746,12 @@ struct WindowMenu {
     /// chrome fields for the same reasoning).
     scale: i32,
     hovered: Option<usize>,
+    /// Whether `hovered` was most recently set by a keyboard nav action
+    /// (Up/Down) rather than mouse motion -- draw_loc_cursor's arrow
+    /// shows only then, mirroring real olvwm's menuHandleMotion erasing
+    /// it the instant the mouse moves again. See LOC_CURSOR_*'s doc
+    /// comment.
+    loc_cursor: bool,
     /// The "Move to Workspace" submenu, if currently open -- see
     /// WorkspaceSubmenu's doc comment.
     workspace_submenu: Option<WorkspaceSubmenu>,
@@ -745,6 +797,8 @@ struct IconMenu {
     /// Integer buffer_scale, updated by scale_factor_changed.
     scale: i32,
     hovered: Option<usize>,
+    /// See WindowMenu::loc_cursor's doc comment.
+    loc_cursor: bool,
 }
 
 impl IconMenu {
@@ -790,6 +844,8 @@ struct WorkspaceSubmenu {
     width: u32,
     height: u32,
     hovered: Option<usize>,
+    /// See WindowMenu::loc_cursor's doc comment.
+    loc_cursor: bool,
     // Snapshotted at open time -- doesn't react to a workspace count or
     // output arrangement changing while open, a rare enough
     // reconfiguration that re-deriving row layout live isn't worth the
@@ -844,6 +900,8 @@ struct MenuPopup {
     /// Integer buffer_scale, updated by scale_factor_changed.
     scale: i32,
     hovered: Option<usize>,
+    /// See WindowMenu::loc_cursor's doc comment.
+    loc_cursor: bool,
     // Pin-to-persist (OPEN LOOK's pushpin gesture): clicking the pushpin
     // in the header converts a transient popup into a persistent one that
     // survives a release and can be used repeatedly, until the pushpin is
@@ -1809,8 +1867,12 @@ impl Olshell {
         // The extra MENU_H_PADDING + SUBMENU_ARROW_SIZE is Move to
         // Workspace's submenu-indicator arrow (see draw_window_menu) --
         // reserved on every row, not just that one, so the popup doesn't
-        // need a different width depending on which item has it.
-        let width = (max_width + MENU_H_PADDING * 3 + SUBMENU_ARROW_SIZE + accel_width).max(80) as u32;
+        // need a different width depending on which item has it. The
+        // left margin uses MENU_ITEM_TEXT_INSET rather than a second
+        // MENU_H_PADDING, matching where item text actually starts (see
+        // its own doc comment).
+        let width =
+            (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING * 2 + SUBMENU_ARROW_SIZE + accel_width).max(80) as u32;
         let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface.clone(), qh);
@@ -1845,6 +1907,7 @@ impl Olshell {
             height,
             scale: 1,
             hovered: None,
+            loc_cursor: false,
             workspace_submenu: None,
         });
         self.draw_window_menu();
@@ -1944,7 +2007,10 @@ impl Olshell {
                 // Equivalent to the manual per-pixel loop this replaced,
                 // now via fill_rect so the scale multiplication happens in
                 // one place rather than needing its own here too.
-                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                if wm.loc_cursor {
+                    draw_loc_cursor(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, MENU_ROW_HEIGHT);
+                }
             }
             let color = if disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             let label = if matches!(item.action, WindowMenuAction::ToggleSticky) && sticky {
@@ -1953,7 +2019,7 @@ impl Olshell {
                 item.label
             };
             draw_text_row_centered(
-                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
                 label, &self.font, MENU_FONT_SIZE, color,
             );
             if matches!(item.action, WindowMenuAction::MoveToWorkspace) {
@@ -2038,7 +2104,9 @@ impl Olshell {
             label.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum()
         };
         let max_width = ICON_MENU_ITEMS.iter().map(|item| label_width(item.label)).max().unwrap_or(0);
-        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        // Left margin uses MENU_ITEM_TEXT_INSET rather than a second
+        // MENU_H_PADDING, matching where item text actually starts.
+        let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING).max(80) as u32;
         let height = (ICON_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let bg_surface = self.backgrounds[background_index].layer.wl_surface().clone();
@@ -2065,6 +2133,7 @@ impl Olshell {
             height,
             scale: 1,
             hovered: None,
+            loc_cursor: false,
         });
         self.draw_icon_menu();
 
@@ -2081,6 +2150,60 @@ impl Olshell {
             }
             im.subsurface.destroy();
             im.surface.destroy();
+        }
+    }
+
+    /// Runs `ICON_MENU_ITEMS[index]`'s action for one icon (or its whole
+    /// multi-selection `group`, see `IconMenu::group`'s doc comment) --
+    /// shared by the mouse Press handler and keyboard Space/Return
+    /// execution (`press_key`). Unlike the window menu, every icon menu
+    /// action closes the menu once run (the caller does that
+    /// unconditionally afterward), so there's nothing to report back.
+    fn execute_icon_menu_item(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId, group: &[ObjectId], background_index: usize, index: usize) {
+        let item = &ICON_MENU_ITEMS[index];
+        if item.disabled {
+            return;
+        }
+        match item.action {
+            IconMenuAction::Open => {
+                for id in group {
+                    self.restore_toplevel(id);
+                }
+            }
+            IconMenuAction::Move => {
+                let output = self.backgrounds[background_index].output.clone();
+                let active_workspace =
+                    self.panels.iter().find(|p| p.output == output).map(|p| p.active_workspace);
+                let icons = active_workspace.map(|w| {
+                    let ids = self.minimized_toplevels_for_output(&output, w);
+                    let height = self.backgrounds[background_index].height as i32;
+                    let rects = self.icon_layout(&ids, height);
+                    group
+                        .iter()
+                        .filter_map(|gid| {
+                            let idx = ids.iter().position(|id| id == gid)?;
+                            let &(x0, y0, ..) = rects.get(idx)?;
+                            Some((gid.clone(), (x0, y0)))
+                        })
+                        .collect::<Vec<_>>()
+                });
+                if let Some(icons) = icons.filter(|icons| !icons.is_empty()) {
+                    let bg = &mut self.backgrounds[background_index];
+                    bg.drag = Some(IconDrag {
+                        primary: toplevel_id.clone(),
+                        press_time: 0,
+                        press_pos: None,
+                        icons,
+                        dragging: true,
+                        armed: true,
+                    });
+                    bg.selected_icons = group.to_vec();
+                    self.request_background_redraw(qh, background_index);
+                }
+            }
+            IconMenuAction::Unimplemented => {
+                log::info!("icon menu: {} not yet implemented", item.label);
+            }
         }
     }
 
@@ -2111,11 +2234,14 @@ impl Olshell {
         for (i, item) in ICON_MENU_ITEMS.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
             if !item.disabled && im.hovered == Some(i) {
-                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                if im.loc_cursor {
+                    draw_loc_cursor(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, MENU_ROW_HEIGHT);
+                }
             }
             let color = if item.disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
             draw_text_row_centered(
-                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
                 item.label, &self.font, MENU_FONT_SIZE, color,
             );
         }
@@ -2219,7 +2345,9 @@ impl Olshell {
             })
             .max()
             .unwrap_or(0);
-        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        // Left margin uses MENU_ITEM_TEXT_INSET rather than a second
+        // MENU_H_PADDING, matching where item text actually starts.
+        let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING).max(80) as u32;
         let height = (rows.len() as i32 * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(wm_surface.clone(), qh);
@@ -2227,7 +2355,8 @@ impl Olshell {
         subsurface.set_desync();
 
         if let Some(wm) = self.window_menu.as_mut() {
-            wm.workspace_submenu = Some(WorkspaceSubmenu { subsurface, surface, width, height, hovered: None, rows });
+            wm.workspace_submenu =
+                Some(WorkspaceSubmenu { subsurface, surface, width, height, hovered: None, loc_cursor: false, rows });
         }
         self.draw_workspace_submenu();
 
@@ -2243,6 +2372,114 @@ impl Olshell {
                 sm.surface.destroy();
             }
         }
+    }
+
+    /// Assigns the toplevel that opened the window menu to the workspace
+    /// named by workspace-submenu row `row_index` -- shared by the mouse
+    /// Press handler and keyboard Space/Return execution. Callers always
+    /// close the whole window menu afterward regardless of whether this
+    /// finds a real Workspace row at `row_index` -- picking a workspace
+    /// (or landing on the disabled current-workspace one) is the whole
+    /// point of the submenu either way.
+    fn execute_workspace_submenu_row(&mut self, row_index: usize) {
+        let selection = self.window_menu.as_ref().and_then(|wm| {
+            let sm = wm.workspace_submenu.as_ref()?;
+            let WorkspaceSubmenuRow::Workspace { output, index, .. } = sm.rows.get(row_index)? else {
+                return None;
+            };
+            Some((wm.toplevel_id.clone(), output.clone(), *index))
+        });
+        if let Some((toplevel_id, output, index)) = selection {
+            if let (Some(panel), Some(handle)) = (
+                self.panels.iter().find(|p| p.output == output),
+                self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref()),
+            ) {
+                panel.workspaces.assign_toplevel(handle, index);
+            }
+        }
+    }
+
+    /// Runs `WINDOW_MENU_ITEMS[index]`'s action for `toplevel_id` -- the
+    /// single execution path shared by the mouse Press handler
+    /// (`PointerHandler::pointer_frame`'s `on_window_menu` arm) and
+    /// keyboard Space/Return execution (`press_key`), so the two trigger
+    /// sources can't drift. Returns whether the window menu should close
+    /// afterward -- false only for Move to Workspace, which opens/closes
+    /// its own submenu instead and leaves the window menu itself open,
+    /// same as the header button toggling the window menu without
+    /// touching anything else.
+    fn execute_window_menu_item(&mut self, qh: &QueueHandle<Self>, toplevel_id: &ObjectId, index: usize) -> bool {
+        let item = &WINDOW_MENU_ITEMS[index];
+        let sticky = self
+            .toplevels
+            .get(toplevel_id)
+            .and_then(|info| info.decoration.as_ref())
+            .is_some_and(|dec| dec.sticky);
+        let disabled = item.disabled || (matches!(item.action, WindowMenuAction::MoveToWorkspace) && sticky);
+        if disabled {
+            return true;
+        }
+        let mut close_menu = true;
+        match item.action {
+            WindowMenuAction::Minimize => {
+                if let Some(handle) = self.toplevels.get(toplevel_id).and_then(|i| i.handle.as_ref()) {
+                    handle.set_minimized();
+                }
+            }
+            WindowMenuAction::ToggleMaximize => {
+                if let Some(info) = self.toplevels.get(toplevel_id) {
+                    if let Some(handle) = info.handle.as_ref() {
+                        if info.states.contains(&0) {
+                            handle.unset_maximized();
+                        } else {
+                            handle.set_maximized();
+                        }
+                    }
+                }
+            }
+            WindowMenuAction::Move => {
+                if let Some(dec) = self.toplevels.get(toplevel_id).and_then(|i| i.decoration.as_ref()) {
+                    // held=0: this is a discrete menu selection, not a
+                    // held drag -- see the protocol doc comment on why
+                    // that has to be asserted rather than inferred by
+                    // olcore. True regardless of whether this ran from a
+                    // mouse click or a keyboard Space/Return.
+                    dec.object._move(0);
+                }
+            }
+            WindowMenuAction::Resize => {
+                if let Some(dec) = self.toplevels.get(toplevel_id).and_then(|i| i.decoration.as_ref()) {
+                    dec.object.resize(EDGE_BOTTOM | EDGE_RIGHT, 0);
+                }
+            }
+            WindowMenuAction::Lower => {
+                if let Some(dec) = self.toplevels.get(toplevel_id).and_then(|i| i.decoration.as_ref()) {
+                    dec.object.lower();
+                }
+            }
+            WindowMenuAction::Quit => {
+                if let Some(dec) = self.toplevels.get(toplevel_id).and_then(|i| i.decoration.as_ref()) {
+                    dec.object.quit();
+                }
+            }
+            WindowMenuAction::ToggleSticky => {
+                if let Some(dec) = self.toplevels.get(toplevel_id).and_then(|i| i.decoration.as_ref()) {
+                    dec.object.toggle_sticky();
+                }
+            }
+            WindowMenuAction::MoveToWorkspace => {
+                if self.window_menu.as_ref().is_some_and(|wm| wm.workspace_submenu.is_some()) {
+                    self.close_workspace_submenu();
+                } else {
+                    self.open_workspace_submenu(qh, toplevel_id);
+                }
+                close_menu = false;
+            }
+            WindowMenuAction::Unimplemented => {
+                log::info!("window menu: {} not yet implemented", item.label);
+            }
+        }
+        close_menu
     }
 
     fn draw_workspace_submenu(&mut self) {
@@ -2281,7 +2518,10 @@ impl Olshell {
             let hovered = matches!(row, WorkspaceSubmenuRow::Workspace { current: false, .. })
                 && sm.hovered == Some(i);
             if hovered {
-                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                if sm.loc_cursor {
+                    draw_loc_cursor(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, MENU_ROW_HEIGHT);
+                }
             }
             let (label, color) = match row {
                 WorkspaceSubmenuRow::OutputHeader { name } => (name.clone(), MENU_TITLE_COLOR),
@@ -2291,7 +2531,7 @@ impl Olshell {
                 ),
             };
             draw_text_row_centered(
-                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
                 &label, &self.font, MENU_FONT_SIZE, color,
             );
         }
@@ -2336,7 +2576,9 @@ impl Olshell {
         for item in &items {
             max_width = max_width.max(label_width(item.label()));
         }
-        let width = (max_width + MENU_H_PADDING * 2).max(80) as u32;
+        // Left margin uses MENU_ITEM_TEXT_INSET rather than a second
+        // MENU_H_PADDING, matching where item text actually starts.
+        let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING).max(80) as u32;
         // Header row (pushpin, always present) + one row per item.
         let rows = items.len() as i32 + 1;
         let height = (rows * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
@@ -2366,6 +2608,7 @@ impl Olshell {
             height,
             scale: 1,
             hovered: None,
+            loc_cursor: false,
             pinned: false,
         });
     }
@@ -2375,6 +2618,36 @@ impl Olshell {
     /// wl_surface, in the order the protocol requires. Destroying the
     /// wl_surface ourselves first (as this used to do) is a protocol
     /// violation: "surface was destroyed before its role object".
+    /// Runs `self.popups[popup_index].items[item_index]`'s action --
+    /// shared by the mouse Release handler and keyboard Space/Return
+    /// execution. Returns whether the popup should close afterward: never
+    /// if it's pinned (a pinned popup stays up like a persistent palette
+    /// regardless of what's picked in it, same as the mouse handler's
+    /// existing rule), otherwise always -- matching every `MenuNode`
+    /// variant's outcome today, `Submenu` included (not yet interactive
+    /// at all, a separate, pre-existing limitation this doesn't change).
+    fn execute_popup_item(&mut self, qh: &QueueHandle<Self>, popup_index: usize, item_index: usize) -> bool {
+        let popup = &mut self.popups[popup_index];
+        let mut command_to_run = None;
+        let mut exit_requested_on = None;
+        match &popup.items[item_index] {
+            MenuNode::Item { command, .. } => command_to_run = Some(command.clone()),
+            MenuNode::Submenu { .. } => log::info!("root menu: submenus aren't interactive yet"),
+            MenuNode::Exit { .. } => exit_requested_on = Some(popup.output.clone()),
+        }
+        let should_close = !popup.pinned;
+        if let Some(command) = command_to_run {
+            Self::run_command(&command);
+        }
+        // Doesn't terminate anything itself -- opens the confirmation
+        // Notice (see its own doc comment), which is what actually sends
+        // session_manager.exit() if its Exit button is clicked.
+        if let Some(output) = exit_requested_on {
+            self.open_notice(qh, &output);
+        }
+        should_close
+    }
+
     fn close_menu(&mut self, index: usize) {
         let popup = self.popups.remove(index);
         // Don't wait for a leave event that destroying our own surface may
@@ -2382,6 +2655,133 @@ impl Olshell {
         // later Escape doesn't look this surface up and find nothing.
         if self.keyboard_focus.as_ref() == Some(popup.layer.wl_surface()) {
             self.keyboard_focus = None;
+        }
+    }
+
+    /// Which menu, if any, currently holds `keyboard_focus` -- the same
+    /// three-way check `press_key`'s Escape handling already does,
+    /// factored out so keyboard nav (Up/Down/Left/Right/Space) can reuse
+    /// it instead of repeating it per key. See FocusedMenu's doc comment
+    /// for why the workspace submenu needs distinguishing from its parent
+    /// even though they share one focused surface.
+    fn focused_menu(&self) -> Option<FocusedMenu> {
+        let surface = self.keyboard_focus.as_ref()?;
+        if let Some(index) = self.popup_at(surface) {
+            Some(FocusedMenu::Popup(index))
+        } else if self.window_menu.as_ref().is_some_and(|wm| wm.surface == *surface) {
+            if self.window_menu.as_ref().is_some_and(|wm| wm.workspace_submenu.is_some()) {
+                Some(FocusedMenu::WorkspaceSubmenu)
+            } else {
+                Some(FocusedMenu::WindowMenu)
+            }
+        } else if self.icon_menu.as_ref().is_some_and(|im| im.surface == *surface) {
+            Some(FocusedMenu::IconMenu)
+        } else {
+            None
+        }
+    }
+
+    /// Moves the keyboard highlight of whichever menu currently holds
+    /// `keyboard_focus` to the next (`forward`) or previous selectable
+    /// item, via `step_selectable` -- direct translation of real olvwm's
+    /// `menuHandleUpDownMotion` (menu.c), applied uniformly to all four
+    /// menu types (see docs/DESIGN.md for the shared-shape reasoning).
+    /// A no-op if no menu is focused.
+    fn navigate_focused_menu(&mut self, forward: bool) {
+        match self.focused_menu() {
+            Some(FocusedMenu::Popup(i)) => {
+                let popup = &mut self.popups[i];
+                let next = step_selectable(popup.hovered, popup.items.len(), forward, |_| true);
+                popup.hovered = next;
+                popup.loc_cursor = next.is_some();
+                draw_popup(&mut self.pool, &self.font, popup);
+            }
+            Some(FocusedMenu::WindowMenu) => {
+                let toplevel_id = self.window_menu.as_ref().map(|wm| wm.toplevel_id.clone());
+                let sticky = toplevel_id.as_ref().is_some_and(|id| {
+                    self.toplevels.get(id).and_then(|info| info.decoration.as_ref()).is_some_and(|dec| dec.sticky)
+                });
+                if let Some(wm) = self.window_menu.as_mut() {
+                    let next = step_selectable(wm.hovered, WINDOW_MENU_ITEMS.len(), forward, |i| {
+                        let item = &WINDOW_MENU_ITEMS[i];
+                        !item.disabled && !(sticky && matches!(item.action, WindowMenuAction::MoveToWorkspace))
+                    });
+                    wm.hovered = next;
+                    wm.loc_cursor = next.is_some();
+                }
+                self.draw_window_menu();
+            }
+            Some(FocusedMenu::WorkspaceSubmenu) => {
+                if let Some(sm) = self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut()) {
+                    let next = step_selectable(sm.hovered, sm.rows.len(), forward, |i| sm.is_selectable(i));
+                    sm.hovered = next;
+                    sm.loc_cursor = next.is_some();
+                }
+                self.draw_workspace_submenu();
+            }
+            Some(FocusedMenu::IconMenu) => {
+                if let Some(im) = self.icon_menu.as_mut() {
+                    let next =
+                        step_selectable(im.hovered, ICON_MENU_ITEMS.len(), forward, |i| !ICON_MENU_ITEMS[i].disabled);
+                    im.hovered = next;
+                    im.loc_cursor = next.is_some();
+                }
+                self.draw_icon_menu();
+            }
+            None => {}
+        }
+    }
+
+    /// Runs whatever item is currently keyboard-highlighted in whichever
+    /// menu holds `keyboard_focus` -- real olvwm's Space/Return
+    /// (`ACTION_SELECT`/`ACTION_EXEC_DEFAULT`) behavior, reusing the same
+    /// execute_* helpers the mouse handlers call. A no-op, deliberately
+    /// not even closing the menu, if nothing is currently highlighted --
+    /// real source always executes *something* here by falling back to a
+    /// `buttonDefault` olwc's item lists don't model (see
+    /// `step_selectable`'s doc comment), so silently doing nothing is a
+    /// safer stand-in than guessing at one.
+    fn execute_focused_menu_item(&mut self, qh: &QueueHandle<Self>) {
+        match self.focused_menu() {
+            Some(FocusedMenu::Popup(i)) => {
+                if let Some(item_index) = self.popups.get(i).and_then(|p| p.hovered) {
+                    if self.execute_popup_item(qh, i, item_index) {
+                        self.close_menu(i);
+                    }
+                }
+            }
+            Some(FocusedMenu::WindowMenu) => {
+                let selection = self
+                    .window_menu
+                    .as_ref()
+                    .and_then(|wm| wm.hovered.map(|index| (wm.toplevel_id.clone(), index)));
+                if let Some((toplevel_id, index)) = selection {
+                    if self.execute_window_menu_item(qh, &toplevel_id, index) {
+                        self.close_window_menu();
+                    }
+                }
+            }
+            Some(FocusedMenu::WorkspaceSubmenu) => {
+                let row_index = self
+                    .window_menu
+                    .as_ref()
+                    .and_then(|wm| wm.workspace_submenu.as_ref())
+                    .and_then(|sm| sm.hovered);
+                if let Some(row_index) = row_index {
+                    self.execute_workspace_submenu_row(row_index);
+                    self.close_window_menu();
+                }
+            }
+            Some(FocusedMenu::IconMenu) => {
+                let selection = self.icon_menu.as_ref().and_then(|im| {
+                    im.hovered.map(|index| (im.toplevel_id.clone(), im.group.clone(), im.background_index, index))
+                });
+                if let Some((toplevel_id, group, background_index, index)) = selection {
+                    self.execute_icon_menu_item(qh, &toplevel_id, &group, background_index, index);
+                    self.close_icon_menu();
+                }
+            }
+            None => {}
         }
     }
 
@@ -2831,10 +3231,13 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
     for (i, item) in popup.items.iter().enumerate() {
         let row_y0 = (row + i as i32) * MENU_ROW_HEIGHT;
         if popup.hovered == Some(i) {
-            draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+            draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+            if popup.loc_cursor {
+                draw_loc_cursor(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, MENU_ROW_HEIGHT);
+            }
         }
         draw_text_row_centered(
-            canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_H_PADDING,
+            canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
             item.label(), font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
         );
     }
@@ -3900,6 +4303,60 @@ fn draw_submenu_arrow(
     draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, SUBMENU_ARROW_GLYPH, color);
 }
 
+/// Moves a menu's keyboard highlight to the next (`forward`) or previous
+/// item, wrapping around and skipping anything `selectable` rejects --
+/// mirrors real olvwm's `nextItem`/`prevItem` (menu.c). Returns `None`
+/// only if nothing in `0..count` is selectable at all. With no current
+/// highlight, `Down` lands on the first selectable item and `Up` on the
+/// last -- olwc's item lists have no `buttonDefault` equivalent to land
+/// on instead, so this is the closest reasonable stand-in.
+fn step_selectable(current: Option<usize>, count: usize, forward: bool, selectable: impl Fn(usize) -> bool) -> Option<usize> {
+    if count == 0 {
+        return None;
+    }
+    let start = match current {
+        Some(i) => i,
+        None => {
+            return if forward { (0..count).find(|&i| selectable(i)) } else { (0..count).rev().find(|&i| selectable(i)) };
+        }
+    };
+    for step in 1..=count {
+        let i = if forward { (start + step) % count } else { (start + count - step) % count };
+        if selectable(i) {
+            return Some(i);
+        }
+    }
+    None
+}
+
+/// Real olvwm's "Mouseless" keyboard-navigation indicator (see
+/// LOC_CURSOR_*'s doc comment): a solid right-pointing triangle at a
+/// highlighted row's left edge, layered on top of that row's pill
+/// highlight -- shown only while the highlight was most recently moved
+/// by a key press, not a mouse hover (see each menu's `loc_cursor`
+/// field). Rasterized directly rather than via draw_glyph_bitmap, since
+/// real olvwm draws it with XFillPolygon at fixed offsets too, not a
+/// font glyph.
+fn draw_loc_cursor(canvas: &mut [u8], canvas_width: i32, canvas_height: i32, scale: i32, row_x0: i32, row_y0: i32, row_height: i32) {
+    let base_x = (row_x0 + LOC_CURSOR_INSET) * scale;
+    let tip_x = base_x + LOC_CURSOR_WIDTH * scale;
+    let mid_y = (row_y0 + row_height / 2) * scale;
+    let half_h = (LOC_CURSOR_HEIGHT * scale) / 2;
+    let (r, g, b) = MENU_TEXT_COLOR;
+    for y in (mid_y - half_h).max(0)..(mid_y + half_h).min(canvas_height) {
+        let dy = (y - mid_y).abs();
+        let width_here = (tip_x - base_x) - (dy * (tip_x - base_x)) / half_h.max(1);
+        let x1 = (base_x + width_here).min(canvas_width);
+        for x in base_x.max(0)..x1 {
+            let idx = ((y * canvas_width + x) * 4) as usize;
+            canvas[idx] = b;
+            canvas[idx + 1] = g;
+            canvas[idx + 2] = r;
+            canvas[idx + 3] = 0xFF;
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_text_at(
     canvas: &mut [u8],
@@ -4858,12 +5315,16 @@ impl PointerHandler for Olshell {
                             !item.disabled
                                 && !(sticky && matches!(item.action, WindowMenuAction::MoveToWorkspace))
                         });
-                        if wm.hovered != hovered {
-                            wm.hovered = hovered;
-                            true
-                        } else {
-                            false
-                        }
+                        // Real olvwm's menuHandleMotion erases the
+                        // location cursor the instant a mouse motion
+                        // event arrives, even landing back on the same
+                        // row a keyboard nav action last highlighted --
+                        // mirrored here by treating losing loc_cursor
+                        // alone as a change worth redrawing for too.
+                        let changed = wm.hovered != hovered || wm.loc_cursor;
+                        wm.hovered = hovered;
+                        wm.loc_cursor = false;
+                        changed
                     } else {
                         false
                     };
@@ -4876,6 +5337,7 @@ impl PointerHandler for Olshell {
                     if had_hover {
                         if let Some(wm) = self.window_menu.as_mut() {
                             wm.hovered = None;
+                            wm.loc_cursor = false;
                         }
                         self.draw_window_menu();
                     }
@@ -4884,109 +5346,10 @@ impl PointerHandler for Olshell {
                     let selection = self.window_menu.as_ref().and_then(|wm| {
                         wm.item_at(event.position.1).map(|index| (wm.toplevel_id.clone(), index))
                     });
-                    // Everything else closes the whole window menu once
-                    // handled; Move to Workspace instead opens (or closes)
-                    // its submenu and leaves the window menu itself open,
-                    // same as clicking the header button toggles the
-                    // window menu without touching anything else.
-                    let mut close_menu = true;
-                    if let Some((toplevel_id, index)) = selection {
-                        let item = &WINDOW_MENU_ITEMS[index];
-                        let sticky = self
-                            .toplevels
-                            .get(&toplevel_id)
-                            .and_then(|info| info.decoration.as_ref())
-                            .is_some_and(|dec| dec.sticky);
-                        let disabled = item.disabled
-                            || (matches!(item.action, WindowMenuAction::MoveToWorkspace) && sticky);
-                        if !disabled {
-                            match item.action {
-                                WindowMenuAction::Minimize => {
-                                    if let Some(handle) =
-                                        self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref())
-                                    {
-                                        handle.set_minimized();
-                                    }
-                                }
-                                WindowMenuAction::ToggleMaximize => {
-                                    if let Some(info) = self.toplevels.get(&toplevel_id) {
-                                        if let Some(handle) = info.handle.as_ref() {
-                                            if info.states.contains(&0) {
-                                                handle.unset_maximized();
-                                            } else {
-                                                handle.set_maximized();
-                                            }
-                                        }
-                                    }
-                                }
-                                WindowMenuAction::Move => {
-                                    if let Some(dec) = self
-                                        .toplevels
-                                        .get(&toplevel_id)
-                                        .and_then(|i| i.decoration.as_ref())
-                                    {
-                                        // held=0: this is a discrete menu
-                                        // click, not a held drag -- see
-                                        // the protocol doc comment on why
-                                        // that has to be asserted rather
-                                        // than inferred by olcore.
-                                        dec.object._move(0);
-                                    }
-                                }
-                                WindowMenuAction::Resize => {
-                                    if let Some(dec) = self
-                                        .toplevels
-                                        .get(&toplevel_id)
-                                        .and_then(|i| i.decoration.as_ref())
-                                    {
-                                        dec.object.resize(EDGE_BOTTOM | EDGE_RIGHT, 0);
-                                    }
-                                }
-                                WindowMenuAction::Lower => {
-                                    if let Some(dec) = self
-                                        .toplevels
-                                        .get(&toplevel_id)
-                                        .and_then(|i| i.decoration.as_ref())
-                                    {
-                                        dec.object.lower();
-                                    }
-                                }
-                                WindowMenuAction::Quit => {
-                                    if let Some(dec) = self
-                                        .toplevels
-                                        .get(&toplevel_id)
-                                        .and_then(|i| i.decoration.as_ref())
-                                    {
-                                        dec.object.quit();
-                                    }
-                                }
-                                WindowMenuAction::ToggleSticky => {
-                                    if let Some(dec) = self
-                                        .toplevels
-                                        .get(&toplevel_id)
-                                        .and_then(|i| i.decoration.as_ref())
-                                    {
-                                        dec.object.toggle_sticky();
-                                    }
-                                }
-                                WindowMenuAction::MoveToWorkspace => {
-                                    if self
-                                        .window_menu
-                                        .as_ref()
-                                        .is_some_and(|wm| wm.workspace_submenu.is_some())
-                                    {
-                                        self.close_workspace_submenu();
-                                    } else {
-                                        self.open_workspace_submenu(qh, &toplevel_id);
-                                    }
-                                    close_menu = false;
-                                }
-                                WindowMenuAction::Unimplemented => {
-                                    log::info!("window menu: {} not yet implemented", item.label);
-                                }
-                            }
-                        }
-                    }
+                    let close_menu = match selection {
+                        Some((toplevel_id, index)) => self.execute_window_menu_item(qh, &toplevel_id, index),
+                        None => true,
+                    };
                     if close_menu {
                         self.close_window_menu();
                     }
@@ -4994,12 +5357,13 @@ impl PointerHandler for Olshell {
                 PointerEventKind::Motion { .. } if on_icon_menu => {
                     let changed = if let Some(im) = self.icon_menu.as_mut() {
                         let hovered = im.item_at(event.position.1).filter(|&i| !ICON_MENU_ITEMS[i].disabled);
-                        if im.hovered != hovered {
-                            im.hovered = hovered;
-                            true
-                        } else {
-                            false
-                        }
+                        // See WindowMenu's matching Motion arm's comment
+                        // on why losing loc_cursor alone still counts as
+                        // a change.
+                        let changed = im.hovered != hovered || im.loc_cursor;
+                        im.hovered = hovered;
+                        im.loc_cursor = false;
+                        changed
                     } else {
                         false
                     };
@@ -5012,6 +5376,7 @@ impl PointerHandler for Olshell {
                     if had_hover {
                         if let Some(im) = self.icon_menu.as_mut() {
                             im.hovered = None;
+                            im.loc_cursor = false;
                         }
                         self.draw_icon_menu();
                     }
@@ -5022,58 +5387,7 @@ impl PointerHandler for Olshell {
                             .map(|index| (im.toplevel_id.clone(), im.group.clone(), im.background_index, index))
                     });
                     if let Some((toplevel_id, group, background_index, index)) = selection {
-                        let item = &ICON_MENU_ITEMS[index];
-                        if !item.disabled {
-                            match item.action {
-                                // Acts on the whole group -- just
-                                // toplevel_id unless the menu was opened on
-                                // an icon that was part of a multi-
-                                // selection (see IconMenu::group's doc
-                                // comment).
-                                IconMenuAction::Open => {
-                                    for id in &group {
-                                        self.restore_toplevel(id);
-                                    }
-                                }
-                                IconMenuAction::Move => {
-                                    let output = self.backgrounds[background_index].output.clone();
-                                    let active_workspace = self
-                                        .panels
-                                        .iter()
-                                        .find(|p| p.output == output)
-                                        .map(|p| p.active_workspace);
-                                    let icons = active_workspace.map(|w| {
-                                        let ids = self.minimized_toplevels_for_output(&output, w);
-                                        let height = self.backgrounds[background_index].height as i32;
-                                        let rects = self.icon_layout(&ids, height);
-                                        group
-                                            .iter()
-                                            .filter_map(|gid| {
-                                                let idx = ids.iter().position(|id| id == gid)?;
-                                                let &(x0, y0, ..) = rects.get(idx)?;
-                                                Some((gid.clone(), (x0, y0)))
-                                            })
-                                            .collect::<Vec<_>>()
-                                    });
-                                    if let Some(icons) = icons.filter(|icons| !icons.is_empty()) {
-                                        let bg = &mut self.backgrounds[background_index];
-                                        bg.drag = Some(IconDrag {
-                                            primary: toplevel_id,
-                                            press_time: 0,
-                                            press_pos: None,
-                                            icons,
-                                            dragging: true,
-                                            armed: true,
-                                        });
-                                        bg.selected_icons = group;
-                                        self.request_background_redraw(qh, background_index);
-                                    }
-                                }
-                                IconMenuAction::Unimplemented => {
-                                    log::info!("icon menu: {} not yet implemented", item.label);
-                                }
-                            }
-                        }
+                        self.execute_icon_menu_item(qh, &toplevel_id, &group, background_index, index);
                     }
                     self.close_icon_menu();
                 }
@@ -5127,12 +5441,13 @@ impl PointerHandler for Olshell {
                         self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
                     {
                         let hovered = sm.item_at(event.position.1).filter(|&i| sm.is_selectable(i));
-                        if sm.hovered != hovered {
-                            sm.hovered = hovered;
-                            true
-                        } else {
-                            false
-                        }
+                        // See WindowMenu's matching Motion arm's comment
+                        // on why losing loc_cursor alone still counts as
+                        // a change.
+                        let changed = sm.hovered != hovered || sm.loc_cursor;
+                        sm.hovered = hovered;
+                        sm.loc_cursor = false;
+                        changed
                     } else {
                         false
                     };
@@ -5151,26 +5466,18 @@ impl PointerHandler for Olshell {
                             self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut())
                         {
                             sm.hovered = None;
+                            sm.loc_cursor = false;
                         }
                         self.draw_workspace_submenu();
                     }
                 }
                 PointerEventKind::Press { button, .. } if on_workspace_submenu && button == BTN_LEFT => {
-                    let selection = self.window_menu.as_ref().and_then(|wm| {
+                    let row_index = self.window_menu.as_ref().and_then(|wm| {
                         let sm = wm.workspace_submenu.as_ref()?;
-                        let row_index = sm.item_at(event.position.1).filter(|&i| sm.is_selectable(i))?;
-                        let WorkspaceSubmenuRow::Workspace { output, index, .. } = &sm.rows[row_index] else {
-                            unreachable!("is_selectable guarantees a Workspace row");
-                        };
-                        Some((wm.toplevel_id.clone(), output.clone(), *index))
+                        sm.item_at(event.position.1).filter(|&i| sm.is_selectable(i))
                     });
-                    if let Some((toplevel_id, output, index)) = selection {
-                        if let (Some(panel), Some(handle)) = (
-                            self.panels.iter().find(|p| p.output == output),
-                            self.toplevels.get(&toplevel_id).and_then(|i| i.handle.as_ref()),
-                        ) {
-                            panel.workspaces.assign_toplevel(handle, index);
-                        }
+                    if let Some(row_index) = row_index {
+                        self.execute_workspace_submenu_row(row_index);
                     }
                     // The whole point was picking a workspace -- done now,
                     // regardless of whether the press landed on a real row
@@ -5180,15 +5487,19 @@ impl PointerHandler for Olshell {
                 PointerEventKind::Motion { .. } if popup_index.is_some() => {
                     let popup = &mut self.popups[popup_index.unwrap()];
                     let hovered = popup.item_at(event.position.1);
-                    if popup.hovered != hovered {
-                        popup.hovered = hovered;
+                    // See WindowMenu's matching Motion arm's comment on
+                    // why losing loc_cursor alone still counts as a
+                    // change.
+                    let changed = popup.hovered != hovered || popup.loc_cursor;
+                    popup.hovered = hovered;
+                    popup.loc_cursor = false;
+                    if changed {
                         draw_popup(&mut self.pool, &self.font, popup);
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
-                    let mut command_to_run = None;
-                    let mut exit_requested_on = None;
                     let mut close_index = None;
+                    let mut item_selection = None;
 
                     if let Some(i) = popup_index {
                         let popup = &mut self.popups[i];
@@ -5205,20 +5516,7 @@ impl PointerHandler for Olshell {
                                 draw_popup(&mut self.pool, &self.font, popup);
                             }
                         } else if let Some(item_index) = popup.item_at(event.position.1) {
-                            match &popup.items[item_index] {
-                                MenuNode::Item { command, .. } => {
-                                    command_to_run = Some(command.clone());
-                                }
-                                MenuNode::Submenu { .. } => {
-                                    log::info!("root menu: submenus aren't interactive yet");
-                                }
-                                MenuNode::Exit { .. } => {
-                                    exit_requested_on = Some(popup.output.clone());
-                                }
-                            }
-                            if !popup.pinned {
-                                close_index = Some(i);
-                            }
+                            item_selection = Some((i, item_index));
                         } else if !popup.pinned {
                             // Released on this popup's own padding, not an
                             // item or the pushpin.
@@ -5233,15 +5531,10 @@ impl PointerHandler for Olshell {
                         close_index = Some(i);
                     }
 
-                    if let Some(command) = command_to_run {
-                        Self::run_command(&command);
-                    }
-                    // Doesn't terminate anything itself -- opens the
-                    // confirmation Notice (see its own doc comment), which
-                    // is what actually sends session_manager.exit() if its
-                    // Exit button is clicked.
-                    if let Some(output) = exit_requested_on {
-                        self.open_notice(qh, &output);
+                    if let Some((i, item_index)) = item_selection {
+                        if self.execute_popup_item(qh, i, item_index) {
+                            close_index = Some(i);
+                        }
                     }
                     if let Some(i) = close_index {
                         self.close_menu(i);
@@ -5283,7 +5576,7 @@ impl KeyboardHandler for Olshell {
     fn press_key(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
         event: KeyEvent,
@@ -5337,6 +5630,63 @@ impl KeyboardHandler for Olshell {
                     }
                 }
                 self.close_notice();
+            } else {
+                // Real olvwm binds Return/KP_Enter to ACTION_EXEC_DEFAULT
+                // for a menu too -- runs whatever's currently keyboard-
+                // highlighted, same as Space just below.
+                self.execute_focused_menu_item(qh);
+            }
+        } else if event.keysym == Keysym::space {
+            // ACTION_SELECT: menu.c's MenuHandleKeyEvent treats this
+            // identically to Return for a menu (the Notice has no space
+            // binding of its own, so this only ever reaches a menu).
+            self.execute_focused_menu_item(qh);
+        } else if event.keysym == Keysym::Up || event.keysym == Keysym::Down {
+            // ACTION_UP/ACTION_DOWN (menuHandleUpDownMotion).
+            self.navigate_focused_menu(event.keysym == Keysym::Down);
+        } else if event.keysym == Keysym::Right {
+            // ACTION_RIGHT: only meaningful for the window menu's "Move
+            // to Workspace" row today -- olwc's other menus have no
+            // interactive submenus (the root menu's own Submenu rows
+            // are a separate, pre-existing "not yet interactive"
+            // limitation a Right press doesn't change), so this is a
+            // no-op everywhere else, matching what a click on a
+            // non-submenu item already does.
+            let selection = self.window_menu.as_ref().and_then(|wm| {
+                let index = wm.hovered?;
+                matches!(WINDOW_MENU_ITEMS[index].action, WindowMenuAction::MoveToWorkspace)
+                    .then(|| wm.toplevel_id.clone())
+            });
+            if let Some(toplevel_id) = selection {
+                let sticky = self
+                    .toplevels
+                    .get(&toplevel_id)
+                    .and_then(|info| info.decoration.as_ref())
+                    .is_some_and(|dec| dec.sticky);
+                if !sticky {
+                    self.open_workspace_submenu(qh, &toplevel_id);
+                    // Land on its first selectable row immediately,
+                    // rather than requiring an extra Down press -- real
+                    // olvwm's activateSubMenu highlights a starting item
+                    // the same way.
+                    if let Some(sm) = self.window_menu.as_mut().and_then(|wm| wm.workspace_submenu.as_mut()) {
+                        let first = step_selectable(None, sm.rows.len(), true, |i| sm.is_selectable(i));
+                        sm.hovered = first;
+                        sm.loc_cursor = first.is_some();
+                    }
+                    self.draw_workspace_submenu();
+                }
+            }
+        } else if event.keysym == Keysym::Left {
+            // ACTION_LEFT: closes the current level (just the submenu, if
+            // one's open) or, at the top, the whole menu without
+            // executing anything -- same outcome as Escape.
+            match self.focused_menu() {
+                Some(FocusedMenu::WorkspaceSubmenu) => self.close_workspace_submenu(),
+                Some(FocusedMenu::WindowMenu) => self.close_window_menu(),
+                Some(FocusedMenu::IconMenu) => self.close_icon_menu(),
+                Some(FocusedMenu::Popup(i)) => self.close_menu(i),
+                None => {}
             }
         }
     }
