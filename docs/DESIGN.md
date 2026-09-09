@@ -1554,3 +1554,69 @@ with wlroots compositors generally, not just this project.
   layout-constant-driven compression), and the pinned glyphs' native
   15x15 size is small enough that one fine gradient partially aliases
   away rather than being a code defect to fix.
+- ~~Window-menu button: flat housing and chevron instead of real 3D
+  bevel shading, and undersized relative to the header.~~ resolved,
+  following directly on the pushpin fix above -- checked whether the
+  same authenticity gap and the same bug classes applied elsewhere.
+  Resize corner handles (`draw_corner_handle`) and the focused/recessed
+  title bar (`paint_row`-based) both turned out not to be at risk: the
+  first computes every pixel's color via per-pixel geometry with no
+  bitmap scaling at all, the second is plain exact-position row fills --
+  neither has the scaling ambiguity either pushpin bug depended on.
+
+  The header button itself was a real match: `BUTTON_GLYPH_NORMAL`/
+  `_PRESSED` were flat, single-glyph renders (encodings 22/23), the same
+  flat-2D-mode choice the pushpin used to make. `lib/libolgx/ol_button.c`
+  confirmed the same 3-layer 3D path (`ABBREV_MENU_UL`/`_LR`, encodings
+  51/52, for the housing) plus a separately-drawn chevron mark
+  (`olgx_draw_menu_mark`, encodings 45/46/47) on top -- and something
+  worth reusing directly: unpressed fill is `OLGX_BG1` (background-
+  matching, already exactly how the existing `fill_rect(...,
+  button_color)` call already worked), pressed fill is `OLGX_BG2`
+  (distinct mid-tone, same one the pushpin fix already introduced).
+
+  Split into two passes rather than one, given how much the pushpin
+  needed: the housing first (`BUTTON_HOUSING_TOP`/`_BOTTOM`, layered like
+  the pushpin, `content_bg`'s existing fill_rect call doing double duty
+  as the fill layer so there's no dense fill glyph to erode the thin
+  edges this time), with the chevron mark deliberately kept flat for
+  that pass -- real olgx's mark has an unusual state-*independent*
+  dark-UL/light-LR convention (the opposite of the housing's own
+  light-top-unless-invoked rule) plus a press-dependent outline-vs-filled
+  switch, an easy detail to get wrong for a very small glyph. A real
+  reference screenshot (`share/chevron-bsd.png`) settled it on a second
+  look, though: pixel-analyzed directly, the chevron region showed a
+  genuine spread of distinct grey tones, not a flat fill, so the flat
+  mark was visibly wrong, not just less pure -- implemented properly as
+  a second pass (`MENU_MARK_TOP`/`_BOTTOM`/`_FILL`, matching the exact
+  state-independent colors and fill_in-only-when-not-pressed rule
+  confirmed from source).
+
+  Three more bugs surfaced only through live, pixel-level comparison
+  against reference screenshots, same as the pushpin:
+
+  1. The mark's own native size (11x11) is much smaller than the
+     housing's (18x16), but `draw_glyph_bitmap` independently scales
+     whatever box it's given to fill as much of it as possible --
+     handing the mark the same full box the housing uses blew it up to
+     dominate the housing instead of sitting inside it. Fixed by
+     insetting the mark's own box; the native font-size ratio (11/18,
+     11/16) still looked crowded once compared live, so the final
+     fraction (half the housing's box) was tuned against the reference
+     rather than derived from the fonts alone.
+  2. `DECORATION_BUTTON_SIZE` was first bumped to match the full header
+     height (`DECORATION_HEIGHT`) to close a real gap -- the button
+     read noticeably smaller than the header row around it, floating
+     with empty space above and below, unlike real olvwm's button, which
+     is flush with the full title-bar height. But the full raw header
+     height includes the top black border strip and (when focused) a
+     bottom margin outside the recessed panel -- confirmed live as the
+     enlarged button visibly drawing over both. Fixed by sizing to the
+     header's own inner content region instead
+     (`DECORATION_HEIGHT - DECORATION_FOCUS_MARGIN_TOP -
+     DECORATION_FOCUS_MARGIN_BOTTOM`) and positioning `button_rect`
+     flush with that region's top edge exactly, rather than a generic
+     centering formula that would have been off by a pixel against it --
+     deliberately keyed to the focused-state margins even for the
+     unfocused header's own simpler bevel treatment, so the button
+     doesn't shift position when focus changes.

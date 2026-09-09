@@ -267,7 +267,15 @@ const DECORATION_FOCUS_MARGIN_BOTTOM: i32 = 5;
 const DECORATION_BEVEL_LIGHT: (u8, u8, u8) = (0xE8, 0xE8, 0xE8);
 const DECORATION_BEVEL_DARK: (u8, u8, u8) = (0x70, 0x70, 0x70);
 const DECORATION_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
-const DECORATION_BUTTON_SIZE: i32 = 14;
+// Flush with the header's own inner content region -- DECORATION_HEIGHT
+// minus the top border strip and bottom margin the focused-state recessed
+// panel already carves out (DECORATION_FOCUS_MARGIN_TOP/_BOTTOM) -- not
+// the full raw header height, which would draw over the black top border
+// and the non-recessed bottom strip. Deliberately keyed to the *focused*
+// margins even for the unfocused header's own simpler bevel treatment,
+// so the button doesn't shift position when focus changes.
+const DECORATION_BUTTON_SIZE: i32 =
+    DECORATION_HEIGHT as i32 - DECORATION_FOCUS_MARGIN_TOP - DECORATION_FOCUS_MARGIN_BOTTOM;
 const DECORATION_BUTTON_MARGIN: i32 = 4;
 const DECORATION_BUTTON_HOVER_COLOR: (u8, u8, u8) = MENU_HOVER_COLOR;
 const DECORATION_FONT_SIZE: f32 = 15.0;
@@ -580,7 +588,11 @@ impl Decoration {
     // by CORNER_HANDLE_SIZE from where they'd otherwise sit.
     fn button_rect(&self) -> (i32, i32, i32, i32) {
         let x0 = CORNER_HANDLE_SIZE + DECORATION_BUTTON_MARGIN;
-        let y0 = (self.height as i32 - DECORATION_BUTTON_SIZE) / 2;
+        // Flush with the top of the header's inner content region, not
+        // centered -- DECORATION_BUTTON_SIZE's own doc comment covers why
+        // this has to be the exact margin, not a generic (height-size)/2
+        // centering formula (which would be off by a pixel here).
+        let y0 = DECORATION_FOCUS_MARGIN_TOP;
         (x0, y0, x0 + DECORATION_BUTTON_SIZE, y0 + DECORATION_BUTTON_SIZE)
     }
 
@@ -1654,7 +1666,7 @@ impl Olshell {
         let (bx0, by0, bx1, by1) = dec.button_rect();
         let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { content_bg };
         fill_rect(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, button_color);
-        draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, dec.button_hovered, DECORATION_TEXT_COLOR);
+        draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, dec.button_hovered);
 
         if !info.title.is_empty() {
             draw_text_row_centered(
@@ -2863,51 +2875,110 @@ fn draw_bold_text_row_centered(
 // nearest-neighbor-scales whatever box the caller asks for, so the source
 // bitmap's own resolution doesn't have to match olshell's chosen sizes.
 
-/// Window-menu button glyph (OLGlyph encoding 22, `OLG_ABBREV_MENU_BUTTON`):
-/// a rounded-square housing around a downward-pointing chevron.
-const BUTTON_GLYPH_NORMAL: &[&str] = &[
-    ".###############..",
-    "#...............#.",
-    "#...............##",
-    "#...............##",
-    "#...#########...##",
-    "#...#.......#...##",
-    "#....#.....#....##",
-    "#....#.....#....##",
-    "#.....#...#.....##",
-    "#.....#...#.....##",
-    "#......#.#......##",
-    "#......#.#......##",
-    "#.......#.......##",
-    "#...............##",
-    "#...............##",
-    ".#################",
-    "..###############.",
+// olgx_draw_abbrev_button's 3D rendering path (confirmed against
+// lib/libolgx/ol_button.c the same way the pushpin fix confirmed
+// olgx_draw_pushpin's) draws the button housing as two layered edge
+// glyphs -- top/highlight, bottom/shadow (encodings 51/52) -- rather than
+// the flat single-glyph combined housing+chevron outline
+// (OLG_ABBREV_MENU_BUTTON/_INVERTED, encodings 22/23) previously used
+// here, the same flat-2D-mode choice the pushpin used to make before its
+// own fix (see docs/DESIGN.md).
+
+/// Button housing, top/highlight bevel edge -- olgx encoding 51
+/// (`ABBREV_MENU_UL`), traced from fonts/bdf/misc/olgl14.bdf.
+const BUTTON_HOUSING_TOP: &[&str] = &[
+    ".################.",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "#.................",
+    "..................",
 ];
 
-/// Window-menu button glyph, invoked/pressed state (encoding 23,
-/// `OLG_ABBREV_MENU_BUTTON_INVERTED`). olshell has no separate button-press
-/// state today (only hover, which already gets its own fill-color change --
-/// see button_rect's caller), so this stands in for hover instead of going
-/// untouched.
-const BUTTON_GLYPH_PRESSED: &[&str] = &[
-    ".###############..",
-    "#...............#.",
-    "#.#############.##",
-    "#.#############.##",
-    "#.##.........##.##",
-    "#.##.#######.##.##",
-    "#.###.#####.###.##",
-    "#.###.#####.###.##",
-    "#.####.###.####.##",
-    "#.####.###.####.##",
-    "#.#####.#.#####.##",
-    "#.#####.#.#####.##",
-    "#.######.######.##",
-    "#.#############.##",
-    "#...............##",
-    ".#################",
-    "..###############.",
+/// Button housing, bottom/shadow bevel edge -- olgx encoding 52
+/// (`ABBREV_MENU_LR`).
+const BUTTON_HOUSING_BOTTOM: &[&str] = &[
+    "..................",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".................#",
+    ".################.",
+];
+
+/// Window-menu button's chevron mark, top/shadow layer -- olgx encoding
+/// 45 (`VERT_MENU_MARK_UL`). Unlike the housing's own bevel, real olgx
+/// draws this one color *unconditionally* dark, regardless of pressed
+/// state (confirmed from `lib/libolgx/ol_button.c`'s
+/// `olgx_draw_menu_mark`), and directly visible in a real reference
+/// screenshot pixel-analyzed live: a genuine spread of distinct grey
+/// tones, not the flat single-color fill this glyph set replaces.
+const MENU_MARK_TOP: &[&str] = &[
+    "###########",
+    "#..........",
+    ".#.........",
+    ".#.........",
+    "..#........",
+    "..#........",
+    "...#.......",
+    "...#.......",
+    "....#......",
+    "....#......",
+    "...........",
+];
+
+/// Chevron mark, bottom/highlight layer -- olgx encoding 46
+/// (`VERT_MENU_MARK_LR`) -- unconditionally light, same reasoning as
+/// MENU_MARK_TOP's doc comment.
+const MENU_MARK_BOTTOM: &[&str] = &[
+    "...........",
+    "..........#",
+    ".........#.",
+    ".........#.",
+    "........#..",
+    "........#..",
+    ".......#...",
+    ".......#...",
+    "......#....",
+    "......#....",
+    ".....#.....",
+];
+
+/// Chevron mark, middle/fill layer -- olgx encoding 47
+/// (`VERT_MENU_MARK_FILL`). Real olgx only draws this when the button
+/// isn't in its pressed state -- see draw_button_glyph's own use of it.
+const MENU_MARK_FILL: &[&str] = &[
+    "...........",
+    ".#########.",
+    "..#######..",
+    "..#######..",
+    "...#####...",
+    "...#####...",
+    "....###....",
+    "....###....",
+    ".....#.....",
+    ".....#.....",
+    "...........",
 ];
 
 // olgx_draw_pushpin's 3D rendering path (real 3D mode, confirmed live
@@ -3701,11 +3772,19 @@ fn fill_rect(
     }
 }
 
-/// Draws the window-menu button's full glyph -- housing and chevron
-/// together, since OLGlyph's own bitmap includes both (see
-/// BUTTON_GLYPH_NORMAL) -- into the given box, scaled to fit. `inverted`
-/// selects the pressed-state glyph; see BUTTON_GLYPH_PRESSED's doc comment
-/// for why olshell's only caller passes hover for this.
+/// Draws the window-menu button: a beveled housing (two layered edge
+/// glyphs, matching real olgx_draw_abbrev_button's 3D path -- light-top/
+/// dark-bottom unless `inverted`, the same raised-unless-invoked
+/// convention used throughout olshell's chrome) with the chevron mark
+/// drawn on top in a single flat color. `inverted` stands in for a
+/// pressed state olshell doesn't otherwise have; olshell's only caller
+/// passes hover for this, same as before this function's housing/chevron
+/// split. The housing's own fill isn't drawn here -- draw_decoration's
+/// existing fill_rect call already covers it (both the background-
+/// matching normal fill and the hover-distinct one), drawn before this
+/// runs, which is also what keeps this safe from the layer-order erosion
+/// draw_pushpin hit once: there's no large dense fill glyph layered
+/// *after* these thin edges to erode them.
 #[allow(clippy::too_many_arguments)]
 fn draw_button_glyph(
     canvas: &mut [u8],
@@ -3717,10 +3796,49 @@ fn draw_button_glyph(
     x1: i32,
     y1: i32,
     inverted: bool,
-    color: (u8, u8, u8),
 ) {
-    let bitmap = if inverted { BUTTON_GLYPH_PRESSED } else { BUTTON_GLYPH_NORMAL };
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, bitmap, color);
+    let (top_color, bottom_color) = if inverted {
+        (DECORATION_BEVEL_DARK, DECORATION_BEVEL_LIGHT)
+    } else {
+        (DECORATION_BEVEL_LIGHT, DECORATION_BEVEL_DARK)
+    };
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, BUTTON_HOUSING_TOP, top_color);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, BUTTON_HOUSING_BOTTOM, bottom_color);
+
+    // draw_glyph_bitmap scales each glyph it's given to fill as much of
+    // its own box as possible -- fine for the housing layers above (both
+    // native BBX 18x16, so they fill this box identically), but the mark
+    // is a smaller native glyph (11x11) meant to sit *within* the larger
+    // housing, not be independently blown up to fill the same box itself
+    // -- confirmed live as the chevron rendering wildly oversized,
+    // dominating the housing rather than sitting inside it. Inset its own
+    // box so it scales proportionally smaller instead. The two native
+    // font sizes' own ratio (11/18, 11/16) still left it looking crowded
+    // against the reference once compared live -- the mark's own bitmap
+    // has "on" pixels touching its full native width/height at the edges
+    // (no inherent margin of its own), so draw_glyph_bitmap fills
+    // whatever box it's given edge-to-edge regardless; a tighter fraction
+    // is what actually buys visual breathing room, tuned against
+    // share/chevron-bsd.png rather than derived from the fonts alone.
+    let (box_w, box_h) = (x1 - x0, y1 - y0);
+    let mark_w = box_w / 2;
+    let mark_h = box_h / 2;
+    let mark_x0 = x0 + (box_w - mark_w) / 2;
+    let mark_y0 = y0 + (box_h - mark_h) / 2;
+    let (mx0, my0, mx1, my1) = (mark_x0, mark_y0, mark_x0 + mark_w, mark_y0 + mark_h);
+
+    // Fill drawn first (same erosion-safety lesson as the pushpin fix),
+    // and only when not inverted -- matching real olgx exactly: the
+    // mark's fill only appears when the housing itself isn't in its
+    // pressed state.
+    if !inverted {
+        draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, mx0, my0, mx1, my1, MENU_MARK_FILL, DECORATION_BG_COLOR);
+    }
+    // Unconditionally dark/light regardless of `inverted` -- see
+    // MENU_MARK_TOP's own doc comment for why this doesn't follow the
+    // housing's light-unless-invoked rule.
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, mx0, my0, mx1, my1, MENU_MARK_TOP, DECORATION_BEVEL_DARK);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, mx0, my0, mx1, my1, MENU_MARK_BOTTOM, DECORATION_BEVEL_LIGHT);
 }
 
 /// Draws a small rightward-pointing wedge -- the window menu's indicator
