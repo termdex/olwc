@@ -1858,3 +1858,28 @@ with wlroots compositors generally, not just this project.
   purely to keep the convention consistent across every multi-layer
   glyph in this file, not because draw order matters for correctness
   here the way it did for the pushpin.
+- ~~Only the icon menu stays on-screen; the root-menu popup, window
+  menu, and workspace submenu don't clamp yet.~~ Root-menu popup
+  resolved: it's a wlr-layer-shell surface anchored `TOP | LEFT` on a
+  known output with a known margin (the click position), the exact same
+  "output-local (x, y) plus a known output size" shape
+  `open_icon_menu`'s own call to `clamp_popup_position` already handles
+  -- just looks up that output's `BackgroundOutput` for its width/height
+  instead of reading them off the icon's own background.
+
+  The window menu (and its workspace submenu, nested inside it) turned
+  out not to be the same trivial reuse this entry originally assumed:
+  it's a subsurface of the toplevel's *decoration header*, positioned in
+  header-local coordinates, and knowing whether it would overflow the
+  *output's* edge needs the header's absolute on-screen position --
+  which olshell has no way to learn at all today. Wayland doesn't hand a
+  client its own absolute position by design, and neither
+  `openlook-decoration` nor the foreign-toplevel-management handle
+  expose it. Clamping within the header's own small local bounds
+  wouldn't solve the actual problem either: a header near the bottom of
+  the screen would still let a much taller menu spill off the bottom
+  regardless of anything clamped locally. Left open, deliberately, per
+  request -- doing this properly needs a real new capability (olcore
+  telling olshell a toplevel's current output-relative position, or
+  olcore taking over the clamping itself), not a few more lines reusing
+  `clamp_popup_position`.

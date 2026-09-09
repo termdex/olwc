@@ -2612,7 +2612,19 @@ impl Olshell {
             Some(output),
         );
         layer.set_anchor(Anchor::TOP | Anchor::LEFT);
-        layer.set_margin(y as i32, 0, 0, x as i32);
+        // Clamped to stay fully on this output -- see
+        // clamp_popup_position's doc comment. (x, y) here is already
+        // output-local (the layer's own TOP|LEFT anchor with this as its
+        // margin), same coordinate space open_icon_menu's own call
+        // already clamps in.
+        let (x, y) = self
+            .backgrounds
+            .iter()
+            .find(|b| &b.output == output)
+            .map_or((x as i32, y as i32), |b| {
+                clamp_popup_position(x as i32, y as i32, width as i32, height as i32, b.width as i32, b.height as i32)
+            });
+        layer.set_margin(y, 0, 0, x);
         layer.set_size(width, height);
         // Exclusive so olcore grants it keyboard focus while mapped (see
         // layer_surface_map() there) -- that's what lets Escape reach us.
