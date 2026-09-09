@@ -1821,3 +1821,40 @@ with wlroots compositors generally, not just this project.
   position by the time it handles the warp. `close_notice` (the single
   shared dismissal path every exit route already funnels through) sends
   `restore_pointer`, a no-op if nothing's pending.
+- ~~Submenu ("pullright") indicator on "Move to Workspace"
+  (`SUBMENU_ARROW_GLYPH`) is a flat, single-color triangle.~~ resolved:
+  confirmed from source that the union of the three real layers
+  (`olgl14.bdf` encodings 48/49/50, `HORIZ_MENU_MARK_UL`/`_LR`/`_FILL`)
+  is pixel-identical to the flat triangle this replaced, so the earlier
+  trace itself wasn't wrong -- `olgx_draw_button`'s call always passes
+  `info->three_d` though, so it should never have rendered flat to
+  begin with, same class of miss as the pushpin and window-menu button's
+  own chevron mark earlier this session. Split into
+  `HORIZ_MENU_MARK_TOP`/`_BOTTOM`/`_FILL`, drawn via `draw_glyph_bitmap`
+  fill-first (same erosion-safety reasoning as those two fixes), with
+  `fill_in` matching real olgx's own `fill_color != OLGX_BG2` rule --
+  shown only when the row isn't the pill-highlighted one, since a
+  highlighted row's fill_color there is `OLGX_BG2` by definition.
+- ~~The window-menu accelerator diamond mark (`DIAMOND_MARK_GLYPH`) is a
+  flat, single-color fill.~~ resolved -- raised as a live side-finding
+  while reviewing the submenu-arrow fix above (`Olvwm-desktop.jpg`, the
+  only available reference for it since the live session had no open
+  submenus to reveal it directly). This glyph's own doc comment already
+  correctly noted it isn't traced from an OLGlyph bitmap font character
+  at all (real `olgx_draw_diamond_mark` draws it procedurally, six
+  `XPoint`s via `XDrawLines`/`XFillPolygon`) -- but that got misread as
+  also meaning it isn't bevel-shaded, when the same function's `3d`
+  branch bevels it exactly like everything else in this file: filled
+  first in `OLGX_BG2`, upper two edges in `OLGX_BG3`, lower two in
+  `OLGX_WHITE` ("light source from above," the function's own comment
+  says). Split into `DIAMOND_MARK_TOP`/`_BOTTOM`/`_FILL` by hand,
+  following this diamond's own existing 9x9 proportions rather than the
+  six raw `XPoint`s (whose exact path doesn't map cleanly onto a
+  discrete bitmap grid at this size), with the middle row shared with
+  the top layer matching source's own "point 3 is 1 pixel below point
+  2" seam between the two outline halves. Drawn via `blit_bitmap`
+  (native size, no scale-to-fit), which doesn't share `draw_glyph_
+  bitmap`'s boundary-sampling ambiguity -- fill is still drawn first
+  purely to keep the convention consistent across every multi-layer
+  glyph in this file, not because draw order matters for correctness
+  here the way it did for the pushpin.

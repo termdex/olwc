@@ -1859,7 +1859,7 @@ impl Olshell {
         // way the submenu arrow below is, so the popup doesn't need a
         // different width depending on which item's accelerator happens
         // to be widest.
-        let accel_width = DIAMOND_MARK_GLYPH.first().map_or(0, |row| row.len() as i32) + ACCEL_MARK_GAP * 2
+        let accel_width = DIAMOND_MARK_FILL.first().map_or(0, |row| row.len() as i32) + ACCEL_MARK_GAP * 2
             + WINDOW_MENU_ITEMS
                 .iter()
                 .filter_map(|item| item.accel_key)
@@ -2029,18 +2029,30 @@ impl Olshell {
                 let ax0 = ax1 - SUBMENU_ARROW_SIZE;
                 let ay0 = row_y0 + (MENU_ROW_HEIGHT - SUBMENU_ARROW_SIZE) / 2;
                 let ay1 = ay0 + SUBMENU_ARROW_SIZE;
-                draw_submenu_arrow(canvas, buf_width, buf_height, scale, ax0, ay0, ax1, ay1, color);
+                draw_submenu_arrow(canvas, buf_width, buf_height, scale, ax0, ay0, ax1, ay1, wm.hovered != Some(i));
             }
             if let Some(accel_key) = item.accel_key {
                 let key_str = accel_key.to_string();
                 let key_width: i32 =
                     key_str.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum();
-                let diamond_w = DIAMOND_MARK_GLYPH.first().map_or(0, |row| row.len() as i32);
-                let diamond_h = DIAMOND_MARK_GLYPH.len() as i32;
+                let diamond_w = DIAMOND_MARK_FILL.first().map_or(0, |row| row.len() as i32);
+                let diamond_h = DIAMOND_MARK_FILL.len() as i32;
                 let key_x = width - MENU_H_PADDING - key_width;
                 let diamond_x = key_x - ACCEL_MARK_GAP - diamond_w;
                 let diamond_y = row_y0 + (MENU_ROW_HEIGHT - diamond_h) / 2;
-                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_GLYPH, color);
+                // Fixed bevel colors regardless of `color` (disabled/
+                // normal text) -- real olgx_draw_diamond_mark's own
+                // `state` parameter is marked unused; it's always
+                // BG2/BG3/WHITE. Order doesn't matter for correctness
+                // here the way it did for the pushpin -- blit_bitmap
+                // scales each pixel uniformly rather than fitting a
+                // differently-shaped box, so there's no shared boundary
+                // for one layer to erode another at -- drawn fill-then-
+                // outline anyway, just to keep the convention consistent
+                // across every multi-layer glyph in this file.
+                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_FILL, DECORATION_BG_COLOR);
+                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_TOP, DECORATION_BEVEL_DARK);
+                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_BOTTOM, DECORATION_BEVEL_LIGHT);
                 draw_text_row_centered(
                     canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, key_x,
                     &key_str, &self.font, MENU_FONT_SIZE, color,
@@ -3576,35 +3588,111 @@ const PUSHPIN_GLYPH_PINNED_MIDDLE: &[&str] = &[
 ];
 
 /// Submenu ("pullright") indicator -- olgx's "menu mark" glyph
-/// (encodings 48/49/50, `HorizMeMa-UL`/`-LR`/`fill`), oriented
+/// (encodings 48/49/50, `HORIZ_MENU_MARK_UL`/`_LR`/`_FILL`), oriented
 /// horizontally for a pullright item (`OLGX_HORIZ_MENU_MARK`; a vertical
 /// orientation, encodings 45-47, marks the window-menu button itself --
-/// see `olgx_draw_abbrev_button`'s 3D path). XView's own 2D rendering
-/// combines all three layers in one color (`olgx_draw_menu_mark`'s
-/// `!info->three_d` branch draws the UL and LR outline layers together,
-/// then optionally the fill layer on top), which is what this traces --
-/// a solid filled triangle, not just its outline.
-const SUBMENU_ARROW_GLYPH: &[&str] = &[
-    "##.........",
-    "####.......",
-    "######.....",
-    "########...",
-    "##########.",
-    "###########",
-    "##########.",
-    "########...",
-    "######.....",
-    "####.......",
-    "##.........",
+/// see `MENU_MARK_TOP`'s doc comment). First traced as one merged 2D
+/// shape (confirmed correct for that: the union of all three layers
+/// below is pixel-identical to the flat triangle this replaced) --
+/// olgx_draw_button's own call always passes `info->three_d`, matching
+/// olshell's own bevel-everywhere aesthetic, so it should never have
+/// been flat to begin with, same class of miss as the pushpin and
+/// window-menu button's chevron earlier this session.
+///
+/// `olgx_draw_menu_mark`'s real draw order is top, bottom, then fill
+/// last (only when `fill_color != OLGX_BG2` -- normal/unhighlighted;
+/// omitted when the row is the pill-highlighted one, so the thin bevel
+/// lines still read against that darker background) -- draw_submenu_arrow
+/// draws fill *first* instead, same deliberate deviation draw_pushpin's
+/// own doc comment explains: this project's scaled-bitmap blit model
+/// (unlike real olgx's unscaled XDrawText) lets a dense layer drawn last
+/// erode thin ones drawn earlier at their shared boundary.
+const HORIZ_MENU_MARK_TOP: &[&str] = &[
+    "##........",
+    "#.##......",
+    "#...##....",
+    "#.....##..",
+    "#.......##",
+    "#.........",
+    "#.........",
+    "#.........",
+    "#.........",
+    "#.........",
+    "#.........",
+];
+const HORIZ_MENU_MARK_BOTTOM: &[&str] = &[
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "...........",
+    "..........#",
+    "........##.",
+    "......##...",
+    "....##.....",
+    "..##.......",
+    ".#.........",
+];
+const HORIZ_MENU_MARK_FILL: &[&str] = &[
+    "...........",
+    ".#.........",
+    ".###.......",
+    ".#####.....",
+    ".#######...",
+    ".#########.",
+    ".#######...",
+    ".#####.....",
+    ".###.......",
+    ".#.........",
+    "...........",
 ];
 
 /// The window-menu accelerator "Meta" mark -- see WindowMenuItem::
 /// accel_key's doc comment for why a diamond, and why it isn't decorative.
-/// Unlike the glyphs above, this isn't traced from OLGlyph: real olwm/
-/// libolgx drew it procedurally (`olgx_draw_diamond_mark`, a six-point
-/// outline, not a bitmap font character), so this is a plain hand-drawn
-/// filled diamond of the same shape rather than a font trace.
-const DIAMOND_MARK_GLYPH: &[&str] = &[
+/// Unlike the other glyphs in this file, this isn't traced from an
+/// OLGlyph bitmap font character: real olwm/libolgx draws it
+/// procedurally (`olgx_draw_diamond_mark`, six `XPoint`s forming a
+/// hexagonal outline via `XDrawLines`/`XFillPolygon`, not a font
+/// character), so this is a plain hand-drawn diamond of the same shape
+/// rather than a font trace -- and, confirmed from that same function,
+/// real olgx bevels it in 3D mode exactly like everything else in this
+/// file: filled first in `OLGX_BG2`, then the upper two edges in
+/// `OLGX_BG3` and the lower two in `OLGX_WHITE` ("light source from
+/// above," the function's own comment says) -- a flat single-color fill
+/// was another instance of the same "should never have been flat"
+/// miss the pushpin/button/submenu-arrow fixes already caught, just
+/// missed the first time since this glyph's own doc comment already
+/// (correctly) explained why it *isn't* a font trace, which this pass
+/// misread as also meaning it isn't bevel-shaded. Split by hand into
+/// the same three layers those glyphs use, following this diamond's own
+/// existing 9x9 proportions rather than the six raw `XPoint`s (whose
+/// exact pixel path doesn't map cleanly onto a discrete bitmap grid at
+/// this size anyway) -- middle row shared with the top layer, matching
+/// source's own "point 3 is 1 pixel below point 2" seam between the two
+/// outline halves.
+const DIAMOND_MARK_TOP: &[&str] = &[
+    "....#....",
+    "...#.#...",
+    "..#...#..",
+    ".#.....#.",
+    "#.......#",
+    ".........",
+    ".........",
+    ".........",
+    ".........",
+];
+const DIAMOND_MARK_BOTTOM: &[&str] = &[
+    ".........",
+    ".........",
+    ".........",
+    ".........",
+    ".........",
+    ".#.....#.",
+    "..#...#..",
+    "...#.#...",
+    "....#....",
+];
+const DIAMOND_MARK_FILL: &[&str] = &[
     "....#....",
     "...###...",
     "..#####..",
@@ -4396,8 +4484,12 @@ fn draw_button_glyph(
 }
 
 /// Draws a small rightward-pointing wedge -- the window menu's indicator
-/// that an item opens a submenu rather than acting immediately -- traced
-/// from OLGlyph, see SUBMENU_ARROW_GLYPH's doc comment.
+/// that an item opens a submenu rather than acting immediately -- see
+/// HORIZ_MENU_MARK_TOP's doc comment for the real 3-layer bevel this
+/// traces. `fill_in` mirrors real olgx exactly: shown only when the row
+/// isn't the pill-highlighted one (`fill_color != OLGX_BG2`), same
+/// convention `draw_button_glyph`'s own chevron mark already follows for
+/// its housing's pressed state.
 #[allow(clippy::too_many_arguments)]
 fn draw_submenu_arrow(
     canvas: &mut [u8],
@@ -4408,9 +4500,15 @@ fn draw_submenu_arrow(
     y0: i32,
     x1: i32,
     y1: i32,
-    color: (u8, u8, u8),
+    fill_in: bool,
 ) {
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, SUBMENU_ARROW_GLYPH, color);
+    // Fill drawn first (same erosion-safety lesson as the pushpin fix),
+    // then the thin top/bottom bevel lines on top of it.
+    if fill_in {
+        draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_FILL, DECORATION_BG_COLOR);
+    }
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_TOP, DECORATION_BEVEL_DARK);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_BOTTOM, DECORATION_BEVEL_LIGHT);
 }
 
 /// Moves a menu's keyboard highlight to the next (`forward`) or previous
