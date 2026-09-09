@@ -2096,6 +2096,7 @@ impl Olshell {
         let Some(icon_index) = icon_ids.iter().position(|id| id == toplevel_id) else {
             return;
         };
+        let bg_width = self.backgrounds[background_index].width as i32;
         let bg_height = self.backgrounds[background_index].height as i32;
         let rects = self.icon_layout(&icon_ids, bg_height);
         let (ix0, _, _, iy1) = rects[icon_index];
@@ -2111,8 +2112,13 @@ impl Olshell {
 
         let bg_surface = self.backgrounds[background_index].layer.wl_surface().clone();
         let (subsurface, surface) = self.subcompositor.create_subsurface(bg_surface.clone(), qh);
-        // Just below the icon's label, left-aligned with the icon itself.
-        subsurface.set_position(ix0, iy1 + ICON_LABEL_HEIGHT);
+        // Just below the icon's label, left-aligned with the icon itself
+        // -- clamped to stay fully on-screen (see clamp_popup_position's
+        // doc comment), since icons live at the bottom of the tray and
+        // would otherwise routinely push this off the bottom edge.
+        let (x, y) =
+            clamp_popup_position(ix0, iy1 + ICON_LABEL_HEIGHT, width as i32, height as i32, bg_width, bg_height);
+        subsurface.set_position(x, y);
         subsurface.set_desync();
 
         // A plain subsurface has no wlr-layer-shell Exclusive-interactivity
@@ -4327,6 +4333,32 @@ fn step_selectable(current: Option<usize>, count: usize, forward: bool, selectab
         }
     }
     None
+}
+
+/// Keeps a newly-opened popup fully on-screen -- direct translation of
+/// real olvwm's `showMenu` (menu.c):
+/// ```c
+/// if ((x + menuInfo->menuWidth) > dpyWidth)
+///     x = dpyWidth - menuInfo->menuWidth;
+/// if ((y + menuInfo->menuHeight) > dpyHeight)
+///     y = dpyHeight - menuInfo->menuHeight;
+/// if (y < 0)
+///     y = 0;
+/// ```
+/// `bounds_width`/`_height` is the output's own size -- olwc has one
+/// popup per output rather than X11's single shared root window, but a
+/// subsurface's position is already relative to its parent output
+/// layer's surface, the same coordinate space `dpyWidth`/`dpyHeight`
+/// describes there. Note real source clamps `y` to non-negative but
+/// never `x` the same way -- kept faithful to that asymmetry rather
+/// than "fixing" it, since a menu opens from a click or an icon that's
+/// already on-screen, so `x` going negative isn't actually reachable in
+/// practice either way.
+fn clamp_popup_position(x: i32, y: i32, width: i32, height: i32, bounds_width: i32, bounds_height: i32) -> (i32, i32) {
+    let x = if x + width > bounds_width { bounds_width - width } else { x };
+    let y = if y + height > bounds_height { bounds_height - height } else { y };
+    let y = y.max(0);
+    (x, y)
 }
 
 /// Real olvwm's "Mouseless" keyboard-navigation indicator (see

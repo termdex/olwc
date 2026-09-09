@@ -1752,13 +1752,17 @@ with wlroots compositors generally, not just this project.
   two-branch claim or the screenshot is right, or whether the real
   answer depends on some `olwm.info` 3D-mode setting neither traces
   captured.
-- To-do, noted during the same testing pass, also not acted on yet: the
-  icon menu (`open_icon_menu`) can extend past the bottom of its
+- ~~The icon menu (`open_icon_menu`) can extend past the bottom of its
   output entirely uncorrected (`share/icon-menu-conceal.png`), unlike
-  real olvwm, which always keeps a popup menu fully on-screen,
-  repositioning it if the spot that would normally anchor it doesn't
-  leave enough room. None of olwc's four menu popups
-  (window menu, icon menu, workspace submenu, root menu) currently clamp
-  their position to their output's bounds -- worth a dedicated pass
-  across all of them together rather than just the icon menu, since
-  they'd all share the same fix.
+  real olvwm, which always keeps a popup menu fully on-screen.~~
+  resolved: confirmed from source (`menu.c`'s `showMenu`) -- three
+  literal lines, direct translation to a new `clamp_popup_position`:
+  shift left if the popup would overflow the right edge, shift up if it
+  would overflow the bottom, then clamp `y` (never `x`) to non-negative.
+  Kept that left/top asymmetry faithful rather than "fixing" it, since a
+  menu only ever opens from something already on-screen (a click or an
+  icon), so `x` going negative isn't reachable in practice either way.
+  Applied to the icon menu specifically, per request -- the other three
+  popups (window menu, workspace submenu, root menu) don't call it yet,
+  though the helper's written generically enough to drop into each when
+  that's wanted.
