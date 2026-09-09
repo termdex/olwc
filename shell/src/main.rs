@@ -2662,12 +2662,23 @@ impl Olshell {
         let popup = &mut self.popups[popup_index];
         let mut command_to_run = None;
         let mut exit_requested_on = None;
+        let mut reload_menu = false;
         match &popup.items[item_index] {
             MenuNode::Item { command, .. } => command_to_run = Some(command.clone()),
             MenuNode::Submenu { .. } => log::info!("root menu: submenus aren't interactive yet"),
             MenuNode::Exit { .. } => exit_requested_on = Some(popup.output.clone()),
+            MenuNode::ReloadMenu { .. } => reload_menu = true,
         }
         let should_close = !popup.pinned;
+        if reload_menu {
+            // Only feeds *future* open_menu calls (it clones self.menu's
+            // items/title at open time) -- an already-open popup,
+            // pinned or not, keeps showing what it had when opened. See
+            // this feature's own plan/DESIGN.md entry for why that's an
+            // accepted, deliberate limitation rather than live-
+            // refreshing an open popup's layout in place.
+            self.menu = Menu::load_default();
+        }
         if let Some(command) = command_to_run {
             Self::run_command(&command);
         }

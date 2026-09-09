@@ -10,6 +10,8 @@
 //   END [MENU]                        -- is exactly END (optionally "END MENU")
 //   "Label" EXIT                      -- leaf item; terminates the compositor
 //                                         session (see MenuNode::Exit)
+//   "Label" REREAD_MENU_FILE          -- leaf item; reloads the root menu
+//                                         from disk (see MenuNode::ReloadMenu)
 //
 // Unrecognized directives (DEFAULT, PIN, and friends from the original
 // olwm format) are skipped with a warning rather than treated as a parse
@@ -38,6 +40,18 @@ pub enum MenuNode {
     // manager. Distinct from Item since it isn't a shell command olshell
     // spawns; olcore does the actual work.
     Exit { label: String },
+    // Authentic: REREAD_MENU_FILE is a real user-facing olwm menu-file
+    // token (usermenu.c's token table: "REREAD_MENU_FILE",
+    // ReReadUserMenuFunc, ServiceToken -- alongside EXIT above), not
+    // just one of the hardcoded default menu's own buttons. Reloads
+    // olwc's root menu from disk without restarting olcore -- unlike
+    // real olwm's own "Restart WM" (a full WM re-exec that survives
+    // only because X11 lets client windows be reparented back to the
+    // root window first), which has no Wayland equivalent at all (a
+    // client's connection belongs to the compositor's own wl_display,
+    // so restarting olcore would drop every client outright) and so
+    // isn't offered here.
+    ReloadMenu { label: String },
 }
 
 impl MenuNode {
@@ -46,6 +60,7 @@ impl MenuNode {
             MenuNode::Item { label, .. } => label,
             MenuNode::Submenu { label, .. } => label,
             MenuNode::Exit { label } => label,
+            MenuNode::ReloadMenu { label } => label,
         }
     }
 }
@@ -81,7 +96,12 @@ impl Menu {
             title: Some("Workspace".to_string()),
             items: vec![
                 MenuNode::Item { label: "Terminal".into(), command: "konsole --separate".into() },
-                MenuNode::Item { label: "Refresh".into(), command: "true".into() },
+                // Real olwm's own hardcoded default menu (usermenu.c)
+                // pairs Restart WM with this -- Restart WM itself has no
+                // Wayland equivalent (see MenuNode::ReloadMenu's doc
+                // comment), but this half is genuinely useful and has no
+                // such obstacle, so it's kept.
+                MenuNode::ReloadMenu { label: "Reread Menu File".into() },
                 // Matches authentic olwm's own default root menu, which
                 // pairs a Programs submenu with exactly this -- see
                 // MenuNode::Exit's doc comment.
@@ -158,6 +178,8 @@ fn parse_items<'a, I: Iterator<Item = &'a str>>(
             items.push(MenuNode::Item { label, command: command.trim().to_string() });
         } else if rest == "EXIT" {
             items.push(MenuNode::Exit { label });
+        } else if rest == "REREAD_MENU_FILE" {
+            items.push(MenuNode::ReloadMenu { label });
         } else {
             log::warn!("root menu: skipping item {label:?} with unsupported action {rest:?}");
         }
@@ -238,6 +260,19 @@ mod tests {
         assert_eq!(menu.items.len(), 2);
         assert_eq!(menu.items[1].label(), "Exit...");
         assert!(matches!(&menu.items[1], MenuNode::Exit { .. }));
+    }
+
+    #[test]
+    fn parses_reread_menu_file() {
+        let menu = Menu::parse(
+            r#"
+                "Reread Menu File" REREAD_MENU_FILE
+            "#,
+        )
+        .unwrap();
+        assert_eq!(menu.items.len(), 1);
+        assert_eq!(menu.items[0].label(), "Reread Menu File");
+        assert!(matches!(&menu.items[0], MenuNode::ReloadMenu { .. }));
     }
 
     #[test]

@@ -1894,3 +1894,49 @@ with wlroots compositors generally, not just this project.
   paired with `Exit...`) on that exact file, so the title should match
   it too rather than standing in for the project's own name -- retitled
   to `"Workspace"`.
+- New: root menu "Reread Menu File" item, reloading `.openwin-menu`/
+  `$OLWC_MENU` from disk without restarting olcore. Prompted by
+  reviewing real olvwm's hardcoded default root menu (`usermenu.c`)
+  against olwc's own; four of the five items it has that olwc didn't
+  turned out not worth adding:
+
+  - Command Tool/xterm as separate entries: redundant with the existing
+    generic "Terminal" entry; olwc has no Xwayland support regardless.
+  - Refresh: already explicitly dropped elsewhere in olwc
+    (`WINDOW_MENU_ITEMS`'s own comment) -- force-repainting a stale X11
+    window is a class of bug Wayland's damage-tracking model makes
+    structurally impossible.
+  - Restart WM: real `RestartOLWM` (`olwm.c`) reparents every client
+    window back to the X root window, then `execvp`'s the same binary
+    in place, so windows survive the restart. Wayland has no
+    equivalent -- a client's connection belongs to the compositor's own
+    `wl_display`, so restarting olcore would drop every client outright
+    with no hand-off path. Depends on an X11 capability Wayland doesn't
+    have a substitute for.
+  - A no-confirm "Exit WM": no structural obstacle, just not a gap
+    worth a second, riskier exit path alongside the existing
+    confirm-gated one.
+
+  "Reread Menu File" was the one real gap, and a genuinely authentic
+  one: confirmed from source it's real user-facing olwm menu-file
+  grammar too, not just a hardcoded button (`usermenu.c`'s token table:
+  `"REREAD_MENU_FILE", ReReadUserMenuFunc, ServiceToken`, alongside
+  `EXIT` and others olwc's own parser already supports). Added as
+  `MenuNode::ReloadMenu`, a new `REREAD_MENU_FILE` directive in
+  `shell/src/menu.rs`'s parser (same token name as source), executed in
+  `execute_popup_item` (already shared between the mouse and keyboard
+  paths from this session's earlier keyboard-navigation work) by just
+  reassigning `self.menu = Menu::load_default()`. Also replaced
+  `default_menu()`'s own dead `Refresh`/`"true"` placeholder item with
+  this real one, in the same slot.
+
+  Deliberate scope limit: `self.menu` only feeds *future* `open_menu`
+  calls (items/title are cloned into a `MenuPopup` at open time), so an
+  already-open popup -- pinned or not -- keeps showing what it had when
+  opened rather than live-refreshing in place; live-updating an open
+  popup's own width/height/row layout from newly-reloaded items was
+  judged not worth the complexity for what's a secondary case. Confirmed
+  live: edited a test `.openwin-menu` (`$OLWC_MENU` pointing at a temp
+  file) while olshell was running, selected "Reread Menu File," and a
+  freshly-opened root menu picked up the new title and item immediately,
+  no restart involved.
