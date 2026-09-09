@@ -1620,3 +1620,46 @@ with wlroots compositors generally, not just this project.
      deliberately keyed to the focused-state margins even for the
      unfocused header's own simpler bevel treatment, so the button
      doesn't shift position when focus changes.
+- ~~Window-menu button: the just-added recessed bevel was keyed to
+  `button_hovered` (pointer motion only), so merely hovering the button
+  showed the recessed look and an actual click didn't visibly react.~~
+  resolved -- `/tmp/olvwm-src/winbutton.c` has no hover concept for this
+  control at all: a strict two-state `OLGX_NORMAL`/`OLGX_INVOKED`
+  control, invoked only while a mouse button is actually held down over
+  the housing (or, for a right-click, for as long as the menu it opened
+  stays open).
+
+  Replaced `button_hovered: bool` with `button_press: Option<ButtonPress>`
+  (`Selecting` for a pending left click, `MenuOpen` for an open
+  right-click menu), driving both the box fill and `draw_button_glyph`'s
+  bevel. Left-click no longer fires its default action
+  (`set_minimized`) on press -- it's deferred to a qualifying release,
+  direct translations of source's three handlers:
+
+  - `eventButtonPress`: press sets `Selecting`/`MenuOpen` and redraws
+    invoked immediately, for both actions.
+  - `eventMotionNotify`: while a left press is pending, live-toggles the
+    housing between invoked/normal as the pointer moves in and out --
+    press-and-drag-off-to-cancel, matching source exactly.
+  - `eventButtonRelease`: always clears the recessed look; the default
+    action only fires if the release lands back on the housing.
+
+  The right-click/`MenuOpen` case has no source-side release handling at
+  all -- the button stays invoked for as long as the menu is open,
+  restored by source's `doUnhilite` callback when it closes. `olshell`
+  has no equivalent blocking call, but already has a single centralized
+  close path every dismissal route funnels through
+  (`close_window_menu`), which is exactly where the equivalent one-line
+  un-invoke belongs -- no other call site needed touching.
+
+  One real bug found only by testing live, not by reading source: the
+  first pass gated the new `Motion` handler on `button_press !=
+  Some(MenuOpen)`, which -- since `None` also satisfies that -- let
+  plain hovering set `Selecting` with no press involved at all, exactly
+  reproducing the original bug from a different cause. The two pieces of
+  state source keeps separate (`currentAction`, which persists across
+  motion even when dragged off the housing, vs. `buttonActive`, the
+  visual toggle) had been collapsed into one field. Fixed by adding back
+  a second field, `button_left_down: bool`, tracking "is a left press
+  actually in flight" independently of the housing's current visual
+  state, and gating `Motion`/`Leave` on it instead.

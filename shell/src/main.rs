@@ -479,7 +479,16 @@ struct Decoration {
     /// see the protocol's configure event doc comment for why olcore has
     /// to tell us this rather than us computing it some other way.
     toplevel_height: u32,
-    button_hovered: bool,
+    button_press: Option<ButtonPress>,
+    /// Whether a left button is currently held down on the housing,
+    /// waiting for a qualifying release -- real olvwm's `currentAction ==
+    /// ACTION_SELECT`, which persists across motion even while dragged
+    /// off the housing (unlike `button_press`, which only reflects the
+    /// current *visual* state and goes back to `None` in that case). Only
+    /// while this is true do Motion/Leave update `button_press` at all --
+    /// otherwise plain hovering would (and once did) recess the housing
+    /// with no press involved.
+    button_left_down: bool,
     /// Mirrors olcore's state, kept in sync via the sticky_changed event --
     /// olshell never decides this itself, only asks to toggle it.
     sticky: bool,
@@ -490,6 +499,18 @@ struct Decoration {
     footer: ResizeHandle,
     left_border: BorderStrip,
     right_border: BorderStrip,
+}
+
+/// What a currently-recessed window-menu button (see draw_button_glyph)
+/// is doing -- mirrors real olvwm's winbutton.c currentAction. A left
+/// press defers its default action to a qualifying release and tracks
+/// the pointer meanwhile (eventMotionNotify); a right press's recessed
+/// look is entirely owned by the window menu it opened, and lasts until
+/// that menu closes (see close_window_menu).
+#[derive(PartialEq)]
+enum ButtonPress {
+    Selecting,
+    MenuOpen,
 }
 
 /// A resize handle: a small subsurface of the header (same trick as the
@@ -1575,7 +1596,8 @@ impl Olshell {
             height: DECORATION_HEIGHT,
             scale: 1,
             toplevel_height: 0,
-            button_hovered: false,
+            button_press: None,
+            button_left_down: false,
             sticky: false,
             top_left,
             top_right,
@@ -1664,9 +1686,14 @@ impl Olshell {
         fill_rect(canvas, buf_width, buf_height, scale, CORNER_HANDLE_SIZE, 0, width - CORNER_HANDLE_SIZE, DECORATION_BORDER_WIDTH, DECORATION_BORDER_COLOR);
 
         let (bx0, by0, bx1, by1) = dec.button_rect();
-        let button_color = if dec.button_hovered { DECORATION_BUTTON_HOVER_COLOR } else { content_bg };
+        // Real olvwm has no hover state for this control at all -- just
+        // OLGX_NORMAL/OLGX_INVOKED, the latter only while a button is
+        // actually held down over the housing (or the menu it opened is
+        // still open). See ButtonPress's doc comment.
+        let pressed = dec.button_press.is_some();
+        let button_color = if pressed { DECORATION_BUTTON_HOVER_COLOR } else { content_bg };
         fill_rect(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, button_color);
-        draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, dec.button_hovered);
+        draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, pressed);
 
         if !info.title.is_empty() {
             draw_text_row_centered(
@@ -1834,6 +1861,20 @@ impl Olshell {
 
     fn close_window_menu(&mut self) {
         if let Some(wm) = self.window_menu.take() {
+            // The doUnhilite equivalent: a right-click on the button
+            // leaves it invoked for as long as this menu stays open (see
+            // the Press arm in pointer_frame), so every dismissal route
+            // -- Escape, click elsewhere, item execution, a second click
+            // toggling closed, reopening a different toplevel's menu --
+            // funnels through here and un-invokes it.
+            if let Some(dec) =
+                self.toplevels.get_mut(&wm.toplevel_id).and_then(|info| info.decoration.as_mut())
+            {
+                if dec.button_press == Some(ButtonPress::MenuOpen) {
+                    dec.button_press = None;
+                    self.draw_decoration(&wm.toplevel_id);
+                }
+            }
             if let Some(sm) = wm.workspace_submenu {
                 sm.subsurface.destroy();
                 sm.surface.destroy();
@@ -4639,25 +4680,36 @@ impl PointerHandler for Olshell {
                         }
                     }
                 }
+                // Live-tracks a pending left press (Selecting) in/out of
+                // the housing, exactly like real olvwm's eventMotionNotify
+                // -- a genuine "drag off to cancel" affordance. A MenuOpen
+                // press ignores motion entirely: the invoked look while a
+                // menu is open doesn't depend on pointer position.
                 PointerEventKind::Motion { .. } if decoration_toplevel.is_some() => {
                     let id = decoration_toplevel.unwrap();
                     if let Some(dec) =
                         self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
                     {
-                        let hovered = dec.is_on_button(event.position.0, event.position.1);
-                        if dec.button_hovered != hovered {
-                            dec.button_hovered = hovered;
-                            self.draw_decoration(&id);
+                        if dec.button_left_down {
+                            let on_button = dec.is_on_button(event.position.0, event.position.1);
+                            let want = if on_button { Some(ButtonPress::Selecting) } else { None };
+                            if dec.button_press != want {
+                                dec.button_press = want;
+                                self.draw_decoration(&id);
+                            }
                         }
                     }
                 }
+                // The pointer left the header surface entirely while a
+                // left press was pending -- same un-invoke as moving out
+                // of the housing without actually releasing.
                 PointerEventKind::Leave { .. } if decoration_toplevel.is_some() => {
                     let id = decoration_toplevel.unwrap();
                     if let Some(dec) =
                         self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
                     {
-                        if dec.button_hovered {
-                            dec.button_hovered = false;
+                        if dec.button_left_down && dec.button_press.is_some() {
+                            dec.button_press = None;
                             self.draw_decoration(&id);
                         }
                     }
@@ -4681,15 +4733,35 @@ impl PointerHandler for Olshell {
                         // same convention the icon menu already uses.
                         if window_menu_toplevel.as_ref() != Some(&id) {
                             self.open_window_menu(qh, &id, event.position);
+                            if on_button {
+                                // Real olvwm's ACTION_MENU case invokes the
+                                // housing immediately too, just like
+                                // ACTION_SELECT -- it stays invoked for as
+                                // long as the menu is open, restored by
+                                // close_window_menu (the doUnhilite
+                                // equivalent), not by anything here.
+                                if let Some(dec) = self
+                                    .toplevels
+                                    .get_mut(&id)
+                                    .and_then(|info| info.decoration.as_mut())
+                                {
+                                    dec.button_press = Some(ButtonPress::MenuOpen);
+                                    self.draw_decoration(&id);
+                                }
+                            }
                         }
                     } else if on_button {
-                        // Left-click on the button invokes the default
-                        // action directly instead of opening the menu,
-                        // matching real olvwm -- mirrors WINDOW_MENU_ITEMS[0]
-                        // ("Close" -> Minimize); move with it if that ever
-                        // changes.
-                        if let Some(handle) = self.toplevels.get(&id).and_then(|i| i.handle.as_ref()) {
-                            handle.set_minimized();
+                        // Left-click on the button defers its default
+                        // action to a qualifying release (see the Release
+                        // arm below), matching real olvwm's
+                        // eventButtonPress/eventButtonRelease exactly --
+                        // it doesn't fire on press.
+                        if let Some(dec) =
+                            self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
+                        {
+                            dec.button_left_down = true;
+                            dec.button_press = Some(ButtonPress::Selecting);
+                            self.draw_decoration(&id);
                         }
                     } else if let Some(dec) =
                         self.toplevels.get(&id).and_then(|info| info.decoration.as_ref())
@@ -4700,6 +4772,41 @@ impl PointerHandler for Olshell {
                         // button is still down -- the move ends when it's
                         // released.
                         dec.object._move(1);
+                    }
+                }
+                // The other half of the deferred left-click above --
+                // direct translation of eventButtonRelease's
+                // qualifying-release logic: the default action only fires
+                // if the release lands back on the housing.
+                PointerEventKind::Release { button, .. }
+                    if decoration_toplevel.is_some() && button == BTN_LEFT =>
+                {
+                    let id = decoration_toplevel.unwrap();
+                    let was_down = self
+                        .toplevels
+                        .get(&id)
+                        .and_then(|info| info.decoration.as_ref())
+                        .is_some_and(|dec| dec.button_left_down);
+                    if was_down {
+                        let on_button = self
+                            .toplevels
+                            .get(&id)
+                            .and_then(|info| info.decoration.as_ref())
+                            .is_some_and(|dec| dec.is_on_button(event.position.0, event.position.1));
+                        if let Some(dec) =
+                            self.toplevels.get_mut(&id).and_then(|info| info.decoration.as_mut())
+                        {
+                            dec.button_left_down = false;
+                            dec.button_press = None;
+                        }
+                        self.draw_decoration(&id);
+                        if on_button {
+                            // Mirrors WINDOW_MENU_ITEMS[0] ("Close" ->
+                            // Minimize); move with it if that ever changes.
+                            if let Some(handle) = self.toplevels.get(&id).and_then(|i| i.handle.as_ref()) {
+                                handle.set_minimized();
+                            }
+                        }
                     }
                 }
                 PointerEventKind::Motion { .. } if resize_region.is_some() => {
