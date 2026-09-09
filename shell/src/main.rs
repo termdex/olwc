@@ -117,8 +117,10 @@ mod openlook_session {
     pub mod v1 {
         pub mod client {
             use wayland_client;
+            use wayland_client::protocol::*;
 
             pub mod __interfaces {
+                use wayland_client::protocol::__interfaces::*;
                 wayland_scanner::generate_interfaces!(
                     "../protocol/openlook-session-unstable-v1.xml"
                 );
@@ -1061,7 +1063,7 @@ fn main() {
     log::info!("openlook-decoration: {}",
         if decoration_manager.is_some() { "bound" } else { "not available" });
     let session_manager = globals
-        .bind::<ZopenlookSessionManagerV1, _, _>(&qh, 1..=1, ())
+        .bind::<ZopenlookSessionManagerV1, _, _>(&qh, 1..=2, ())
         .ok();
     log::info!("openlook-session: {}",
         if session_manager.is_some() { "bound" } else { "not available" });
@@ -2848,6 +2850,13 @@ impl Olshell {
             if self.keyboard_focus.as_ref() == Some(notice.layer.wl_surface()) {
                 self.keyboard_focus = None;
             }
+            // Undoes open_notice's own warp_pointer_to_surface_point --
+            // real olvwm's noticeDone does the matching XWarpPointer-back
+            // unconditionally too, and olcore's own restore_pointer is
+            // already a no-op if nothing's actually pending.
+            if let Some(manager) = self.session_manager.as_ref() {
+                manager.restore_pointer();
+            }
         }
     }
 
@@ -2894,7 +2903,10 @@ impl Olshell {
 
         for (i, &(x0, y0, x1, y1)) in notice.button_rects.iter().enumerate() {
             let pressed = notice.pressed == Some(i);
-            draw_button(canvas, buf_width, buf_height, scale, x0, y0, x1, y1, NOTICE_BUTTONS[i], &self.font, pressed);
+            draw_button(
+                canvas, buf_width, buf_height, scale, x0, y0, x1, y1, NOTICE_BUTTONS[i], &self.font, pressed,
+                i == NOTICE_DEFAULT_BUTTON,
+            );
         }
 
         let wl_surface = notice.layer.wl_surface();
@@ -3607,6 +3619,78 @@ const DIAMOND_MARK_GLYPH: &[&str] = &[
 /// it, and between the label and the start of the diamond.
 const ACCEL_MARK_GAP: i32 = 4;
 
+/// Real olvwm/libolgx's "this is the default (non-menu-item) button"
+/// indicator -- confirmed from `xview-3.2p1.4-19c`'s
+/// `lib/libolgx/ol_button.c`'s `olgx_draw_button` (not
+/// `olgx_draw_varheight_button`, which a first, mistaken pass through
+/// this source attributed it to instead: notice.c calls
+/// `olgx_draw_button` with `height` 0, which that function's own `if
+/// (height && height != Button_Height(info))` guard routes to the
+/// varheight path only for a nonzero, non-default height, so a Notice's
+/// buttons never take it). Its `!(state & OLGX_MENU_ITEM) && (state &
+/// OLGX_DEFAULT)` branch draws a second, single-color pill-outline ring
+/// at the *exact same box* the button's own pill occupies
+/// (`DFLT_BUTTON_LEFT_ENDCAP`/`_RIGHT_ENDCAP`/`_MIDDLE_1`, `olgl14.bdf`
+/// encodings 106/107/108 -- not the flat corner-bracket glyphs at
+/// encodings 215-218 the first pass traced, which turned out to belong
+/// to an unrelated widget). 3D mode draws it in one color (`OLGX_BG3`,
+/// olshell's `DECORATION_BEVEL_DARK` -- the same "BG3" `draw_pill_
+/// highlight`'s own doc comment already identifies for an invoked
+/// pill's top edge) rather than the fill's usual top/bottom split,
+/// reading as a second thin border traced just inside the button's own
+/// bevel edges. `DFLT_BUTTON_LEFT_ENDCAP`/`_RIGHT_ENDCAP` happen to be
+/// the same native width as `PILL_ENDCAP_WIDTH` (11), so draw_default_
+/// ring reuses it and PILL_VERTICAL_BIAS directly rather than adding a
+/// near-duplicate pair of constants.
+const DFLT_RING_LEFT_ENDCAP: &[&str] = &[
+    "...........",
+    "...........",
+    "........###",
+    "......##...",
+    ".....#.....",
+    "....#......",
+    "...#.......",
+    "...#.......",
+    "..#........",
+    "..#........",
+    "..#........",
+    "..#........",
+    "..#........",
+    "...#.......",
+    "...#.......",
+    "....#......",
+    ".....#.....",
+    "......##...",
+    "........###",
+    "...........",
+];
+const DFLT_RING_RIGHT_ENDCAP: &[&str] = &[
+    "...........",
+    "...........",
+    "###........",
+    "...##......",
+    ".....#.....",
+    "......#....",
+    ".......#...",
+    ".......#...",
+    "........#..",
+    "........#..",
+    "........#..",
+    "........#..",
+    "........#..",
+    ".......#...",
+    ".......#...",
+    "......#....",
+    ".....#.....",
+    "...##......",
+    "###........",
+    "...........",
+];
+const DFLT_RING_MIDDLE_TILE: &[&str] =
+    &[".", ".", "#", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "#", "."];
+/// Native pixel height of the default-ring endcap glyphs above.
+const DFLT_RING_HEIGHT: i32 = 20;
+
 // The pill-shaped menu-item highlight below is OLGlyph too (encodings
 // 24-29 for the endcaps, 30/35/40 for the tileable middle segments,
 // `ol_button.c`'s BUTTON_UL/_LL/_LEFT_ENDCAP_FILL/_LR/_UR/_RIGHT_ENDCAP_FILL/
@@ -3956,6 +4040,7 @@ fn draw_button(
     label: &str,
     font: &fontdue::Font,
     pressed: bool,
+    default: bool,
 ) {
     let (top_color, bottom_color, fill_color) = if pressed {
         (DECORATION_BEVEL_DARK, DECORATION_BEVEL_LIGHT, MENU_HOVER_COLOR)
@@ -3963,12 +4048,31 @@ fn draw_button(
         (DECORATION_BEVEL_LIGHT, DECORATION_BEVEL_DARK, MENU_BG_COLOR)
     };
     draw_pill(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, top_color, bottom_color, fill_color);
+    if default {
+        draw_default_ring(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1);
+    }
     let label_width: i32 =
         label.chars().map(|c| font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum();
     let label_x = x0 + ((x1 - x0) - label_width) / 2;
     draw_text_row_centered(
         canvas, canvas_width, scale, y0, y1 - y0, label_x, label, font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
     );
+}
+
+/// Draws real olvwm's default-button ring (see DFLT_RING_LEFT_ENDCAP's
+/// doc comment) -- a single-color pill outline at the same box the
+/// button's own pill occupies, via the identical endcap-plus-tiled-
+/// middle technique draw_pill already uses for the button shape itself.
+#[allow(clippy::too_many_arguments)]
+fn draw_default_ring(canvas: &mut [u8], canvas_width: i32, canvas_height: i32, scale: i32, x0: i32, y0: i32, x1: i32, y1: i32) {
+    let tiles = (x1 - x0 - 2 * PILL_ENDCAP_WIDTH).max(0);
+    let y = y0 + ((y1 - y0) - DFLT_RING_HEIGHT) / 2 + PILL_VERTICAL_BIAS;
+    let right_x = x0 + PILL_ENDCAP_WIDTH + tiles;
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, DFLT_RING_LEFT_ENDCAP, DECORATION_BEVEL_DARK);
+    for i in 0..tiles {
+        blit_bitmap(canvas, canvas_width, canvas_height, scale, x0 + PILL_ENDCAP_WIDTH + i, y, DFLT_RING_MIDDLE_TILE, DECORATION_BEVEL_DARK);
+    }
+    blit_bitmap(canvas, canvas_width, canvas_height, scale, right_x, y, DFLT_RING_RIGHT_ENDCAP, DECORATION_BEVEL_DARK);
 }
 
 /// Renders one of the bitmaps above into box (x0,y0)-(x1,y1): scaled
@@ -4706,6 +4810,20 @@ impl LayerShellHandler for Olshell {
                 }
             }
             self.draw_notice();
+            // Real olvwm's on-by-default PopupJumpCursor (notice.c/
+            // resources.c): jump the pointer onto the default button the
+            // instant the dialog appears. Sent right after draw_notice's
+            // own wl_surface.commit(), not before -- Wayland requests are
+            // processed in order per connection, so by the time olcore
+            // handles this, that commit has already mapped the surface
+            // and finalized its position server-side (see
+            // warp_pointer_to_surface_point's own doc comment).
+            if let (Some(manager), Some(notice)) = (self.session_manager.as_ref(), self.notice.as_ref()) {
+                let (bx0, by0, bx1, by1) = notice.button_rects[NOTICE_DEFAULT_BUTTON];
+                manager.warp_pointer_to_surface_point(
+                    notice.layer.wl_surface(), (bx0 + bx1) / 2, (by0 + by1) / 2,
+                );
+            }
         }
     }
 }

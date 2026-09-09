@@ -92,10 +92,19 @@ struct olc_server {
 	// it doesn't own. See protocol/openlook-decoration-unstable-v1.xml.
 	struct wl_global *decoration_manager_global;
 
-	// openlook-session: whole-session actions (currently just exit) an
+	// openlook-session: whole-session actions (exit, pointer warp) an
 	// unprivileged client has no other way to reach. See
 	// protocol/openlook-session-unstable-v1.xml.
 	struct wl_global *session_manager_global;
+
+	// warp_pointer_to_surface_point/restore_pointer's saved pre-warp
+	// position -- mirrors real olvwm's notice.c own warped/pointerX/
+	// pointerY, just living compositor-side since olcore, not the
+	// client, is the only thing that actually knows true pointer
+	// position in Wayland. Only one warp is ever pending at a time (see
+	// the request's own doc comment).
+	bool pointer_warp_pending;
+	double pointer_warp_saved_x, pointer_warp_saved_y;
 
 	// The surface most recently granted focus via openlook-decoration's
 	// grab_keyboard request -- the window menu and its submenus, which
@@ -2308,9 +2317,62 @@ static void session_manager_handle_destroy(struct wl_client *client, struct wl_r
 	wl_resource_destroy(resource);
 }
 
+// See protocol/openlook-session-unstable-v1.xml's own doc comment, and
+// real olvwm's on-by-default PopupJumpCursor (notice.c/resources.c),
+// which this mirrors: warp the pointer onto surface's (x, y), saving
+// its pre-warp position first so restore_pointer can undo it.
+static void session_manager_handle_warp_pointer_to_surface_point(
+		struct wl_client *client, struct wl_resource *resource,
+		struct wl_resource *surface_resource, int32_t x, int32_t y) {
+	(void)client;
+	struct olc_server *server = wl_resource_get_user_data(resource);
+	struct wlr_surface *surface = wlr_surface_from_resource(surface_resource);
+
+	struct olc_layer_surface *layer_surface;
+	wl_list_for_each(layer_surface, &server->layer_surfaces, link) {
+		if (layer_surface->layer_surface->surface != surface) {
+			continue;
+		}
+		// Already layout-absolute (shared global scene-graph space) by
+		// the time a layer surface is mapped -- see arrange_output_layers,
+		// which translates by the output's own box before storing this.
+		double abs_x = layer_surface->scene_layer_surface->tree->node.x + x;
+		double abs_y = layer_surface->scene_layer_surface->tree->node.y + y;
+
+		if (!server->pointer_warp_pending) {
+			server->pointer_warp_saved_x = server->cursor->x;
+			server->pointer_warp_saved_y = server->cursor->y;
+			server->pointer_warp_pending = true;
+		}
+		wlr_cursor_warp(server->cursor, NULL, abs_x, abs_y);
+
+		struct timespec now;
+		clock_gettime(CLOCK_MONOTONIC, &now);
+		process_cursor_motion(server, now.tv_sec * 1000 + now.tv_nsec / 1000000);
+		return;
+	}
+}
+
+static void session_manager_handle_restore_pointer(
+		struct wl_client *client, struct wl_resource *resource) {
+	(void)client;
+	struct olc_server *server = wl_resource_get_user_data(resource);
+	if (!server->pointer_warp_pending) {
+		return;
+	}
+	wlr_cursor_warp(server->cursor, NULL, server->pointer_warp_saved_x, server->pointer_warp_saved_y);
+	server->pointer_warp_pending = false;
+
+	struct timespec now;
+	clock_gettime(CLOCK_MONOTONIC, &now);
+	process_cursor_motion(server, now.tv_sec * 1000 + now.tv_nsec / 1000000);
+}
+
 static const struct zopenlook_session_manager_v1_interface session_manager_impl = {
 	.exit = session_manager_handle_exit,
 	.destroy = session_manager_handle_destroy,
+	.warp_pointer_to_surface_point = session_manager_handle_warp_pointer_to_surface_point,
+	.restore_pointer = session_manager_handle_restore_pointer,
 };
 
 static void session_manager_bind(
@@ -2406,7 +2468,7 @@ int main(int argc, char *argv[]) {
 		&zopenlook_decoration_manager_v1_interface, 1, &server, decoration_manager_bind);
 
 	server.session_manager_global = wl_global_create(server.wl_display,
-		&zopenlook_session_manager_v1_interface, 1, &server, session_manager_bind);
+		&zopenlook_session_manager_v1_interface, 2, &server, session_manager_bind);
 
 	wl_list_init(&server.layer_surfaces);
 	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);

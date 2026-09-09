@@ -25,18 +25,24 @@
     THIS SOFTWARE.
   </copyright>
 
-  <interface name="zopenlook_session_manager_v1" version="1">
+  <interface name="zopenlook_session_manager_v1" version="2">
     <description summary="whole-session actions an unprivileged client can't otherwise reach">
       Lets olshell ask olcore to perform actions that affect the whole
       compositor session rather than one toplevel or output -- currently
-      just exit, the Wayland-native equivalent of authentic OPEN LOOK's
+      exit, the Wayland-native equivalent of authentic OPEN LOOK's
       root ("Workspace") menu Exit... item, which terminated olwm itself
       (typically returning to a display manager, since olwm was normally
       the X session's leader). olcore is that same "whole session," so
       exit here means the same thing: wl_display_terminate(), the
       compositor's own clean-shutdown path, already used internally for a
       dev-only Alt+Escape binding -- this is the first way an unprivileged
-      client can reach it at all.
+      client can reach it at all. Also the pointer warp pair added in
+      version 2 (see their own doc comments): unlike X11's XWarpPointer,
+      nothing in Wayland lets a *client* move the pointer, but olcore is
+      a compositor this project controls, and wlroots gives the
+      compositor itself an unrestricted warp -- so this is the natural
+      home for that too, a session-wide capability no single toplevel or
+      output owns.
 
       Interface name and scope are deliberately left room to grow: a
       request per session-wide fixture (screen lock, suspend, ...) rather
@@ -67,6 +73,37 @@
     <request name="destroy" type="destructor">
       <description summary="destroy the manager object">
         Destroys this manager object. Does not affect the session itself.
+      </description>
+    </request>
+
+    <request name="warp_pointer_to_surface_point" since="2">
+      <description summary="move the pointer to a point in one of olshell's own surfaces">
+        Moves the pointer to (x, y), in surface's own local coordinates.
+        surface must belong to the requesting client and currently be
+        mapped. Before moving it, olcore remembers the pointer's current
+        position (compositor-side -- olcore is the only thing that
+        actually knows true pointer position in Wayland, unlike X11
+        where a client could just ask) so a later restore_pointer can
+        put it back. Calling this again before restore_pointer replaces
+        the pending restore target with wherever the pointer was just
+        before this call, not the original position before the first
+        warp -- there's only ever one pending restore at a time.
+
+        Authentic OPEN LOOK: matches real olvwm's on-by-default
+        PopupJumpCursor behavior (resources.c/notice.c), which warps the
+        pointer onto a Notice's default button the instant it appears.
+      </description>
+      <arg name="surface" type="object" interface="wl_surface"/>
+      <arg name="x" type="int" summary="surface-local x to warp to"/>
+      <arg name="y" type="int" summary="surface-local y to warp to"/>
+    </request>
+
+    <request name="restore_pointer" since="2">
+      <description summary="undo the most recent warp_pointer_to_surface_point">
+        Moves the pointer back to wherever it was immediately before the
+        most recent warp_pointer_to_surface_point call. A no-op if
+        there's no pending warp to undo -- already restored, or none
+        ever happened.
       </description>
     </request>
   </interface>

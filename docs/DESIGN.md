@@ -1766,3 +1766,58 @@ with wlroots compositors generally, not just this project.
   popups (window menu, workspace submenu, root menu) don't call it yet,
   though the helper's written generically enough to drop into each when
   that's wanted.
+- Notice dialog: the default button ("Cancel") now shows a real
+  indicator, and the pointer jumps onto it the instant the dialog
+  appears -- both confirmed, on-by-default OPEN LOOK behavior, traced
+  from `xview-3.2p1.4-19c`'s `lib/libolgx/ol_button.c` and
+  `olvwm4.tar.Z`'s `notice.c`/`resources.c`.
+
+  **The ring.** First pass mistakenly traced encodings 215-218
+  (`PIXLABEL_DEF_BUTTON_UL`/`_LL`/`_UR`/`_LR`) as four corner-bracket
+  glyphs, attributed to `olgx_draw_varheight_button`'s `OLGX_DEFAULT`
+  state -- confirmed live as wrong (`share/confirm-exit-snap.png`
+  showed them essentially swallowed inside the pill's own rounded
+  corners, not the clearly visible mark real olvwm shows). Re-reading
+  source more carefully: `notice.c` calls `olgx_draw_button` with
+  `height` 0, and that function only delegates to
+  `olgx_draw_varheight_button` for a *nonzero*, non-default height --
+  so a Notice's buttons never take that path at all. The real mechanism
+  is `olgx_draw_button`'s own `!(state & OLGX_MENU_ITEM) && (state &
+  OLGX_DEFAULT)` branch: a second, single-color pill-outline ring drawn
+  at the *same box* the button's own pill occupies
+  (`DFLT_BUTTON_LEFT_ENDCAP`/`_RIGHT_ENDCAP`/`_MIDDLE_1`, encodings
+  106/107/108), 3D mode in one color (`OLGX_BG3`, olshell's
+  `DECORATION_BEVEL_DARK`) rather than the fill's usual top/bottom
+  split. `draw_default_ring` reuses `draw_pill`'s own endcap-plus-tiled-
+  middle technique directly -- `DFLT_BUTTON_LEFT_ENDCAP`/`_RIGHT_ENDCAP`
+  happen to be the same native width as `PILL_ENDCAP_WIDTH` (11),
+  confirmed live afterward as reading correctly (`share/confirm-exit-
+  curves.png`).
+
+  **The cursor jump.** A named, on-by-default resource
+  (`"popupJumpCursor"`/`PopupJumpCursor`, default `"True"`,
+  `resources.c`) controls `ShowNoticeBox` warping the pointer onto the
+  default button's center via `XWarpPointer`, after saving its pre-warp
+  position; `noticeDone` (the shared cleanup for every dismissal path)
+  warps it back. Wayland has no client-side equivalent of
+  `XWarpPointer` -- deliberately, unlike X11 -- but olcore is a
+  compositor this project controls, and wlroots gives the compositor
+  itself an unrestricted `wlr_cursor_warp(cursor, NULL, lx, ly)`. Added
+  two requests to `protocol/openlook-session-unstable-v1.xml`
+  (`warp_pointer_to_surface_point`, `restore_pointer`; interface bumped
+  to version 2), implemented in `core/main.c` by resolving the
+  `wl_surface` to its `olc_layer_surface`, reading its already-layout-
+  absolute position (`scene_layer_surface->tree->node.x/y`, finalized
+  by `arrange_output_layers` at map time), saving the cursor's current
+  position server-side the same way `notice.c`'s own `warped`/
+  `pointerX`/`pointerY` do (just compositor-side instead of client-side,
+  since only olcore actually knows true pointer position in Wayland),
+  then `wlr_cursor_warp` plus a `process_cursor_motion` call so the
+  surface now under the pointer gets a proper enter/motion event without
+  waiting for real mouse movement. olshell sends the warp request from
+  the Notice's own `configure` handler, right after (not before)
+  `draw_notice()`'s own commit -- Wayland's in-order request processing
+  means olcore has already mapped the surface and finalized its
+  position by the time it handles the warp. `close_notice` (the single
+  shared dismissal path every exit route already funnels through) sends
+  `restore_pointer`, a no-op if nothing's pending.
