@@ -72,7 +72,13 @@ impl Menu {
         // action should always open a fresh window regardless of
         // environment, so this is the right default even outside testing.
         Menu {
-            title: Some("olwc".to_string()),
+            // Real olwm's own default root menu file (clients/olwm/
+            // openwin-menu in the historical XView/olwm tree) titles it
+            // "Workspace" via a literal `"Workspace" TITLE` line -- this
+            // fallback already matches that file's item structure
+            // (Programs + Exit... below) so the title should too, rather
+            // than the project's own name standing in for it.
+            title: Some("Workspace".to_string()),
             items: vec![
                 MenuNode::Item { label: "Terminal".into(), command: "konsole --separate".into() },
                 MenuNode::Item { label: "Refresh".into(), command: "true".into() },

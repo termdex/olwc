@@ -1883,3 +1883,14 @@ with wlroots compositors generally, not just this project.
   telling olshell a toplevel's current output-relative position, or
   olcore taking over the clamping itself), not a few more lines reusing
   `clamp_popup_position`.
+- ~~olwc's own built-in fallback root menu (`Menu::default_menu`, used
+  only when no `.openwin-menu` config exists) titled itself "olwc".~~
+  resolved: spotted live (a screenshot of olwc's own menu pinned into
+  its own window, title visible in the title bar) against a screenshot
+  of real olvwm's, titled "Workspace" instead. Confirmed from source
+  (`clients/olwm/openwin-menu`, the actual historical default root menu
+  file): `"Workspace" TITLE`. This fallback's own surrounding comment
+  already explicitly models its two real items (a `Programs` submenu
+  paired with `Exit...`) on that exact file, so the title should match
+  it too rather than standing in for the project's own name -- retitled
+  to `"Workspace"`.
