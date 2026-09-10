@@ -12,21 +12,32 @@
 //                                         session (see MenuNode::Exit)
 //   "Label" REREAD_MENU_FILE          -- leaf item; reloads the root menu
 //                                         from disk (see MenuNode::ReloadMenu)
+//   "Label" INCLUDE <file>            -- submenu whose items come from <file>
+//                                         (resolved relative to this file)
+//   "Label" DEFAULT <action>          -- any of the above, prefixed with
+//                                         DEFAULT, marks it the menu's
+//                                         default item (pre-highlighted on
+//                                         open)
 //
-// Unrecognized directives (DEFAULT, PIN, and friends from the original
+// Unrecognized directives (PIN, WINMENU, and friends from the original
 // olwm format) are skipped with a warning rather than treated as a parse
 // error, since real-world menu files may use them and a missing feature
 // shouldn't take down the whole menu.
 
 use std::path::{Path, PathBuf};
 
+/// An INCLUDE chain deeper than this is treated as a cycle and cut off
+/// -- a real cycle (A includes B includes A) would otherwise recurse
+/// until the stack overflows, and no legitimate menu nests this deep.
+const MAX_INCLUDE_DEPTH: usize = 16;
+
 #[derive(Debug, Clone)]
 pub enum MenuNode {
     Item { label: String, command: String },
-    // items: parsed but not yet read -- olshell doesn't open nested popups
-    // on hover yet, see MenuPopup's doc comment.
-    #[allow(dead_code)]
-    Submenu { label: String, items: Vec<MenuNode> },
+    // A nested submenu, from a `MENU`/`END` block or `INCLUDE <file>`.
+    // `default` is the index into `items` of the submenu's own DEFAULT
+    // item, if any (see Menu::default's doc comment).
+    Submenu { label: String, items: Vec<MenuNode>, default: Option<usize> },
     // Authentic OPEN LOOK: olwm's own default root ("Workspace") menu is
     // exactly a Programs submenu and this, "Exit..." (confirmed from
     // source, clients/olwm/openwin-menu in the historical XView/olwm tree
@@ -69,6 +80,14 @@ impl MenuNode {
 pub struct Menu {
     pub title: Option<String>,
     pub items: Vec<MenuNode>,
+    /// Index into `items` of the item marked `DEFAULT`, if any. Real
+    /// olwm activates the default item on a plain click of the menu
+    /// button without traversing into the menu, and rings it. olwc's
+    /// root menu has no such button (it opens from a background
+    /// right-click), so instead the default row is pre-highlighted and
+    /// ringed when the menu opens -- a quick release without moving
+    /// activates it.
+    pub default: Option<usize>,
 }
 
 impl Menu {
@@ -107,6 +126,7 @@ impl Menu {
                 // MenuNode::Exit's doc comment.
                 MenuNode::Exit { label: "Exit...".into() },
             ],
+            default: None,
         }
     }
 
@@ -140,20 +160,68 @@ impl Menu {
 
     pub fn parse_file(path: &Path) -> Result<Menu, String> {
         let contents = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        Menu::parse(&contents)
+        Ok(Menu::parse_inner(&contents, path.parent(), 0))
     }
 
+    /// Parses menu text with no base directory -- a relative `INCLUDE`
+    /// can't be resolved without one, so it just warns and is skipped.
+    /// Only the tests need this entry point; real use always has a file
+    /// path and goes through `parse_file`.
+    #[cfg(test)]
     pub fn parse(contents: &str) -> Result<Menu, String> {
+        Ok(Menu::parse_inner(contents, None, 0))
+    }
+
+    fn parse_inner(contents: &str, base_dir: Option<&Path>, depth: usize) -> Menu {
         let mut lines = contents.lines().peekable();
         let mut title = None;
-        let items = parse_items(&mut lines, &mut title);
-        Ok(Menu { title, items })
+        let mut default = None;
+        let items = parse_items(&mut lines, base_dir, depth, &mut title, &mut default);
+        Menu { title, items, default }
     }
+
+    /// Reads and parses an `INCLUDE`d file. A read error yields an empty
+    /// menu (warned) rather than propagating -- one bad INCLUDE
+    /// shouldn't take down the whole root menu, same leniency the rest
+    /// of the parser has.
+    fn parse_include(path: &Path, depth: usize) -> Menu {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => Menu::parse_inner(&contents, path.parent(), depth),
+            Err(e) => {
+                log::warn!("root menu: can't read INCLUDEd {}: {e}", path.display());
+                Menu::default()
+            }
+        }
+    }
+}
+
+/// Resolves an `INCLUDE <file>` argument: an absolute path used
+/// directly, otherwise relative to the including file's own directory,
+/// otherwise `$HOME/<file>`. Real olwm has a longer search path
+/// (`$OPENWINHOME/lib` and friends); olwc has no equivalent of those
+/// locations, so this is the practical subset.
+fn resolve_include_path(file: &str, base_dir: Option<&Path>) -> Option<PathBuf> {
+    let p = Path::new(file);
+    if p.is_absolute() {
+        return p.exists().then(|| p.to_path_buf());
+    }
+    if let Some(dir) = base_dir {
+        let candidate = dir.join(file);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    let home = std::env::var_os("HOME")?;
+    let candidate = PathBuf::from(home).join(file);
+    candidate.exists().then_some(candidate)
 }
 
 fn parse_items<'a, I: Iterator<Item = &'a str>>(
     lines: &mut std::iter::Peekable<I>,
+    base_dir: Option<&Path>,
+    depth: usize,
     title: &mut Option<String>,
+    default: &mut Option<usize>,
 ) -> Vec<MenuNode> {
     let mut items = Vec::new();
     while let Some(raw_line) = lines.next() {
@@ -168,12 +236,33 @@ fn parse_items<'a, I: Iterator<Item = &'a str>>(
             log::warn!("root menu: skipping unparseable line: {raw_line:?}");
             continue;
         };
-        let rest = rest.trim();
+        // DEFAULT is a leading modifier on any other action, not an
+        // action itself -- `"Programs" DEFAULT INCLUDE ...`. DEFAULT
+        // with nothing after it falls through to the warn branch below.
+        let (is_default, rest) = match rest.trim().strip_prefix("DEFAULT ") {
+            Some(after) => (true, after.trim()),
+            None => (false, rest.trim()),
+        };
+        let before_len = items.len();
         if rest == "TITLE" {
             *title = Some(label);
         } else if rest == "MENU" {
-            let children = parse_items(lines, title);
-            items.push(MenuNode::Submenu { label, items: children });
+            let mut child_title = None;
+            let mut child_default = None;
+            let children =
+                parse_items(lines, base_dir, depth, &mut child_title, &mut child_default);
+            items.push(MenuNode::Submenu { label, items: children, default: child_default });
+        } else if let Some(file) = rest.strip_prefix("INCLUDE ") {
+            let sub = if depth >= MAX_INCLUDE_DEPTH {
+                log::warn!("root menu: INCLUDE nesting too deep near {file:?} -- possible cycle, stopping");
+                Menu::default()
+            } else if let Some(path) = resolve_include_path(file.trim(), base_dir) {
+                Menu::parse_include(&path, depth + 1)
+            } else {
+                log::warn!("root menu: INCLUDE {file:?} not found");
+                Menu::default()
+            };
+            items.push(MenuNode::Submenu { label, items: sub.items, default: sub.default });
         } else if let Some(command) = rest.strip_prefix("exec ") {
             items.push(MenuNode::Item { label, command: command.trim().to_string() });
         } else if rest == "EXIT" {
@@ -182,6 +271,9 @@ fn parse_items<'a, I: Iterator<Item = &'a str>>(
             items.push(MenuNode::ReloadMenu { label });
         } else {
             log::warn!("root menu: skipping item {label:?} with unsupported action {rest:?}");
+        }
+        if is_default && items.len() == before_len + 1 {
+            *default = Some(before_len);
         }
     }
     items
@@ -242,7 +334,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(menu.items.len(), 2);
-        let MenuNode::Submenu { label, items } = &menu.items[0] else { panic!("expected submenu") };
+        let MenuNode::Submenu { label, items, .. } = &menu.items[0] else { panic!("expected submenu") };
         assert_eq!(label, "Programs");
         assert_eq!(items.len(), 2);
         assert_eq!(items[1].label(), "XTerm");
@@ -279,18 +371,82 @@ mod tests {
     fn skips_unsupported_directives() {
         let menu = Menu::parse(
             r#"
-                "Weird" DEFAULT
+                "Weird" WINMENU
+                "Bare" DEFAULT
                 "Terminal" exec xterm
             "#,
         )
         .unwrap();
+        // WINMENU isn't supported; "Bare" DEFAULT has no action after
+        // the modifier so there's nothing to mark default -- both
+        // skipped, leaving just the one real item.
         assert_eq!(menu.items.len(), 1);
         assert_eq!(menu.items[0].label(), "Terminal");
+        assert_eq!(menu.default, None);
     }
 
     #[test]
     fn handles_escaped_quote_in_label() {
         let menu = Menu::parse(r#""Say \"Hi\"" exec echo"#).unwrap();
         assert_eq!(menu.items[0].label(), "Say \"Hi\"");
+    }
+
+    #[test]
+    fn parses_default_modifier() {
+        let menu = Menu::parse(
+            r#"
+                "First" exec a
+                "Second" DEFAULT exec b
+                "Third" exec c
+            "#,
+        )
+        .unwrap();
+        assert_eq!(menu.items.len(), 3);
+        assert_eq!(menu.default, Some(1));
+
+        // DEFAULT also works on a submenu, tracked per level.
+        let menu = Menu::parse(
+            r#"
+                "Progs" DEFAULT MENU
+                    "X" exec x
+                    "Y" DEFAULT exec y
+                END
+            "#,
+        )
+        .unwrap();
+        assert_eq!(menu.default, Some(0));
+        let MenuNode::Submenu { default, .. } = &menu.items[0] else { panic!("expected submenu") };
+        assert_eq!(*default, Some(1));
+    }
+
+    #[test]
+    fn parses_include() {
+        let dir = std::env::temp_dir().join(format!("olwc-menu-include-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("sub"), "\"Emacs\" exec emacs\n\"Vim\" DEFAULT exec vim\n").unwrap();
+        std::fs::write(dir.join("root"), "\"Workspace\" TITLE\n\"Programs\" INCLUDE sub\n\"Exit\" EXIT\n").unwrap();
+
+        let menu = Menu::parse_file(&dir.join("root")).unwrap();
+        assert_eq!(menu.title.as_deref(), Some("Workspace"));
+        assert_eq!(menu.items.len(), 2);
+        let MenuNode::Submenu { label, items, default } = &menu.items[0] else { panic!("expected submenu") };
+        assert_eq!(label, "Programs");
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[1].label(), "Vim");
+        assert_eq!(*default, Some(1)); // the INCLUDEd file's own DEFAULT carries through
+    }
+
+    #[test]
+    fn include_cycle_terminates() {
+        let dir = std::env::temp_dir().join(format!("olwc-menu-cycle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a"), "\"B\" INCLUDE b\n").unwrap();
+        std::fs::write(dir.join("b"), "\"A\" INCLUDE a\n").unwrap();
+
+        // Just needs to return rather than stack-overflow.
+        let menu = Menu::parse_file(&dir.join("a")).unwrap();
+        assert_eq!(menu.items.len(), 1);
     }
 }

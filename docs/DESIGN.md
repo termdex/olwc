@@ -2005,3 +2005,101 @@ with wlroots compositors generally, not just this project.
   finishing. If `flash_iconify` never arrives at all (an error
   condition), the safety-net timer still eventually corrects the
   visibility on its own, just without the animation.
+
+- Root menu: interactive nested submenus, plus the `INCLUDE` and
+  `DEFAULT` menu-file keywords. `shell/src/menu.rs` already parsed
+  `MENU`/`END` blocks into `MenuNode::Submenu`, but the root-menu popup
+  never opened them -- a hand-written `"Programs" MENU ... END` block
+  was dead weight. This is the foundation half of a two-part effort
+  toward an authentic Programs submenu (the follow-up: an `APPMENU`
+  keyword auto-populating from `.desktop` files, and wiring an
+  auto-Programs submenu into the built-in fallback menu).
+
+  - Interactivity. New `RootSubmenu` struct and `MenuPopup.submenu_
+    chain: Vec<RootSubmenu>`, mirroring the window menu's existing
+    `WorkspaceSubmenu` in every respect -- a subsurface of the popup's
+    own surface (or of the level above it), arbitrarily deep, with its
+    own `hovered`/`loc_cursor`, opened and closed by clicking the
+    parent row that owns it (a toggle). Chosen over open-on-hover
+    deliberately, matching the workspace submenu's own gesture. The
+    root menu's press/drag/release model means "click the row" is a
+    release on a `Submenu` row: `activate_popup_row` /
+    `activate_submenu_row` toggle the child and return "don't close",
+    while a leaf row runs via the new shared `execute_menu_leaf` and
+    dismisses the whole popup. Keyboard: new `FocusedMenu::
+    PopupSubmenu(usize)` (the popup index; the level operated on is
+    always `submenu_chain.last()`), with Right opening the highlighted
+    row's submenu and landing on its first item, Left and Escape
+    closing one level at a time -- the exact shape the window menu's
+    workspace submenu already uses. Since `RootSubmenu` holds plain
+    subsurfaces (not sctk `LayerSurface`s), the chain needs explicit
+    `wl_subsurface.destroy()`/`wl_surface.destroy()` teardown --
+    `close_root_submenu_from` -- wired into `close_menu` and into
+    `open_menu`'s drop-the-unpinned-popup step.
+  - Pullright arrow. `draw_popup` (and `draw_root_submenu`) now draw
+    the beveled submenu-arrow glyph on a `Submenu` row, via the same
+    `draw_submenu_arrow` the window menu already uses; `open_menu` and
+    `open_root_submenu` reserve `MENU_H_PADDING + SUBMENU_ARROW_SIZE`
+    of extra width past the widest label when any row has a submenu.
+  - On-screen placement. A submenu opens to its parent's right, but
+    flips to the parent's left when that would overflow the output's
+    right edge, and clamps upward to stay on-screen vertically -- the
+    same rules `open_menu` / `clamp_popup_position` apply to the popup
+    itself. Each level tracks its own absolute top-left so the next
+    level down can be placed without re-deriving it.
+  - `INCLUDE`. `"Label" INCLUDE <file>` parses `<file>` into a
+    `MenuNode::Submenu`. Path resolution is a lean subset of real
+    olwm's search path (`usermenu.c`): an absolute path used directly,
+    else relative to the including file's own directory, else
+    `$HOME/<file>`. `parse_inner` threads the base directory and a
+    recursion depth; `MAX_INCLUDE_DEPTH = 16` terminates an `INCLUDE`
+    cycle (file A includes B, B includes A) with a warning instead of
+    a stack overflow. A missing or unreadable included file warns and
+    yields an empty submenu rather than failing the whole menu,
+    matching the parser's existing leniency.
+  - `DEFAULT`. A leading modifier on any action (`"Programs" DEFAULT
+    MENU`, `"X" DEFAULT exec ...`), not a standalone directive --
+    `DEFAULT` with nothing after it stays a skip-with-warning. `Menu`
+    and `MenuNode::Submenu` each gain `default: Option<usize>` (an
+    index into their own items). olwc's interaction model has no
+    "menu button" to click without traversing the way real olwm does,
+    so instead: when a popup or submenu opens, its `default` row is
+    pre-highlighted (`hovered` pre-set) and drawn with a thin ring
+    (`draw_default_ring`, reused from this session's Notice
+    default-button work), so a quick right-press-release without
+    moving activates it.
+
+  Verified: `cargo build`/`clippy`/`test` clean (new `menu.rs` tests
+  `parses_default_modifier`, `parses_include`, `include_cycle_
+  terminates`); a hand-written test menu with a `"Programs" DEFAULT
+  MENU` block two levels deep parses to the right nested structure
+  with `default` recorded on the Programs row; nested headless run
+  starts with no protocol error or panic.
+
+  Two refinements after first live testing:
+
+  - Active-path highlight lock. Once a submenu is open, the row that
+    owns it stays highlighted and hovering the parent menu's other
+    rows no longer moves the highlight -- only the deepest open level
+    tracks the pointer. This is real olvwm's own behavior (in
+    `menuHandleMotion` the parent row of an open pullright stays
+    selected; moving to a *sibling* row there retracts the child, but
+    olwc's click-to-open model keeps the child up instead) and it
+    removes an inconsistency where the root popup's highlight could
+    drift while a submenu hung off it. `open_root_submenu` also pins
+    the parent level's `hovered` to the owning row as it opens, so
+    switching between sibling submenus by clicking them moves the
+    highlight cleanly instead of stranding it on the previous row
+    (the lock would otherwise stop Motion from ever catching up).
+  - Menu frame. Every transient menu (root popup and submenus, window
+    and icon menus) now draws a thin raised frame -- a dark keyline
+    around the whole perimeter plus a light inner edge on top and left
+    (`draw_menu_frame` / `MENU_FRAME_WIDTH`). Real olvwm draws one on
+    every non-pinned menu via `olgx_draw_box(..., OLGX_NORMAL, True)`
+    (`DrawMenu`); olwc had dropped it as a simplification, which was
+    fine until a submenu clamped near a screen edge could open back
+    over its own root and the two identical `MENU_BG_COLOR` slabs
+    blended into one shape with no visible seam. Drawn as a 2px
+    overlay on the outer edge -- the row content already carries
+    enough margin that it needs no layout change, the same
+    simplification the Notice frame makes.

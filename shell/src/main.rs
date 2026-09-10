@@ -226,6 +226,20 @@ const POPUP_PUSHPIN_HEIGHT: i32 = 14;
 // (currently just Move to Workspace) rather than acting immediately.
 const SUBMENU_ARROW_SIZE: i32 = 8;
 
+// Every transient menu (the root popup and its submenus, the window and
+// icon menus) is drawn inside a thin raised frame. Real olvwm draws one
+// on every non-pinned menu window via `olgx_draw_box(..., OLGX_NORMAL,
+// True)` (menu.c's `DrawMenu`); without it, two menus that overlap --
+// e.g. a submenu clamped back over its own root near a screen edge --
+// blend into one featureless slab, since both share MENU_BG_COLOR. Drawn
+// as a small overlay on the menu's outer edge (draw_menu_frame): a dark
+// keyline right around the perimeter to separate overlapping menus on
+// every side, plus a light inner edge on top and left for the raised
+// look. The content underneath already carries enough margin (pill
+// insets, row centering) that this doesn't visibly clip it, so it needs
+// no layout changes -- the same simplification the Notice frame makes.
+const MENU_FRAME_WIDTH: i32 = 2;
+
 // The "Mouseless" keyboard-navigation location cursor (see
 // draw_loc_cursor): a solid right-pointing triangle, traced directly
 // from real olvwm's DrawLocCursor (menu.c) -- XFillPolygon at relative
@@ -583,6 +597,12 @@ enum ButtonPress {
 /// WindowMenu's doc comment).
 enum FocusedMenu {
     Popup(usize),
+    /// A root-menu popup with a non-empty `submenu_chain`; keyboard nav
+    /// operates on its deepest open level (`submenu_chain.last()`).
+    /// Keyboard focus stays on the popup's own layer surface throughout
+    /// -- the chain entries are subsurfaces -- exactly like
+    /// WorkspaceSubmenu shares focus with its parent WindowMenu.
+    PopupSubmenu(usize),
     WindowMenu,
     WorkspaceSubmenu,
     IconMenu,
@@ -901,11 +921,39 @@ impl WorkspaceSubmenu {
     }
 }
 
+/// One level of a root menu's open submenu chain -- a subsurface of the
+/// popup's own surface (or of the level above it), positioned to that
+/// parent's right (or left, near a screen edge). Mirrors the window
+/// menu's WorkspaceSubmenu, but carries plain `MenuNode`s and nests
+/// arbitrarily deep (Programs -> Development -> ...). Opened and closed
+/// by clicking the parent row that owns it, exactly like WorkspaceSubmenu.
+struct RootSubmenu {
+    subsurface: wl_subsurface::WlSubsurface,
+    surface: wl_surface::WlSurface,
+    /// A clone of the parent `MenuNode::Submenu`'s items.
+    items: Vec<MenuNode>,
+    /// Index into the parent level's items of the row this hangs off.
+    parent_row: usize,
+    /// Index into `items` of this submenu's own DEFAULT item, if any --
+    /// pre-highlighted and ringed when it opens, see Menu::default.
+    default: Option<usize>,
+    width: u32,
+    height: u32,
+    hovered: Option<usize>,
+    /// See WindowMenu::loc_cursor's doc comment.
+    loc_cursor: bool,
+    /// This submenu's own top-left, in its output's local coordinates --
+    /// carried down the chain so open_root_submenu can clamp the *next*
+    /// level and pick left-vs-right without re-deriving it.
+    abs_x: i32,
+    abs_y: i32,
+}
+
 /// A root-menu popup: press MENU on a background to open one, drag to
 /// highlight an item, release over it to run the item's command and
-/// dismiss (release elsewhere just dismisses). Submenu entries are
-/// rendered but not yet interactive -- opening a nested popup on hover is
-/// follow-up work.
+/// dismiss (release elsewhere just dismisses). A Submenu row shows a
+/// pullright arrow and toggles a RootSubmenu open/closed on click (see
+/// activate_popup_row / submenu_chain).
 ///
 /// `Olshell::popups` holds any number of these at once, but
 /// `open_menu` only ever lets one *unpinned* one exist -- opening a new
@@ -924,8 +972,18 @@ struct MenuPopup {
     output: wl_output::WlOutput,
     items: Vec<MenuNode>,
     title: Option<String>,
+    /// Index into `items` of the DEFAULT item, if any (see Menu::default).
+    default: Option<usize>,
     width: u32,
     height: u32,
+    /// This popup's own top-left in its output's local coordinates (the
+    /// clamped layer margin open_menu computed) -- the base the submenu
+    /// chain's own abs_x/abs_y build on.
+    abs_x: i32,
+    abs_y: i32,
+    /// The open submenu chain, [0] a subsurface of this popup's surface,
+    /// [n] a subsurface of [n-1]'s. Empty when no submenu is open.
+    submenu_chain: Vec<RootSubmenu>,
     /// Integer buffer_scale, updated by scale_factor_changed.
     scale: i32,
     hovered: Option<usize>,
@@ -2087,6 +2145,8 @@ impl Olshell {
             }
         }
 
+        draw_menu_frame(canvas, buf_width, buf_height, scale, width, height);
+
         let wl_surface = &wm.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.set_buffer_scale(scale);
@@ -2308,6 +2368,8 @@ impl Olshell {
                 item.label, &self.font, MENU_FONT_SIZE, color,
             );
         }
+
+        draw_menu_frame(canvas, buf_width, buf_height, scale, width, height);
 
         let wl_surface = &im.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
@@ -2599,6 +2661,8 @@ impl Olshell {
             );
         }
 
+        draw_menu_frame(canvas, buf_width, buf_height, scale, width, height);
+
         let wl_surface = &sm.surface;
         buffer.attach_to(wl_surface).expect("failed to attach buffer");
         wl_surface.set_buffer_scale(scale);
@@ -2622,10 +2686,19 @@ impl Olshell {
         // comment), so opening a fresh menu on another output shouldn't
         // undo a pin any more than it would close a real physical palette
         // sitting on another monitor.
+        for i in 0..self.popups.len() {
+            if !self.popups[i].pinned {
+                // Plain subsurfaces -- dropping the Vec<RootSubmenu>
+                // wouldn't send wl_subsurface.destroy, so tear the chain
+                // down explicitly before the popup goes.
+                self.close_root_submenu_from(i, 0);
+            }
+        }
         self.popups.retain(|p| p.pinned);
 
         let items = self.menu.items.clone();
         let title = self.menu.title.clone();
+        let default = self.menu.default;
 
         let label_width = |label: &str| -> i32 {
             label
@@ -2639,9 +2712,17 @@ impl Olshell {
         for item in &items {
             max_width = max_width.max(label_width(item.label()));
         }
+        // Reserve room past the widest label for a pullright arrow when
+        // any row has a submenu, same as open_workspace_submenu /
+        // draw_window_menu do for "Move to Workspace".
+        let arrow_reserve = if items.iter().any(|it| matches!(it, MenuNode::Submenu { .. })) {
+            MENU_H_PADDING + SUBMENU_ARROW_SIZE
+        } else {
+            0
+        };
         // Left margin uses MENU_ITEM_TEXT_INSET rather than a second
         // MENU_H_PADDING, matching where item text actually starts.
-        let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING).max(80) as u32;
+        let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING + arrow_reserve).max(80) as u32;
         // Header row (pushpin, always present) + one row per item.
         let rows = items.len() as i32 + 1;
         let height = (rows * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
@@ -2679,62 +2760,297 @@ impl Olshell {
             output: output.clone(),
             items,
             title,
+            // Pre-highlight the DEFAULT item (with its ring, see
+            // draw_popup) so a quick right-release without moving picks
+            // it -- olwc's stand-in for real olwm's "click the menu
+            // button without traversing," see Menu::default.
+            hovered: default,
+            default,
             width,
             height,
+            abs_x: x,
+            abs_y: y,
+            submenu_chain: Vec::new(),
             scale: 1,
-            hovered: None,
             loc_cursor: false,
             pinned: false,
         });
+    }
+
+    /// Runs one leaf menu node's action -- Item (spawn), Exit (open the
+    /// confirmation Notice), ReloadMenu (re-read the menu file). Submenu
+    /// isn't a leaf and is a no-op here; its callers open a child popup
+    /// instead. Shared by the root popup's own rows and every level of
+    /// its submenu chain. Takes the node by value so the caller can
+    /// clone it out from under the `&self.popups[..]` borrow before
+    /// handing it to this `&mut self` method.
+    fn execute_menu_leaf(&mut self, qh: &QueueHandle<Self>, node: MenuNode, output: &wl_output::WlOutput) {
+        match node {
+            MenuNode::Item { command, .. } => Self::run_command(&command),
+            // Doesn't terminate anything itself -- opens the confirmation
+            // Notice (see its own doc comment), which is what actually
+            // sends session_manager.exit() if its Exit button is clicked.
+            MenuNode::Exit { .. } => self.open_notice(qh, output),
+            // Feeds only *future* open_menu calls (which clone
+            // self.menu at open time) -- an already-open popup keeps
+            // what it had. See docs/DESIGN.md's Reread Menu File entry.
+            MenuNode::ReloadMenu { .. } => self.menu = Menu::load_default(),
+            MenuNode::Submenu { .. } => {}
+        }
+    }
+
+    /// Right-release or Space/Return on a row of the popup's own top
+    /// level. A Submenu row toggles its child open/closed; a leaf runs
+    /// via execute_menu_leaf. Returns whether the whole popup should
+    /// close afterward (never for a Submenu row, and never while
+    /// pinned).
+    fn activate_popup_row(&mut self, qh: &QueueHandle<Self>, popup_index: usize, item_index: usize) -> bool {
+        if matches!(self.popups[popup_index].items.get(item_index), Some(MenuNode::Submenu { .. })) {
+            let already =
+                self.popups[popup_index].submenu_chain.first().map(|s| s.parent_row) == Some(item_index);
+            if already {
+                self.close_root_submenu_from(popup_index, 0);
+            } else {
+                self.open_root_submenu(qh, popup_index, 0, item_index);
+            }
+            return false;
+        }
+        let should_close = !self.popups[popup_index].pinned;
+        let node = self.popups[popup_index].items[item_index].clone();
+        let output = self.popups[popup_index].output.clone();
+        self.execute_menu_leaf(qh, node, &output);
+        should_close
+    }
+
+    /// Same as activate_popup_row, for a row of submenu-chain level
+    /// `depth`.
+    fn activate_submenu_row(
+        &mut self, qh: &QueueHandle<Self>, popup_index: usize, depth: usize, item_index: usize,
+    ) -> bool {
+        let is_submenu = matches!(
+            self.popups[popup_index].submenu_chain[depth].items.get(item_index),
+            Some(MenuNode::Submenu { .. })
+        );
+        if is_submenu {
+            let already = self.popups[popup_index].submenu_chain.get(depth + 1).map(|s| s.parent_row)
+                == Some(item_index);
+            if already {
+                self.close_root_submenu_from(popup_index, depth + 1);
+            } else {
+                self.open_root_submenu(qh, popup_index, depth + 1, item_index);
+            }
+            return false;
+        }
+        let should_close = !self.popups[popup_index].pinned;
+        let node = self.popups[popup_index].submenu_chain[depth].items[item_index].clone();
+        let output = self.popups[popup_index].output.clone();
+        self.execute_menu_leaf(qh, node, &output);
+        should_close
+    }
+
+    /// Opens the submenu hanging off `parent_row` of chain level
+    /// `depth - 1` (or the popup's own top level when `depth == 0`).
+    /// Truncates anything already open at `depth` or deeper first, so
+    /// opening a sibling drops the old branch. Positioned to the
+    /// parent's right, flipped left near the output's right edge and
+    /// clamped vertically -- same on-screen rules open_menu uses for the
+    /// popup itself.
+    fn open_root_submenu(
+        &mut self, qh: &QueueHandle<Self>, popup_index: usize, depth: usize, parent_row: usize,
+    ) {
+        self.close_root_submenu_from(popup_index, depth);
+
+        let popup = &self.popups[popup_index];
+        // Parent surface + geometry, and the Submenu node's own items/default.
+        let (parent_surface, parent_abs_x, parent_abs_y, parent_width, row_top, items, sub_default) =
+            if depth == 0 {
+                let MenuNode::Submenu { items, default, .. } = &popup.items[parent_row] else {
+                    return;
+                };
+                let row_top = (popup.header_rows() + parent_row as i32) * MENU_ROW_HEIGHT;
+                (
+                    popup.layer.wl_surface().clone(),
+                    popup.abs_x,
+                    popup.abs_y,
+                    popup.width as i32,
+                    row_top,
+                    items.clone(),
+                    *default,
+                )
+            } else {
+                let Some(parent) = popup.submenu_chain.get(depth - 1) else {
+                    return;
+                };
+                let MenuNode::Submenu { items, default, .. } = &parent.items[parent_row] else {
+                    return;
+                };
+                (
+                    parent.surface.clone(),
+                    parent.abs_x,
+                    parent.abs_y,
+                    parent.width as i32,
+                    parent_row as i32 * MENU_ROW_HEIGHT,
+                    items.clone(),
+                    *default,
+                )
+            };
+        if items.is_empty() {
+            return;
+        }
+
+        let label_width = |label: &str| -> i32 {
+            label.chars().map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32).sum()
+        };
+        let has_nested = items.iter().any(|it| matches!(it, MenuNode::Submenu { .. }));
+        let max_width = items.iter().map(|it| label_width(it.label())).max().unwrap_or(0);
+        let arrow_reserve = if has_nested { MENU_H_PADDING + SUBMENU_ARROW_SIZE } else { 0 };
+        let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING + arrow_reserve).max(80) as u32;
+        let height = (items.len() as i32 * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
+
+        // Absolute placement: to the parent's right by default, its left
+        // if that overflows the output. Vertically top-aligned with the
+        // parent row, shifted up to stay on-screen.
+        let output = popup.output.clone();
+        let (out_w, out_h) = self
+            .backgrounds
+            .iter()
+            .find(|b| b.output == output)
+            .map_or((i32::MAX, i32::MAX), |b| (b.width as i32, b.height as i32));
+
+        let right_abs_x = parent_abs_x + parent_width;
+        let abs_x = if right_abs_x + width as i32 > out_w {
+            (parent_abs_x - width as i32).max(0)
+        } else {
+            right_abs_x
+        };
+        let abs_y = (parent_abs_y + row_top).min((out_h - height as i32).max(0)).max(0);
+
+        let (subsurface, surface) = self.subcompositor.create_subsurface(parent_surface.clone(), qh);
+        subsurface.set_position(abs_x - parent_abs_x, abs_y - parent_abs_y);
+        subsurface.set_desync();
+
+        self.popups[popup_index].submenu_chain.push(RootSubmenu {
+            subsurface,
+            surface,
+            items,
+            parent_row,
+            // Land on the DEFAULT row (or nothing) when it opens, same
+            // as the popup itself does -- see open_menu.
+            hovered: sub_default,
+            default: sub_default,
+            width,
+            height,
+            loc_cursor: false,
+            abs_x,
+            abs_y,
+        });
+        // Pin the parent level's highlight to the row this hangs off --
+        // the "active path" the parent's Motion arm then holds locked.
+        // Set here (not just left wherever hover happened to be) so
+        // switching to a sibling submenu by clicking it moves the
+        // highlight cleanly rather than leaving it on the old row.
+        if depth == 0 {
+            self.popups[popup_index].hovered = Some(parent_row);
+            self.popups[popup_index].loc_cursor = false;
+            let popup_ptr = &self.popups[popup_index];
+            draw_popup(&mut self.pool, &self.font, popup_ptr);
+        } else {
+            self.popups[popup_index].submenu_chain[depth - 1].hovered = Some(parent_row);
+            self.popups[popup_index].submenu_chain[depth - 1].loc_cursor = false;
+            self.draw_root_submenu(popup_index, depth - 1);
+        }
+        self.draw_root_submenu(popup_index, depth);
+        // Same subsurface-visibility nudge every other surface in this
+        // chain needs -- see open_window_menu's identical comment.
+        parent_surface.commit();
+    }
+
+    /// Destroys and drops submenu-chain levels `depth..` of popup
+    /// `popup_index`.
+    fn close_root_submenu_from(&mut self, popup_index: usize, depth: usize) {
+        let Some(popup) = self.popups.get_mut(popup_index) else {
+            return;
+        };
+        if depth >= popup.submenu_chain.len() {
+            return;
+        }
+        for sub in popup.submenu_chain.drain(depth..) {
+            sub.subsurface.destroy();
+            sub.surface.destroy();
+        }
+    }
+
+    fn draw_root_submenu(&mut self, popup_index: usize, depth: usize) {
+        let Some(popup) = self.popups.get(popup_index) else {
+            return;
+        };
+        let Some(sub) = popup.submenu_chain.get(depth) else {
+            return;
+        };
+        let scale = popup.scale;
+        let width = sub.width as i32;
+        let height = sub.height as i32;
+        let buf_width = width * scale;
+        let buf_height = height * scale;
+        let stride = buf_width * 4;
+
+        let (buffer, canvas) = self
+            .pool
+            .create_buffer(buf_width, buf_height, stride, wl_shm::Format::Argb8888)
+            .expect("failed to create buffer");
+        let (r, g, b) = MENU_BG_COLOR;
+        for pixel in canvas.chunks_exact_mut(4) {
+            pixel[0] = b;
+            pixel[1] = g;
+            pixel[2] = r;
+            pixel[3] = 0xFF;
+        }
+
+        for (i, item) in sub.items.iter().enumerate() {
+            let row_y0 = i as i32 * MENU_ROW_HEIGHT;
+            if sub.hovered == Some(i) {
+                draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
+                if sub.loc_cursor {
+                    draw_loc_cursor(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, MENU_ROW_HEIGHT);
+                }
+            } else if sub.default == Some(i) {
+                draw_default_ring(
+                    canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0,
+                    width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT,
+                );
+            }
+            draw_text_row_centered(
+                canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
+                item.label(), &self.font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
+            );
+            if matches!(item, MenuNode::Submenu { .. }) {
+                let ax1 = width - MENU_H_PADDING;
+                let ax0 = ax1 - SUBMENU_ARROW_SIZE;
+                let ay0 = row_y0 + (MENU_ROW_HEIGHT - SUBMENU_ARROW_SIZE) / 2;
+                draw_submenu_arrow(
+                    canvas, buf_width, buf_height, scale, ax0, ay0, ax1, ay0 + SUBMENU_ARROW_SIZE,
+                    sub.hovered != Some(i),
+                );
+            }
+        }
+
+        draw_menu_frame(canvas, buf_width, buf_height, scale, width, height);
+
+        buffer.attach_to(&sub.surface).expect("failed to attach buffer");
+        sub.surface.set_buffer_scale(scale);
+        sub.surface.damage_buffer(0, 0, buf_width, buf_height);
+        sub.surface.commit();
     }
 
     /// Closes one popup by index. Just drops it -- sctk's LayerSurface::Drop
     /// already destroys the zwlr_layer_surface_v1 role object before the
     /// wl_surface, in the order the protocol requires. Destroying the
     /// wl_surface ourselves first (as this used to do) is a protocol
-    /// violation: "surface was destroyed before its role object".
-    /// Runs `self.popups[popup_index].items[item_index]`'s action --
-    /// shared by the mouse Release handler and keyboard Space/Return
-    /// execution. Returns whether the popup should close afterward: never
-    /// if it's pinned (a pinned popup stays up like a persistent palette
-    /// regardless of what's picked in it, same as the mouse handler's
-    /// existing rule), otherwise always -- matching every `MenuNode`
-    /// variant's outcome today, `Submenu` included (not yet interactive
-    /// at all, a separate, pre-existing limitation this doesn't change).
-    fn execute_popup_item(&mut self, qh: &QueueHandle<Self>, popup_index: usize, item_index: usize) -> bool {
-        let popup = &mut self.popups[popup_index];
-        let mut command_to_run = None;
-        let mut exit_requested_on = None;
-        let mut reload_menu = false;
-        match &popup.items[item_index] {
-            MenuNode::Item { command, .. } => command_to_run = Some(command.clone()),
-            MenuNode::Submenu { .. } => log::info!("root menu: submenus aren't interactive yet"),
-            MenuNode::Exit { .. } => exit_requested_on = Some(popup.output.clone()),
-            MenuNode::ReloadMenu { .. } => reload_menu = true,
-        }
-        let should_close = !popup.pinned;
-        if reload_menu {
-            // Only feeds *future* open_menu calls (it clones self.menu's
-            // items/title at open time) -- an already-open popup,
-            // pinned or not, keeps showing what it had when opened. See
-            // this feature's own plan/DESIGN.md entry for why that's an
-            // accepted, deliberate limitation rather than live-
-            // refreshing an open popup's layout in place.
-            self.menu = Menu::load_default();
-        }
-        if let Some(command) = command_to_run {
-            Self::run_command(&command);
-        }
-        // Doesn't terminate anything itself -- opens the confirmation
-        // Notice (see its own doc comment), which is what actually sends
-        // session_manager.exit() if its Exit button is clicked.
-        if let Some(output) = exit_requested_on {
-            self.open_notice(qh, &output);
-        }
-        should_close
-    }
-
+    /// violation: "surface was destroyed before its role object". Its
+    /// submenu chain's plain subsurfaces do need explicit teardown,
+    /// though.
     fn close_menu(&mut self, index: usize) {
+        self.close_root_submenu_from(index, 0);
         let popup = self.popups.remove(index);
         // Don't wait for a leave event that destroying our own surface may
         // or may not still generate -- drop the stale reference now so a
@@ -2753,7 +3069,11 @@ impl Olshell {
     fn focused_menu(&self) -> Option<FocusedMenu> {
         let surface = self.keyboard_focus.as_ref()?;
         if let Some(index) = self.popup_at(surface) {
-            Some(FocusedMenu::Popup(index))
+            if self.popups[index].submenu_chain.is_empty() {
+                Some(FocusedMenu::Popup(index))
+            } else {
+                Some(FocusedMenu::PopupSubmenu(index))
+            }
         } else if self.window_menu.as_ref().is_some_and(|wm| wm.surface == *surface) {
             if self.window_menu.as_ref().is_some_and(|wm| wm.workspace_submenu.is_some()) {
                 Some(FocusedMenu::WorkspaceSubmenu)
@@ -2781,6 +3101,14 @@ impl Olshell {
                 popup.hovered = next;
                 popup.loc_cursor = next.is_some();
                 draw_popup(&mut self.pool, &self.font, popup);
+            }
+            Some(FocusedMenu::PopupSubmenu(i)) => {
+                let depth = self.popups[i].submenu_chain.len() - 1;
+                let sub = &mut self.popups[i].submenu_chain[depth];
+                let next = step_selectable(sub.hovered, sub.items.len(), forward, |_| true);
+                sub.hovered = next;
+                sub.loc_cursor = next.is_some();
+                self.draw_root_submenu(i, depth);
             }
             Some(FocusedMenu::WindowMenu) => {
                 let toplevel_id = self.window_menu.as_ref().map(|wm| wm.toplevel_id.clone());
@@ -2831,7 +3159,15 @@ impl Olshell {
         match self.focused_menu() {
             Some(FocusedMenu::Popup(i)) => {
                 if let Some(item_index) = self.popups.get(i).and_then(|p| p.hovered) {
-                    if self.execute_popup_item(qh, i, item_index) {
+                    if self.activate_popup_row(qh, i, item_index) {
+                        self.close_menu(i);
+                    }
+                }
+            }
+            Some(FocusedMenu::PopupSubmenu(i)) => {
+                let depth = self.popups[i].submenu_chain.len() - 1;
+                if let Some(item_index) = self.popups[i].submenu_chain[depth].hovered {
+                    if self.activate_submenu_row(qh, i, depth, item_index) {
                         self.close_menu(i);
                     }
                 }
@@ -3331,12 +3667,31 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
             if popup.loc_cursor {
                 draw_loc_cursor(canvas, buf_width, buf_height, scale, MENU_PILL_MARGIN, row_y0, MENU_ROW_HEIGHT);
             }
+        } else if popup.default == Some(i) {
+            // No pill (that's reserved for the actual highlight), just a
+            // ring around the DEFAULT row so a right-release without
+            // traversing lands on it -- see Menu::default / open_menu.
+            draw_default_ring(
+                canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0,
+                width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT,
+            );
         }
         draw_text_row_centered(
             canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
             item.label(), font, MENU_FONT_SIZE, MENU_TEXT_COLOR,
         );
+        if matches!(item, MenuNode::Submenu { .. }) {
+            let ax1 = width - MENU_H_PADDING;
+            let ax0 = ax1 - SUBMENU_ARROW_SIZE;
+            let ay0 = row_y0 + (MENU_ROW_HEIGHT - SUBMENU_ARROW_SIZE) / 2;
+            draw_submenu_arrow(
+                canvas, buf_width, buf_height, scale, ax0, ay0, ax1, ay0 + SUBMENU_ARROW_SIZE,
+                popup.hovered != Some(i),
+            );
+        }
     }
+
+    draw_menu_frame(canvas, buf_width, buf_height, scale, width, height);
 
     let wl_surface = popup.layer.wl_surface();
     buffer.attach_to(wl_surface).expect("failed to attach buffer");
@@ -3842,8 +4197,6 @@ const DFLT_RING_RIGHT_ENDCAP: &[&str] = &[
 ];
 const DFLT_RING_MIDDLE_TILE: &[&str] =
     &[".", ".", "#", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", ".", "#", "."];
-/// Native pixel height of the default-ring endcap glyphs above.
-const DFLT_RING_HEIGHT: i32 = 20;
 
 // The pill-shaped menu-item highlight below is OLGlyph too (encodings
 // 24-29 for the endcaps, 30/35/40 for the tileable middle segments,
@@ -4220,7 +4573,13 @@ fn draw_button(
 #[allow(clippy::too_many_arguments)]
 fn draw_default_ring(canvas: &mut [u8], canvas_width: i32, canvas_height: i32, scale: i32, x0: i32, y0: i32, x1: i32, y1: i32) {
     let tiles = (x1 - x0 - 2 * PILL_ENDCAP_WIDTH).max(0);
-    let y = y0 + ((y1 - y0) - DFLT_RING_HEIGHT) / 2 + PILL_VERTICAL_BIAS;
+    // Position the ring's glyph box exactly where draw_pill puts the
+    // pill's -- centering on PILL_HEIGHT. The ring and pill outlines
+    // share a glyph-local ink center, but the ring endcap glyph is 2px
+    // shorter, so centering it on its own height instead drops it ~1px
+    // below where the hover pill sits and the ring reads as vertically
+    // off (confirmed against a screenshot).
+    let y = y0 + ((y1 - y0) - PILL_HEIGHT) / 2 + PILL_VERTICAL_BIAS;
     let right_x = x0 + PILL_ENDCAP_WIDTH + tiles;
     blit_bitmap(canvas, canvas_width, canvas_height, scale, x0, y, DFLT_RING_LEFT_ENDCAP, DECORATION_BEVEL_DARK);
     for i in 0..tiles {
@@ -4478,6 +4837,23 @@ fn fill_rect(
             canvas[idx + 3] = 0xFF;
         }
     }
+}
+
+/// Paints MENU_FRAME_WIDTH's raised frame over the outer edge of a
+/// `width` x `height` (surface-local pixels) menu surface -- see
+/// MENU_FRAME_WIDTH's own doc comment. `buf_width`/`buf_height` are the
+/// scaled buffer dimensions, as everywhere else here.
+fn draw_menu_frame(canvas: &mut [u8], buf_width: i32, buf_height: i32, scale: i32, width: i32, height: i32) {
+    // Dark keyline all the way round -- this is the edge that shows
+    // against another menu's identical background where two overlap.
+    fill_rect(canvas, buf_width, buf_height, scale, 0, 0, width, 1, DECORATION_BEVEL_DARK);
+    fill_rect(canvas, buf_width, buf_height, scale, 0, height - 1, width, height, DECORATION_BEVEL_DARK);
+    fill_rect(canvas, buf_width, buf_height, scale, 0, 0, 1, height, DECORATION_BEVEL_DARK);
+    fill_rect(canvas, buf_width, buf_height, scale, width - 1, 0, width, height, DECORATION_BEVEL_DARK);
+    // Light inner edge on top and left for the raised look.
+    let w = MENU_FRAME_WIDTH;
+    fill_rect(canvas, buf_width, buf_height, scale, 1, 1, width - 1, w, DECORATION_BEVEL_LIGHT);
+    fill_rect(canvas, buf_width, buf_height, scale, 1, 1, w, height - 1, DECORATION_BEVEL_LIGHT);
 }
 
 /// Draws the window-menu button: a beveled housing (two layered edge
@@ -4749,6 +5125,11 @@ impl CompositorHandler for Olshell {
         } else if let Some(i) = self.popup_at(surface) {
             self.popups[i].scale = new_factor;
             draw_popup(&mut self.pool, &self.font, &self.popups[i]);
+            // The chain's subsurfaces read the popup's scale (see
+            // draw_root_submenu) -- redraw them at the new one too.
+            for depth in 0..self.popups[i].submenu_chain.len() {
+                self.draw_root_submenu(i, depth);
+            }
         }
     }
 
@@ -5063,6 +5444,14 @@ impl PointerHandler for Olshell {
                 .as_ref()
                 .and_then(|wm| wm.workspace_submenu.as_ref())
                 .is_some_and(|sm| event.surface == sm.surface);
+            // (popup index, chain depth) of the root-menu submenu level
+            // this event landed on, if any.
+            let on_root_submenu = self.popups.iter().enumerate().find_map(|(pi, p)| {
+                p.submenu_chain
+                    .iter()
+                    .position(|s| s.surface == event.surface)
+                    .map(|depth| (pi, depth))
+            });
             let on_icon_menu = self.icon_menu.as_ref().is_some_and(|im| event.surface == im.surface);
             let on_notice = self.notice.as_ref().is_some_and(|n| event.surface == *n.layer.wl_surface());
 
@@ -5798,24 +6187,79 @@ impl PointerHandler for Olshell {
                     // or the disabled current-workspace one.
                     self.close_window_menu();
                 }
+                PointerEventKind::Motion { .. } if on_root_submenu.is_some() => {
+                    let (pi, depth) = on_root_submenu.unwrap();
+                    // A level that itself has an open child keeps its
+                    // highlight locked on the row that owns that child --
+                    // the "active path" stays lit, and hovering its other
+                    // rows does nothing (matching real olvwm, where the
+                    // parent row of an open pullright stays selected).
+                    // Only the deepest open level tracks the pointer.
+                    if depth + 1 < self.popups[pi].submenu_chain.len() {
+                        continue;
+                    }
+                    let sub = &mut self.popups[pi].submenu_chain[depth];
+                    let row = (event.position.1 / MENU_ROW_HEIGHT as f64) as usize;
+                    let hovered = (row < sub.items.len()).then_some(row);
+                    // See WindowMenu's matching Motion arm's comment on
+                    // why losing loc_cursor alone still counts as a change.
+                    let changed = sub.hovered != hovered || sub.loc_cursor;
+                    sub.hovered = hovered;
+                    sub.loc_cursor = false;
+                    if changed {
+                        self.draw_root_submenu(pi, depth);
+                    }
+                }
+                PointerEventKind::Leave { .. } if on_root_submenu.is_some() => {
+                    let (pi, depth) = on_root_submenu.unwrap();
+                    // Same active-path rule as the Motion arm -- don't
+                    // clear a highlight that's marking an open child.
+                    if depth + 1 < self.popups[pi].submenu_chain.len() {
+                        continue;
+                    }
+                    let sub = &mut self.popups[pi].submenu_chain[depth];
+                    if sub.hovered.is_some() {
+                        sub.hovered = None;
+                        sub.loc_cursor = false;
+                        self.draw_root_submenu(pi, depth);
+                    }
+                }
                 PointerEventKind::Motion { .. } if popup_index.is_some() => {
                     let popup = &mut self.popups[popup_index.unwrap()];
-                    let hovered = popup.item_at(event.position.1);
-                    // See WindowMenu's matching Motion arm's comment on
-                    // why losing loc_cursor alone still counts as a
-                    // change.
-                    let changed = popup.hovered != hovered || popup.loc_cursor;
-                    popup.hovered = hovered;
-                    popup.loc_cursor = false;
-                    if changed {
-                        draw_popup(&mut self.pool, &self.font, popup);
+                    // While a submenu is open off this popup, its owning
+                    // row stays highlighted and hovering the popup's
+                    // other rows does nothing -- see the submenu Motion
+                    // arm's comment. `hovered` was already set to that
+                    // row when the submenu opened, so just leave it.
+                    if popup.submenu_chain.is_empty() {
+                        let hovered = popup.item_at(event.position.1);
+                        // See WindowMenu's matching Motion arm's comment
+                        // on why losing loc_cursor alone still counts as
+                        // a change.
+                        let changed = popup.hovered != hovered || popup.loc_cursor;
+                        popup.hovered = hovered;
+                        popup.loc_cursor = false;
+                        if changed {
+                            draw_popup(&mut self.pool, &self.font, popup);
+                        }
                     }
                 }
                 PointerEventKind::Release { button, .. } if button == BTN_RIGHT => {
                     let mut close_index = None;
                     let mut item_selection = None;
+                    let mut submenu_selection = None;
 
-                    if let Some(i) = popup_index {
+                    if let Some((pi, depth)) = on_root_submenu {
+                        // Released on an open submenu level: a Submenu row
+                        // toggles its child (menu stays up), a leaf runs
+                        // and dismisses the whole popup, padding does
+                        // nothing (the chain stays as it is).
+                        let sub = &self.popups[pi].submenu_chain[depth];
+                        let row = (event.position.1 / MENU_ROW_HEIGHT as f64) as usize;
+                        if row < sub.items.len() {
+                            submenu_selection = Some((pi, depth, row));
+                        }
+                    } else if let Some(i) = popup_index {
                         let popup = &mut self.popups[i];
                         if popup.is_on_pushpin(event.position.0, event.position.1) {
                             // Pinning a transient popup makes it persistent;
@@ -5846,8 +6290,13 @@ impl PointerHandler for Olshell {
                     }
 
                     if let Some((i, item_index)) = item_selection {
-                        if self.execute_popup_item(qh, i, item_index) {
+                        if self.activate_popup_row(qh, i, item_index) {
                             close_index = Some(i);
+                        }
+                    }
+                    if let Some((pi, depth, row)) = submenu_selection {
+                        if self.activate_submenu_row(qh, pi, depth, row) {
+                            close_index = Some(pi);
                         }
                     }
                     if let Some(i) = close_index {
@@ -5907,7 +6356,15 @@ impl KeyboardHandler for Olshell {
                 return;
             };
             if let Some(index) = self.popup_at(surface) {
-                self.close_menu(index);
+                // One submenu level at a time, then the whole popup --
+                // same one-step-at-a-time rule as the window menu's
+                // Escape just below, and as Left.
+                let chain_len = self.popups[index].submenu_chain.len();
+                if chain_len > 0 {
+                    self.close_root_submenu_from(index, chain_len - 1);
+                } else {
+                    self.close_menu(index);
+                }
             } else if self.window_menu.as_ref().is_some_and(|wm| wm.surface == *surface) {
                 // One level at a time, same as clicking Move to Workspace
                 // again closes just the submenu it opened rather than the
@@ -5959,13 +6416,45 @@ impl KeyboardHandler for Olshell {
             // ACTION_UP/ACTION_DOWN (menuHandleUpDownMotion).
             self.navigate_focused_menu(event.keysym == Keysym::Down);
         } else if event.keysym == Keysym::Right {
-            // ACTION_RIGHT: only meaningful for the window menu's "Move
-            // to Workspace" row today -- olwc's other menus have no
-            // interactive submenus (the root menu's own Submenu rows
-            // are a separate, pre-existing "not yet interactive"
-            // limitation a Right press doesn't change), so this is a
-            // no-op everywhere else, matching what a click on a
-            // non-submenu item already does.
+            // ACTION_RIGHT: open the submenu of the highlighted row, if
+            // it has one -- the window menu's "Move to Workspace" row, or
+            // any root-menu Submenu row (top level or nested). A no-op on
+            // a row with no submenu, matching a click on it.
+            match self.focused_menu() {
+                Some(FocusedMenu::Popup(i)) => {
+                    if let Some(row) = self.popups[i].hovered {
+                        if matches!(self.popups[i].items.get(row), Some(MenuNode::Submenu { .. })) {
+                            self.open_root_submenu(qh, i, 0, row);
+                            if let Some(sub) = self.popups[i].submenu_chain.last_mut() {
+                                let first = step_selectable(None, sub.items.len(), true, |_| true);
+                                sub.hovered = first;
+                                sub.loc_cursor = first.is_some();
+                            }
+                            let depth = self.popups[i].submenu_chain.len().saturating_sub(1);
+                            self.draw_root_submenu(i, depth);
+                        }
+                    }
+                }
+                Some(FocusedMenu::PopupSubmenu(i)) => {
+                    let depth = self.popups[i].submenu_chain.len() - 1;
+                    if let Some(row) = self.popups[i].submenu_chain[depth].hovered {
+                        if matches!(
+                            self.popups[i].submenu_chain[depth].items.get(row),
+                            Some(MenuNode::Submenu { .. })
+                        ) {
+                            self.open_root_submenu(qh, i, depth + 1, row);
+                            if let Some(sub) = self.popups[i].submenu_chain.last_mut() {
+                                let first = step_selectable(None, sub.items.len(), true, |_| true);
+                                sub.hovered = first;
+                                sub.loc_cursor = first.is_some();
+                            }
+                            let new_depth = self.popups[i].submenu_chain.len() - 1;
+                            self.draw_root_submenu(i, new_depth);
+                        }
+                    }
+                }
+                _ => {}
+            }
             let selection = self.window_menu.as_ref().and_then(|wm| {
                 let index = wm.hovered?;
                 matches!(WINDOW_MENU_ITEMS[index].action, WindowMenuAction::MoveToWorkspace)
@@ -5999,6 +6488,10 @@ impl KeyboardHandler for Olshell {
                 Some(FocusedMenu::WorkspaceSubmenu) => self.close_workspace_submenu(),
                 Some(FocusedMenu::WindowMenu) => self.close_window_menu(),
                 Some(FocusedMenu::IconMenu) => self.close_icon_menu(),
+                Some(FocusedMenu::PopupSubmenu(i)) => {
+                    let chain_len = self.popups[i].submenu_chain.len();
+                    self.close_root_submenu_from(i, chain_len - 1);
+                }
                 Some(FocusedMenu::Popup(i)) => self.close_menu(i),
                 None => {}
             }
