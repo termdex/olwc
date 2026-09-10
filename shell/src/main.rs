@@ -143,7 +143,11 @@ mod appmenu;
 mod icon_theme;
 
 const PANEL_HEIGHT: u32 = 28;
-const PANEL_FONT_SIZE: f32 = 20.0;
+// Lower than the menu size -- a workspace-switcher strip is a secondary,
+// glanceable surface (real olvwm's Virtual Desktop Manager labelled its
+// panner in a tiny 5x8 fixed font); this keeps window titles readable
+// without the strip dominating.
+const PANEL_FONT_SIZE: f32 = 16.0;
 const PANEL_TEXT_COLOR: (u8, u8, u8) = (0x20, 0x20, 0x20);
 const PANEL_BG_COLOR: (u8, u8, u8) = (0xBE, 0xBE, 0xBE);
 
@@ -202,7 +206,7 @@ const ICON_DOUBLE_CLICK_MS: u32 = 400;
 const ICON_DRAG_THRESHOLD: f64 = 4.0;
 const PANEL_DRAG_THRESHOLD: f64 = 4.0;
 
-const MENU_FONT_SIZE: f32 = 18.0;
+const MENU_FONT_SIZE: f32 = 15.0;
 const MENU_ROW_HEIGHT: i32 = 26;
 const MENU_H_PADDING: i32 = 12;
 const MENU_BG_COLOR: (u8, u8, u8) = (0xD8, 0xD8, 0xD0);
@@ -477,8 +481,21 @@ const ICON_MENU_ITEMS: &[IconMenuItem] = &[
     IconMenuItem { label: "Properties", action: IconMenuAction::Unimplemented, disabled: true },
 ];
 
-// SIL Open Font License 1.1, see assets/fonts/OFL.txt.
-static PANEL_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/VT323-Regular.ttf");
+// Luxi Sans -- Kris Holmes & Charles Bigelow's open reimplementation of
+// the Lucida Sans family they designed, donated to X.Org in 2001 (see
+// assets/fonts/LUXI-LICENSE.txt). Real olvwm/XView drew every piece of
+// UI text in Lucida Sans: `buttonFont` (menu items, Notice buttons),
+// `textFont` (Notice body), `iconFont` (icon labels), all
+// `-b&h-lucida-medium-r-normal-sans-*-120-*` (12pt regular), and
+// `titleFont` `-b&h-lucida-bold-r-normal-sans-*-120-*` (12pt bold) for
+// window and menu titles -- confirmed from `resources.c`'s
+// `MainItemTable` and `screen.c`'s olgx graphics-context setup. Luxi
+// Sans is the closest redistributable match (the original B&H Lucida
+// Sans is proprietary), by the same designers. Its license forbids
+// modifying the font files, so both faces are embedded verbatim; the
+// bold weight is a real face, not a synthesized one.
+static UI_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/luxisr.ttf");
+static UI_BOLD_FONT_BYTES: &[u8] = include_bytes!("../assets/fonts/luxisb.ttf");
 
 #[derive(Default)]
 struct ToplevelInfo {
@@ -1154,8 +1171,10 @@ fn main() {
     log::info!("openlook-session: {}",
         if session_manager.is_some() { "bound" } else { "not available" });
 
-    let font = fontdue::Font::from_bytes(PANEL_FONT_BYTES, fontdue::FontSettings::default())
-        .expect("failed to parse embedded panel font");
+    let font = fontdue::Font::from_bytes(UI_FONT_BYTES, fontdue::FontSettings::default())
+        .expect("failed to parse embedded UI font");
+    let bold_font = fontdue::Font::from_bytes(UI_BOLD_FONT_BYTES, fontdue::FontSettings::default())
+        .expect("failed to parse embedded bold UI font");
 
     let mut state = Olshell {
         registry_state: RegistryState::new(&globals),
@@ -1175,6 +1194,7 @@ fn main() {
         session_manager,
         toplevels: std::collections::HashMap::new(),
         font,
+        bold_font,
         menu,
         pointer: None,
         keyboard: None,
@@ -1397,7 +1417,12 @@ struct Olshell {
     decoration_manager: Option<ZopenlookDecorationManagerV1>,
     session_manager: Option<ZopenlookSessionManagerV1>,
     toplevels: std::collections::HashMap<ObjectId, ToplevelInfo>,
+    /// Luxi Sans regular -- every piece of UI text except the bold
+    /// titles (see UI_FONT_BYTES).
     font: fontdue::Font,
+    /// Luxi Sans bold -- menu titles and focused window titles, matching
+    /// XView's `titleFont` / `im->title` bold convention.
+    bold_font: fontdue::Font,
     menu: Menu,
     pointer: Option<wl_pointer::WlPointer>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
@@ -1842,9 +1867,13 @@ impl Olshell {
         draw_button_glyph(canvas, buf_width, buf_height, scale, bx0, by0, bx1, by1, pressed);
 
         if !info.title.is_empty() {
+            // Bold, focused or not -- real olvwm draws the frame title
+            // through NORMAL_GINFO, which is set up with `titleFont`
+            // (`-b&h-lucida-bold-r-...`), the same bold face menu titles
+            // use (screen.c / resources.c).
             draw_text_row_centered(
                 canvas, buf_width, scale, 0, height, bx1 + DECORATION_BUTTON_MARGIN,
-                &info.title, &self.font, DECORATION_FONT_SIZE, DECORATION_TEXT_COLOR,
+                &info.title, &self.bold_font, DECORATION_FONT_SIZE, DECORATION_TEXT_COLOR,
             );
         }
 
@@ -2957,7 +2986,7 @@ impl Olshell {
             self.popups[popup_index].hovered = Some(parent_row);
             self.popups[popup_index].loc_cursor = false;
             let popup_ptr = &self.popups[popup_index];
-            draw_popup(&mut self.pool, &self.font, popup_ptr);
+            draw_popup(&mut self.pool, &self.font, &self.bold_font, popup_ptr);
         } else {
             self.popups[popup_index].submenu_chain[depth - 1].hovered = Some(parent_row);
             self.popups[popup_index].submenu_chain[depth - 1].loc_cursor = false;
@@ -3104,7 +3133,7 @@ impl Olshell {
                 let next = step_selectable(popup.hovered, popup.items.len(), forward, |_| true);
                 popup.hovered = next;
                 popup.loc_cursor = next.is_some();
-                draw_popup(&mut self.pool, &self.font, popup);
+                draw_popup(&mut self.pool, &self.font, &self.bold_font, popup);
             }
             Some(FocusedMenu::PopupSubmenu(i)) => {
                 let depth = self.popups[i].submenu_chain.len() - 1;
@@ -3622,7 +3651,7 @@ fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, scale
     surface.commit();
 }
 
-fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
+fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, bold_font: &fontdue::Font, popup: &MenuPopup) {
     let width = popup.width as i32;
     let height = popup.height as i32;
     let scale = popup.scale;
@@ -3655,10 +3684,10 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, popup: &MenuPopup) {
         // (lib/libxview/menu/omi.c: `if (im->title) font =
         // std_image->bold_font;`) -- a toolkit-level convention, not a
         // one-off screenshot artifact, so this is the one piece of text
-        // in olshell that should be bold.
-        draw_bold_text_row_centered(
+        // in a menu popup drawn in the bold face.
+        draw_text_row_centered(
             canvas, buf_width, scale, 0, MENU_ROW_HEIGHT, px1 + MENU_H_PADDING,
-            title, font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
+            title, bold_font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
         );
     }
     draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, popup.pinned);
@@ -3727,37 +3756,14 @@ fn draw_text_row_centered(
     let row_height = row_height * scale;
     let start_x = start_x * scale;
     let size = size * scale as f32;
-    let baseline_y = row_y0 + row_height / 2 + (size as i32) / 3;
+    // Center the cap-height box in the row (using 'H' as the cap-height
+    // stand-in) rather than guessing from the nominal size -- fonts
+    // vary a lot in how much of the em is reserved for ascenders and
+    // accents, so a size-fraction heuristic that looked right for one
+    // face leaves another sitting noticeably off.
+    let cap = font.metrics('H', size).height as i32;
+    let baseline_y = row_y0 + (row_height + cap) / 2;
     draw_text_at(canvas, canvas_width, row_y0 + row_height, start_x, baseline_y, text, font, size, color)
-}
-
-/// Faux-bold variant of draw_text_row_centered: draws the text twice, the
-/// second copy shifted 1px right, thickening strokes via double alpha-
-/// blending. The bundled font (VT323) has no real bold weight to switch
-/// to -- it's a deliberately single-weight retro terminal typeface -- so
-/// this is the practical way to get XView's actual bold-title convention
-/// (see the caller) without bundling a second, stylistically mismatched
-/// font family just for one line of text.
-#[allow(clippy::too_many_arguments)]
-fn draw_bold_text_row_centered(
-    canvas: &mut [u8],
-    canvas_width: i32,
-    scale: i32,
-    row_y0: i32,
-    row_height: i32,
-    start_x: i32,
-    text: &str,
-    font: &fontdue::Font,
-    size: f32,
-    color: (u8, u8, u8),
-) -> i32 {
-    draw_text_row_centered(canvas, canvas_width, scale, row_y0, row_height, start_x, text, font, size, color);
-    // The +1 here is logical, not physical -- draw_text_row_centered
-    // multiplies it by scale along with start_x itself, so the faux-bold
-    // offset stays a proportional 1 logical pixel (i.e. `scale` physical
-    // ones) at any scale, not a hairline-thin single physical pixel once
-    // scale > 1.
-    draw_text_row_centered(canvas, canvas_width, scale, row_y0, row_height, start_x + 1, text, font, size, color)
 }
 
 // The window-menu button and pushpin glyphs below are traced pixel-for-
@@ -4390,10 +4396,10 @@ const PILL_HEIGHT: i32 = 22;
 /// so it reads as a highlight sitting just inside the row rather than
 /// touching the menu's own outer border.
 const MENU_PILL_MARGIN: i32 = 2;
-/// Downward nudge from pure geometric centering -- see draw_pill_
-/// highlight's doc comment on why the text drawn over this glyph needs
-/// it to actually look centered.
-const PILL_VERTICAL_BIAS: i32 = 2;
+/// Downward nudge from pure geometric centering, to put the pill glyph's
+/// ink on the row centre -- see draw_pill's own comment for why the
+/// glyph box alone doesn't land there.
+const PILL_VERTICAL_BIAS: i32 = 1;
 
 /// Blits `bitmap` ('#' = on) at native pixel size (times `scale` for
 /// HiDPI), top-left at logical (x0, y0) -- unlike draw_glyph_bitmap, no
@@ -4491,19 +4497,14 @@ fn draw_pill(
     fill_color: (u8, u8, u8),
 ) {
     let tiles = (x1 - x0 - 2 * PILL_ENDCAP_WIDTH).max(0);
-    // Centering purely on PILL_HEIGHT within the row leaves the pill
-    // sitting a couple pixels higher than the text drawn over it --
-    // confirmed live (a screenshot showed visibly more empty pill above
-    // "Close" than below it) and measured precisely by rendering the real
-    // glyphs and this glyph together and comparing their pixel centers
-    // (1.5 logical pixels apart) rather than guessing: draw_text_row_
-    // centered's own baseline formula (row-center plus a downward bias of
-    // size/3, tuned for its many other plain-rectangle callers) sits text
-    // slightly lower than this glyph's own geometric center, invisible
-    // against the flat rectangle this replaced but obvious against a
-    // shape with a visible top/bottom edge. PILL_VERTICAL_BIAS closes
-    // that gap empirically rather than deriving it from font metrics,
-    // matching how OPEN LOOK's own bitmap chrome was tuned by eye too.
+    // PILL_VERTICAL_BIAS: the pill glyph's ink stops one row short of
+    // its own box on the bottom edge (the bottom arc sits at box rows
+    // 18-20 of 22), so centering the box on PILL_HEIGHT leaves the
+    // *ink* riding a pixel high in the row; the bias drops it back onto
+    // the row centre, where draw_text_row_centered's cap-box centering
+    // also puts the label. Measured by rendering the glyph and the
+    // label together and comparing pixel centres, the same way OPEN
+    // LOOK's own bitmap chrome was tuned by eye.
     let y = y0 + ((y1 - y0) - PILL_HEIGHT) / 2 + PILL_VERTICAL_BIAS;
     let right_x = x0 + PILL_ENDCAP_WIDTH + tiles;
 
@@ -5128,7 +5129,7 @@ impl CompositorHandler for Olshell {
             self.draw_icon_menu();
         } else if let Some(i) = self.popup_at(surface) {
             self.popups[i].scale = new_factor;
-            draw_popup(&mut self.pool, &self.font, &self.popups[i]);
+            draw_popup(&mut self.pool, &self.font, &self.bold_font, &self.popups[i]);
             // The chain's subsurfaces read the popup's scale (see
             // draw_root_submenu) -- redraw them at the new one too.
             for depth in 0..self.popups[i].submenu_chain.len() {
@@ -5343,7 +5344,7 @@ impl LayerShellHandler for Olshell {
             if configure.new_size.1 > 0 {
                 popup.height = configure.new_size.1;
             }
-            draw_popup(&mut self.pool, &self.font, popup);
+            draw_popup(&mut self.pool, &self.font, &self.bold_font, popup);
         } else if self.notice.as_ref().is_some_and(|n| n.layer.wl_surface() == layer.wl_surface()) {
             // button_rects were computed from the size we requested in
             // open_notice and stay valid as long as the compositor just
@@ -6244,7 +6245,7 @@ impl PointerHandler for Olshell {
                         popup.hovered = hovered;
                         popup.loc_cursor = false;
                         if changed {
-                            draw_popup(&mut self.pool, &self.font, popup);
+                            draw_popup(&mut self.pool, &self.font, &self.bold_font, popup);
                         }
                     }
                 }
@@ -6275,7 +6276,7 @@ impl PointerHandler for Olshell {
                                 close_index = Some(i);
                             } else {
                                 popup.pinned = true;
-                                draw_popup(&mut self.pool, &self.font, popup);
+                                draw_popup(&mut self.pool, &self.font, &self.bold_font, popup);
                             }
                         } else if let Some(item_index) = popup.item_at(event.position.1) {
                             item_selection = Some((i, item_index));

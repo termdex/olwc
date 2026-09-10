@@ -439,17 +439,15 @@ with wlroots compositors generally, not just this project.
   (`lib/libxview/menu/omi.c`): `if (im->title) font = std_image->
   bold_font; else font = INHERIT_VALUE(font);` -- any menu built with
   XView's menu package gets a bold title and plain-weight items
-  automatically, a toolkit-level convention. The bundled font (VT323)
-  has no real bold weight -- deliberately a single-weight retro
-  terminal typeface -- so a second, stylistically mismatched font
-  family wasn't worth bundling just for one line of text; added
-  `draw_bold_text_row_centered` instead, a faux-bold renderer that
-  draws the text twice, the second copy shifted 1px right, thickening
-  strokes via double alpha-blending. Only `MenuPopup`'s own title (e.g.
-  "Workspace") uses it -- the window menu has no equivalent title row,
-  and the Move to Workspace submenu's per-output header rows are an
-  olshell-only grouping label with no XView precedent either way, so
-  they're left as plain weight rather than guessing.
+  automatically, a toolkit-level convention. Originally drawn with a
+  faux-bold renderer (the then-bundled VT323 had no bold weight); once
+  the UI font became Luxi Sans (see the font entry below), which ships
+  a real bold face, that hack was dropped -- `MenuPopup`'s title and
+  the focused window title now select `bold_font` directly, and every
+  other menu string uses the regular face. The Move to Workspace
+  submenu's per-output header rows are an olshell-only grouping label
+  with no XView precedent either way, so they're left plain weight
+  rather than guessing.
 
   ~~The submenu-arrow indicator (Move to Workspace's row) was a
   geometric wedge~~ resolved: found in `libolgx` after all. It's
@@ -2183,3 +2181,41 @@ with wlroots compositors generally, not just this project.
   every returned menu, the fallback included, not just the
   parsed-from-file case; a zero-config olwc session now has a working
   application menu instead of only a terminal shortcut.
+
+- UI font: Luxi Sans, replacing the retro terminal font (VT323) olshell
+  had bundled since its first text rendering. Prompted by a screenshot
+  comparison -- the terminal font read as too thin/monospace/"high-DPI"
+  next to real olvwm. Checked what olvwm/XView actually used
+  (`resources.c`'s `MainItemTable`, `screen.c`'s olgx graphics-context
+  setup): every piece of UI text is **Lucida Sans** at 12pt --
+  `buttonFont` (menu items, Notice buttons), `textFont` (Notice body),
+  `iconFont` (icon labels) all `-b&h-lucida-medium-r-normal-sans-*`
+  regular, and `titleFont` `-b&h-lucida-bold-r-normal-sans-*` bold for
+  window and menu titles. Menus draw items through `BUTTON_GINFO`
+  (buttonFont) and the title through `NORMAL_GINFO` (titleFont), so the
+  bold-title / regular-items split olshell already had is exactly
+  right; it was the typeface that was wrong.
+
+  The original B&H Lucida Sans is proprietary, but Kris Holmes and
+  Charles Bigelow -- the same designers -- drew the open **Luxi**
+  family as a close substitute and donated it to X.Org in 2001 (a
+  permissive MIT-style license, with a no-modification clause, in
+  `shell/assets/fonts/LUXI-LICENSE.txt`). `luxisr.ttf` + `luxisb.ttf`
+  are embedded verbatim; `Olshell` now carries both `font` (regular)
+  and `bold_font`. The faux-bold double-draw renderer is gone -- the
+  menu/window titles select the real bold face.
+
+  Retuning that came with the swap: Luxi renders visibly larger per
+  nominal point size than the old terminal font, so `MENU_FONT_SIZE`
+  dropped 18 -> 15 and `PANEL_FONT_SIZE` 20 -> 16, closer to the
+  authentic 12pt feel. `draw_text_row_centered`'s vertical placement
+  changed from a `size / 3` guess to cap-height-box centering (using
+  'H' as the cap-height stand-in): the old heuristic was tuned to the
+  terminal font's unusual metrics and left Luxi's taller ascent/accent
+  reserve sitting the label low. `PILL_VERTICAL_BIAS` went 2 -> 1 to
+  match -- with the label now cap-box-centred on the row centre, the
+  pill glyph (whose ink stops a row short of its box on the bottom
+  edge) needs one pixel of nudge to sit on the same centre rather than
+  a pixel high. Verified by rendering the pill, the default-button
+  ring, and Notice buttons through the real drawing code and measuring
+  glyph vs. label pixel centres.

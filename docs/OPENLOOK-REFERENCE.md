@@ -200,3 +200,9 @@ From `Olvwm-desktop.jpg`, with the window menu open on an `xterm`:
   header it hangs off) is built out too now -- every item wired,
   including a real submenu (Move to Workspace) and, most recently,
   keyboard focus so Escape closes it -- same entry.
+- ~~UI text font~~ resolved: real olvwm/XView drew every string in
+  **Lucida Sans** 12pt -- `buttonFont`/`textFont`/`iconFont` regular,
+  `titleFont` bold (`resources.c`, `screen.c`). olshell uses **Luxi
+  Sans**, Bigelow & Holmes' own open reimplementation of Lucida donated
+  to X.Org in 2001 (`shell/assets/fonts/luxis{r,b}.ttf`), regular +
+  real bold. See `docs/DESIGN.md`'s UI font entry.
