@@ -139,6 +139,7 @@ use openlook_session::v1::client::zopenlook_session_manager_v1::{self, Zopenlook
 mod menu;
 use menu::{Menu, MenuNode};
 
+mod appmenu;
 mod icon_theme;
 
 const PANEL_HEIGHT: u32 = 28;
@@ -2796,6 +2797,9 @@ impl Olshell {
             // what it had. See docs/DESIGN.md's Reread Menu File entry.
             MenuNode::ReloadMenu { .. } => self.menu = Menu::load_default(),
             MenuNode::Submenu { .. } => {}
+            // Replaced by a Submenu in Menu::expand_appmenus before the
+            // menu is ever shown -- unreachable at runtime.
+            MenuNode::AppMenu { .. } => {}
         }
     }
 

@@ -2103,3 +2103,61 @@ with wlroots compositors generally, not just this project.
     overlay on the outer edge -- the row content already carries
     enough margin that it needs no layout change, the same
     simplification the Notice frame makes.
+
+- Root menu: `APPMENU` keyword -- a category-grouped submenu of the
+  system's installed applications, auto-populated from `.desktop`
+  files. A `"Programs" APPMENU` line in `.openwin-menu` expands, at
+  menu-load time, into a submenu with one child per non-empty
+  freedesktop category (Accessories, Development, Games, Graphics,
+  Internet, Multimedia, Office, Science, Education, System, plus a
+  trailing "Other"), each holding its apps sorted by name.
+
+  This is the second and last piece of the Programs-submenu effort
+  whose foundation (interactive nested submenus, `INCLUDE`, `DEFAULT`)
+  landed just before it. Structurally it's real olvwm's dynamic
+  `DIRMENU` (`virtual.c`'s `GenDirMenuFunc` scanned a directory and
+  turned each file into an `exec` item); the XDG/`.desktop`/category
+  machinery is the part with no historical antecedent, since a 1993
+  window manager predates all of it. `APPMENU` is therefore an olwc
+  keyword, not a real olwm one -- named to sit alongside `DIRMENU` in
+  spirit.
+
+  - New module `shell/src/appmenu.rs`. `generate(label)` scans
+    `icon_theme::application_dirs()` (the XDG `applications` dirs, now
+    `pub(crate)`), parses each `.desktop` file's `[Desktop Entry]`
+    group, and buckets the results. A deliberately lenient subset of
+    the Desktop Entry and Menu specs, same spirit as `icon_theme.rs`
+    and `menu.rs`: it honors `Type`, `NoDisplay`, `Hidden`, and
+    `TryExec` (skipping an entry whose `TryExec` binary isn't on
+    `$PATH`), strips the `Exec` argument placeholders (`%f`/`%U`/... and
+    Flatpak's own `@@`/`@@u` wrappers) so what's left just launches the
+    app, and de-duplicates by desktop-file ID with XDG precedence
+    (earlier dir wins). It ignores `OnlyShowIn`/`NotShowIn` (olwc isn't
+    a registered desktop environment, so honoring them would hide much
+    of the menu), localized `Name[xx]` keys, D-Bus activation, and the
+    Menu spec's `.directory` files and nested-category rules.
+  - Category order in `CATEGORIES` is the multi-category tie-break
+    (an app tagged `Development;Utility;TextEditor` belongs under
+    Development, not Accessories, so the specific buckets come before
+    the catch-alls), but the menu shows the sections alphabetically.
+  - `menu.rs`: new `MenuNode::AppMenu { label }` marker produced by the
+    parser for a `"Label" APPMENU` line (works with a leading
+    `DEFAULT`). The parser stays a pure text-to-tree transform -- the
+    filesystem scan happens afterward in `Menu::expand_appmenus`, a
+    recursive pass (called from `load_default`) that replaces every
+    `AppMenu` node, top-level or nested or pulled in by `INCLUDE`, with
+    the `Submenu` `appmenu::generate` builds. Doing it there rather
+    than in the parser keeps `menu.rs`'s tests filesystem-independent
+    and means "Reread Menu File" re-scans for newly-installed apps for
+    free.
+  - `MenuNode::AppMenu` never reaches runtime code (expansion removes
+    every one before the menu is shown); `execute_menu_leaf`'s match
+    gets an unreachable arm for exhaustiveness and nothing else in
+    `main.rs` changes.
+
+  Verified: `cargo build`/`clippy`/`test` clean (new `appmenu.rs` tests
+  for grouping/sorting/field-code-stripping/`NoDisplay`+`Hidden`+`Type`
+  skips/`TryExec`/XDG precedence/empty, plus `menu.rs`'s
+  `parses_appmenu`); generating against this dev machine's real
+  `.desktop` set produced correctly-grouped, correctly-sorted sections
+  with clean commands; nested run loads the menu with no panic.

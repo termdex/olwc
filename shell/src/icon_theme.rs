@@ -38,7 +38,7 @@ fn xdg_data_dirs() -> Vec<PathBuf> {
 }
 
 /// Every `applications` directory to search, most-preferred first.
-fn application_dirs() -> Vec<PathBuf> {
+pub(crate) fn application_dirs() -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = xdg_data_home().into_iter().collect();
     dirs.extend(xdg_data_dirs());
     dirs.into_iter().map(|d| d.join("applications")).collect()

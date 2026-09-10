@@ -14,6 +14,9 @@
 //                                         from disk (see MenuNode::ReloadMenu)
 //   "Label" INCLUDE <file>            -- submenu whose items come from <file>
 //                                         (resolved relative to this file)
+//   "Label" APPMENU                   -- submenu auto-populated from the
+//                                         system's .desktop files, grouped
+//                                         by category (see appmenu.rs)
 //   "Label" DEFAULT <action>          -- any of the above, prefixed with
 //                                         DEFAULT, marks it the menu's
 //                                         default item (pre-highlighted on
@@ -63,6 +66,16 @@ pub enum MenuNode {
     // so restarting olcore would drop every client outright) and so
     // isn't offered here.
     ReloadMenu { label: String },
+    // A placeholder for a submenu auto-populated from the system's
+    // `.desktop` application files, grouped by freedesktop category --
+    // olwc's modern stand-in for the hand-maintained `Programs` submenu
+    // (and the closest thing to real olvwm's dynamic `DIRMENU`, which
+    // likewise generated a submenu's contents rather than spelling them
+    // out). Present only between parsing and `Menu::expand_appmenus`,
+    // which replaces every one with the `Submenu` that `appmenu::
+    // generate` builds by scanning the filesystem; nothing downstream
+    // of `load_default` ever sees this variant.
+    AppMenu { label: String },
 }
 
 impl MenuNode {
@@ -72,6 +85,7 @@ impl MenuNode {
             MenuNode::Submenu { label, .. } => label,
             MenuNode::Exit { label } => label,
             MenuNode::ReloadMenu { label } => label,
+            MenuNode::AppMenu { label } => label,
         }
     }
 }
@@ -143,12 +157,13 @@ impl Menu {
         };
 
         match Menu::parse_file(&path) {
-            Ok(menu) => {
+            Ok(mut menu) => {
                 log::info!(
                     "root menu: loaded {} top-level item(s) from {}",
                     menu.items.len(),
                     path.display()
                 );
+                menu.expand_appmenus();
                 menu
             }
             Err(e) => {
@@ -156,6 +171,29 @@ impl Menu {
                 Menu::default_menu()
             }
         }
+    }
+
+    /// Replaces every `MenuNode::AppMenu` in the tree (top level and
+    /// inside any `Submenu`, including ones pulled in by `INCLUDE`) with
+    /// the category-grouped `Submenu` that `appmenu::generate` builds
+    /// from the system's `.desktop` files. Done here, after parsing,
+    /// rather than in the parser itself so the parser stays a pure
+    /// text-to-tree transform with no filesystem scan -- and so a
+    /// "Reread Menu File" (which re-runs `load_default`) picks up
+    /// newly-installed applications for free.
+    fn expand_appmenus(&mut self) {
+        fn walk(items: &mut [MenuNode]) {
+            for node in items.iter_mut() {
+                match node {
+                    MenuNode::AppMenu { label } => {
+                        *node = crate::appmenu::generate(std::mem::take(label));
+                    }
+                    MenuNode::Submenu { items, .. } => walk(items),
+                    _ => {}
+                }
+            }
+        }
+        walk(&mut self.items);
     }
 
     pub fn parse_file(path: &Path) -> Result<Menu, String> {
@@ -269,6 +307,8 @@ fn parse_items<'a, I: Iterator<Item = &'a str>>(
             items.push(MenuNode::Exit { label });
         } else if rest == "REREAD_MENU_FILE" {
             items.push(MenuNode::ReloadMenu { label });
+        } else if rest == "APPMENU" {
+            items.push(MenuNode::AppMenu { label });
         } else {
             log::warn!("root menu: skipping item {label:?} with unsupported action {rest:?}");
         }
@@ -389,6 +429,24 @@ mod tests {
     fn handles_escaped_quote_in_label() {
         let menu = Menu::parse(r#""Say \"Hi\"" exec echo"#).unwrap();
         assert_eq!(menu.items[0].label(), "Say \"Hi\"");
+    }
+
+    #[test]
+    fn parses_appmenu() {
+        // The parser only produces the marker node -- the actual
+        // .desktop scan happens later, in Menu::expand_appmenus, and is
+        // covered by appmenu.rs's own tests.
+        let menu = Menu::parse(
+            r#"
+                "Programs" DEFAULT APPMENU
+                "Exit" EXIT
+            "#,
+        )
+        .unwrap();
+        assert_eq!(menu.items.len(), 2);
+        assert!(matches!(&menu.items[0], MenuNode::AppMenu { .. }));
+        assert_eq!(menu.items[0].label(), "Programs");
+        assert_eq!(menu.default, Some(0));
     }
 
     #[test]
