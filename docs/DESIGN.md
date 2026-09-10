@@ -163,12 +163,18 @@ with wlroots compositors generally, not just this project.
   stuck -- confirmed live that snapping back is surprising, since the
   window can appear to vanish if you've switched workspaces since. Unlike
   the other toggle (`Full Size`, whose maximized state comes for free
-  from wlr-foreign-toplevel-management), olcore has to explicitly report
-  sticky state back via a `sticky_changed` event, since two things need
-  to know it: the window menu shows `Unstick` instead of `Stick` once
-  toggled on, and the header draws a small pushpin while sticky (reusing
-  the same glyph the root menu's pin-to-persist gesture uses, since both
-  mean "stays put").
+  from wlr-foreign-toplevel-management -- state 0 in the handle's state
+  list), olcore has to explicitly report sticky state back via a
+  `sticky_changed` event, since two things need to know it: the window
+  menu shows `Unstick` instead of `Stick` once toggled on, and the
+  header draws a small pushpin while sticky (reusing the same glyph the
+  root menu's pin-to-persist gesture uses, since both mean "stays put").
+  `Full Size` gets the same two-state treatment -- its label becomes
+  `Restore Size` while the window is maximized, matching real olvwm's
+  own `fullSizeButton` (usermenu.c's `SetWindowMenuLabels`), read
+  straight off that state-0 flag with no extra bookkeeping. Both
+  alternate labels are reserved in the popup's width calculation
+  unconditionally, since width is fixed before either state is known.
 
   ~~No keyboard focus on the window menu yet, so only click-elsewhere
   closes it, not Escape~~ resolved: unlike the root menu, a plain

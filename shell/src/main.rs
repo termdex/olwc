@@ -1977,14 +1977,15 @@ impl Olshell {
                 .map(|c| self.font.metrics(c, MENU_FONT_SIZE).advance_width.round() as i32)
                 .sum()
         };
-        // "Unstick" (Stick's other label, see draw_window_menu) is wider
-        // than "Stick" -- included here unconditionally so the popup is
-        // wide enough for it regardless of current sticky state, since
-        // that's decided once, here, before it's known.
+        // "Unstick" and "Restore Size" are the alternate labels Stick and
+        // Full Size take once toggled on (see draw_window_menu), each
+        // wider than its default -- included here unconditionally so the
+        // popup is wide enough for them regardless of current state,
+        // which is decided once, here, before it's known.
         let max_width = WINDOW_MENU_ITEMS
             .iter()
             .map(|item| label_width(item.label))
-            .chain(std::iter::once(label_width("Unstick")))
+            .chain(["Unstick", "Restore Size"].map(label_width))
             .max()
             .unwrap_or(0);
         // Widest accelerator key (see WindowMenuItem::accel_key's doc
@@ -2125,6 +2126,15 @@ impl Olshell {
             .get(&wm.toplevel_id)
             .and_then(|info| info.decoration.as_ref())
             .is_some_and(|dec| dec.sticky);
+        // Drives Full Size's label -- "Restore Size" once maximized,
+        // matching real olvwm's own two-state fullSizeButton
+        // (usermenu.c). State 0 is "maximized" in
+        // wlr-foreign-toplevel-management's list, the same one
+        // ToggleMaximize's handler checks.
+        let maximized = self
+            .toplevels
+            .get(&wm.toplevel_id)
+            .is_some_and(|info| info.states.contains(&0));
 
         for (i, item) in WINDOW_MENU_ITEMS.iter().enumerate() {
             let row_y0 = i as i32 * MENU_ROW_HEIGHT;
@@ -2148,10 +2158,10 @@ impl Olshell {
                 }
             }
             let color = if disabled { WINDOW_MENU_DISABLED_COLOR } else { MENU_TEXT_COLOR };
-            let label = if matches!(item.action, WindowMenuAction::ToggleSticky) && sticky {
-                "Unstick"
-            } else {
-                item.label
+            let label = match item.action {
+                WindowMenuAction::ToggleSticky if sticky => "Unstick",
+                WindowMenuAction::ToggleMaximize if maximized => "Restore Size",
+                _ => item.label,
             };
             draw_text_row_centered(
                 canvas, buf_width, scale, row_y0, MENU_ROW_HEIGHT, MENU_ITEM_TEXT_INSET,
