@@ -25,7 +25,7 @@
     THIS SOFTWARE.
   </copyright>
 
-  <interface name="zopenlook_decoration_manager_v1" version="1">
+  <interface name="zopenlook_decoration_manager_v1" version="2">
     <description summary="create OpenLook-style chrome for another client's window">
       Standard Wayland deliberately gives a client no way to learn another
       client's window position, or to attach a surface to another client's
@@ -43,6 +43,12 @@
       access to both surfaces -- takes over positioning and stacking that
       surface relative to the toplevel, the same way wlr-layer-shell takes
       over positioning a plain surface relative to an output.
+
+      flash_iconify, added in version 2, is the same kind of bridge for a
+      different gap: olshell knows an icon's position (it draws the icon
+      tray itself), but not a toplevel's absolute on-screen position, and
+      olcore has the reverse -- neither side alone has enough to draw
+      something connecting the two.
 
       Warning! The protocol described in this file is currently in the
       testing phase. Backward compatible changes may be added together
@@ -104,6 +110,31 @@
         Destroys this manager object. Does not affect any decorations
         already created through it, or a keyboard grab in progress.
       </description>
+    </request>
+
+    <request name="flash_iconify" since="2">
+      <description summary="briefly flash lines connecting a toplevel to its icon">
+        Authentic OPEN LOOK: real olvwm briefly flashes four lines, each
+        from one corner of the window frame to the corresponding corner
+        of its icon, on both iconify and deiconify (winicon.c's
+        DrawIconToWindowLines). olshell calls this once per transition,
+        either direction -- olcore already knows toplevel's own on-screen
+        rectangle, and is told the icon's here since only olshell knows
+        that (icon_x/y/width/height, in icon_output's own local
+        coordinates -- the same space background surfaces already use).
+
+        A no-op, silently, if toplevel doesn't name a currently-mapped
+        toplevel or icon_output doesn't name a current output -- this is
+        a purely cosmetic flourish, not worth a protocol error over a
+        race with either being destroyed between olshell deciding to
+        flash and this request arriving.
+      </description>
+      <arg name="toplevel" type="object" interface="zwlr_foreign_toplevel_handle_v1"/>
+      <arg name="icon_output" type="object" interface="wl_output"/>
+      <arg name="icon_x" type="int" summary="icon-output-local x"/>
+      <arg name="icon_y" type="int" summary="icon-output-local y"/>
+      <arg name="icon_width" type="int"/>
+      <arg name="icon_height" type="int"/>
     </request>
 
     <enum name="error">

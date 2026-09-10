@@ -1940,3 +1940,68 @@ with wlroots compositors generally, not just this project.
   file) while olshell was running, selected "Reread Menu File," and a
   freshly-opened root menu picked up the new title and item immediately,
   no restart involved.
+- Iconify/deiconify "zoom lines" animation: new. Real olvwm briefly
+  flashes four straight lines, each from one corner of the window frame
+  to the corresponding corner of its icon, on both iconify and
+  deiconify -- confirmed from source (`winicon.c`'s
+  `DrawIconToWindowLines`, called from `states.c`'s
+  `iconifyOne`/`deiconifyOne`): `XDrawSegments` with an XOR GC directly
+  on the root window, drawn then immediately drawn again to erase it (no
+  repaint needed), wrapped in `XGrabServer`/`XUngrabServer`, flashed 3x
+  by default (`IconFlashCount`/`IconFlashOnTime`/`IconFlashOffTime`
+  resources) for ~60ms total.
+
+  Neither half of olwc had any way to build this alone: olcore is the
+  only side that can draw outside any one client's own surfaces and the
+  only side that knows a toplevel's real on-screen geometry, but has no
+  idea where an icon is (a pure olshell concept); olshell knows the
+  icon's rectangle but, confirmed during this session's earlier on-
+  screen-clamp work, has no way to learn a toplevel's absolute position
+  at all. Added `flash_iconify` to `openlook-decoration-unstable-v1`
+  (manager-level request, version bumped to 2, keyed by the same
+  `zwlr_foreign_toplevel_handle_v1` `get_decoration` already resolves
+  via `toplevel_from_foreign_handle_resource`, plus a `wl_output` +
+  local rect for the icon, resolved via `wlr_output_from_resource` +
+  `wlr_output_layout_get_box`). The lines themselves are stamped
+  `wlr_scene_rect`s (2x2px, walked along each segment) added to a
+  short-lived `wlr_scene_tree`, avoiding a custom `wlr_buffer_impl`
+  entirely -- real olvwm's 3x XOR flash and its `XGrabServer` stall are
+  both deliberately not reproduced (one continuous ~60ms show is
+  visually indistinguishable and far simpler; freezing every client for
+  every minimize would be a real regression, not something worth
+  preserving from what was an X11 implementation necessity).
+
+  Two real bugs found only by testing live, both about *when* the
+  window's own visibility actually changes relative to the flash, not
+  the lines themselves:
+
+  1. First pass changed visibility the instant `flash_iconify` arrived
+     (temporarily overriding it, then restoring the real state on a
+     timer). Confirmed live as a visible flicker: the *original*
+     minimize/restore request had already applied the real visibility
+     change immediately, well before olshell's round trip (react to the
+     state change, lay out its icon tray, send `flash_iconify` back)
+     could complete, so the override then made the window pop back
+     into view before disappearing again -- hide, reappear, hide.
+  2. Fixed by moving the visibility hold to start immediately, in
+     `toplevel_set_minimized` itself, with its own short timer --
+     removing the original immediate `update_toplevel_visibility` call
+     entirely. This traded the flicker for a *worse* bug: that short
+     timer raced the same unpredictable round trip and often won,
+     applying the real visibility change *before* `flash_iconify` ever
+     arrived -- confirmed live as the window changing state well before
+     the lines/icon did, the opposite direction of the original bug but
+     just as wrong. Real olvwm never has this problem since
+     `DrawIconToWindowLines` runs synchronously in the same process,
+     with nothing else able to intervene.
+
+  Resolved by not racing the round trip at all:
+  `start_toplevel_visibility_flash` (called from `toplevel_set_
+  minimized`) now leaves visibility completely untouched and starts
+  only a long (2 second) safety-net timer. The actual override, and the
+  real ~60ms timer, both happen inside `decoration_manager_handle_
+  flash_iconify` itself once that request actually arrives -- the one
+  point that can't lose the race, since it *is* the round trip
+  finishing. If `flash_iconify` never arrives at all (an error
+  condition), the safety-net timer still eventually corrects the
+  visibility on its own, just without the animation.

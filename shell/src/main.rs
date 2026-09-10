@@ -491,6 +491,33 @@ struct ToplevelInfo {
     /// the ToplevelWorkspace handler below), since a stored position
     /// only makes sense relative to the output it was set on.
     icon_position: Option<(i32, i32)>,
+    /// A minimize/restore transition detected in the foreign-toplevel
+    /// handle's own Event::State (before it overwrites `states`),
+    /// consumed in the following Event::Done once the tray has settled
+    /// -- see PendingFlash's own doc comment for why the two directions
+    /// need different handling.
+    pending_flash: Option<PendingFlash>,
+}
+
+/// Which direction of the real "zoom lines" flash (see
+/// flash_iconify_lines's own doc comment in core/main.c) a toplevel is
+/// mid-transition into, detected in Event::State and acted on in the
+/// following Event::Done. The two directions need different handling
+/// because of when the icon tray's own layout actually reflects the
+/// change:
+///
+/// - Iconify: the icon doesn't exist in the tray yet at Event::State
+///   time -- it's only added once Event::Done's existing
+///   redraw_background_for_output call runs -- so there's nothing to
+///   compute until Done, just a flag that a flash is owed once there is.
+/// - Deiconify: the *opposite* problem -- the current tray layout still
+///   includes this toplevel as minimized at Event::State time, but by
+///   Done, redraw_background_for_output will have already reflowed the
+///   tray without it. Its icon rect has to be captured immediately
+///   here, before that happens, rather than recomputed later.
+enum PendingFlash {
+    Iconify,
+    Deiconify { icon_rect: (i32, i32, i32, i32) },
 }
 
 /// The header (title bar) chrome olshell draws for one toplevel it doesn't
@@ -1058,7 +1085,7 @@ fn main() {
     log::info!("openlook-workspaces: {}",
         if workspaces_manager.is_some() { "bound" } else { "not available" });
     let decoration_manager = globals
-        .bind::<ZopenlookDecorationManagerV1, _, _>(&qh, 1..=1, ())
+        .bind::<ZopenlookDecorationManagerV1, _, _>(&qh, 1..=2, ())
         .ok();
     log::info!("openlook-decoration: {}",
         if decoration_manager.is_some() { "bound" } else { "not available" });
@@ -2091,6 +2118,22 @@ impl Olshell {
     /// exact icon's menu was the one already open (see pointer_frame's
     /// BTN_RIGHT handling), the same pattern open_window_menu's caller
     /// already uses for the header button.
+    /// The current on-screen rect (background-surface-local, i.e.
+    /// output-local -- the same space open_icon_menu's own `ix0`/`iy1`
+    /// below are in) of `toplevel_id`'s icon on `output`'s tray, if it's
+    /// currently minimized there. Factors the same lookup-and-layout
+    /// open_icon_menu does, for PendingFlash's Iconify/Deiconify
+    /// handling (see its own doc comment) to reuse instead of
+    /// duplicating.
+    fn icon_rect_for_output(&self, toplevel_id: &ObjectId, output: &wl_output::WlOutput) -> Option<(i32, i32, i32, i32)> {
+        let background_index = self.backgrounds.iter().position(|b| &b.output == output)?;
+        let active_workspace = self.panels.iter().find(|p| &p.output == output)?.active_workspace;
+        let icon_ids = self.minimized_toplevels_for_output(output, active_workspace);
+        let icon_index = icon_ids.iter().position(|id| id == toplevel_id)?;
+        let bg_height = self.backgrounds[background_index].height as i32;
+        Some(self.icon_layout(&icon_ids, bg_height)[icon_index])
+    }
+
     fn open_icon_menu(
         &mut self,
         qh: &QueueHandle<Self>,
@@ -6048,11 +6091,36 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                 state.toplevels.entry(proxy.id()).or_default().app_id = app_id;
             }
             Event::State { state: state_bytes } => {
-                let states = state_bytes
+                let new_states: Vec<u32> = state_bytes
                     .chunks_exact(4)
                     .map(|c| u32::from_ne_bytes(c.try_into().unwrap()))
                     .collect();
-                state.toplevels.entry(proxy.id()).or_default().states = states;
+                // Detected here, before .states gets overwritten below,
+                // since this is the only point both the old and new
+                // state are simultaneously available -- see PendingFlash's
+                // own doc comment for why the two directions need
+                // different handling (and why Done, not here, is where
+                // both actually get sent).
+                let was_minimized =
+                    state.toplevels.get(&proxy.id()).is_some_and(|info| info.states.contains(&1));
+                let will_be_minimized = new_states.contains(&1);
+                let pending_flash = if was_minimized && !will_be_minimized {
+                    state
+                        .toplevels
+                        .get(&proxy.id())
+                        .and_then(|info| info.output.clone())
+                        .and_then(|output| state.icon_rect_for_output(&proxy.id(), &output))
+                        .map(|icon_rect| PendingFlash::Deiconify { icon_rect })
+                } else if !was_minimized && will_be_minimized {
+                    Some(PendingFlash::Iconify)
+                } else {
+                    None
+                };
+                let entry = state.toplevels.entry(proxy.id()).or_default();
+                if pending_flash.is_some() {
+                    entry.pending_flash = pending_flash;
+                }
+                entry.states = new_states;
             }
             Event::Done => {
                 if let Some(info) = state.toplevels.get(&proxy.id()) {
@@ -6069,6 +6137,23 @@ impl Dispatch<ZwlrForeignToplevelHandleV1, ()> for Olshell {
                 // glyph/label).
                 if let Some(output) = state.toplevels.get(&proxy.id()).and_then(|info| info.output.clone()) {
                     state.redraw_background_for_output(qh, &output);
+                    // After the redraw above, so Iconify's icon rect (not
+                    // computable any earlier -- see PendingFlash's doc
+                    // comment) reflects the tray's current layout.
+                    if let Some(pending) = state.toplevels.get_mut(&proxy.id()).and_then(|info| info.pending_flash.take())
+                    {
+                        let icon_rect = match pending {
+                            PendingFlash::Deiconify { icon_rect } => Some(icon_rect),
+                            PendingFlash::Iconify => state.icon_rect_for_output(&proxy.id(), &output),
+                        };
+                        if let (Some((ix0, iy0, ix1, iy1)), Some(manager), Some(handle)) = (
+                            icon_rect,
+                            state.decoration_manager.as_ref(),
+                            state.toplevels.get(&proxy.id()).and_then(|info| info.handle.as_ref()),
+                        ) {
+                            manager.flash_iconify(handle, &output, ix0, iy0, ix1 - ix0, iy1 - iy0);
+                        }
+                    }
                 }
             }
             Event::Closed => {

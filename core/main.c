@@ -118,6 +118,9 @@ struct olc_server {
 	struct wl_listener new_layer_surface;
 	struct wl_list layer_surfaces; // olc_layer_surface::link
 
+	// openlook-decoration's flash_iconify request -- see olc_iconify_flash.
+	struct wl_list iconify_flashes; // olc_iconify_flash::link
+
 	// Workspaces are per-output (struct olc_output's own workspace_count/
 	// active_workspace) -- this global and its resources only carry
 	// per-output workspace object creation (get_output_workspaces) and
@@ -280,6 +283,33 @@ struct olc_popup {
 	struct wlr_xdg_popup *xdg_popup;
 	struct wl_listener commit;
 	struct wl_listener destroy;
+};
+
+// One in-flight iconify/deiconify "zoom lines" flash. Created by
+// start_toplevel_visibility_flash the instant a toplevel's minimized
+// state changes, with tree empty and timer set to a long safety-net
+// duration -- neither is touched yet at that point (see its own doc
+// comment for why). decoration_manager_handle_flash_iconify, once the
+// flash_iconify request for this same toplevel actually arrives, finds
+// this same entry and both stamps the real line segments into tree and
+// re-arms timer to its real, short duration -- that request handler is
+// what actually starts the visible flash, this struct just exists
+// beforehand so there's somewhere for it to attach to and a fallback if
+// it never arrives. Destroying tree (in iconify_flash_destroy) destroys
+// every rect stamped into it too, or is a no-op if none ever were.
+// Several of these can be alive at once (e.g. minimizing several
+// windows in quick succession), hence the list rather than a single
+// olc_server field.
+//
+// toplevel is NULL if it was destroyed before the timer fired
+// (toplevel_destroy) -- update_toplevel_visibility is a no-op in that
+// case, but tree still needs cleaning up either way.
+struct olc_iconify_flash {
+	struct wl_list link;
+	struct wlr_scene_tree *tree;
+	struct wl_event_source *timer;
+	struct olc_toplevel *toplevel;
+	struct wl_listener toplevel_destroy;
 };
 
 struct olc_layer_surface {
@@ -455,9 +485,122 @@ static struct olc_toplevel *focused_toplevel(struct olc_server *server) {
 // keyboard accelerator below -- both just want to set this state and
 // have everything else (visibility, telling every client's foreign-
 // toplevel handle) follow from it.
+#define ICONIFY_FLASH_DURATION_MS 60
+// Small enough that consecutive stamps along a segment visually read as
+// one continuous line rather than dashes, large enough that a typical
+// window-to-icon distance doesn't need hundreds of rects.
+#define ICONIFY_FLASH_STEP_PX 3
+// Safety-net-only duration -- see start_toplevel_visibility_flash's own
+// doc comment for why this needs to be generous rather than a tight
+// race against an unpredictable round trip.
+#define ICONIFY_FLASH_SAFETY_MS 2000
+
+static void iconify_flash_destroy(struct olc_iconify_flash *flash) {
+	wl_list_remove(&flash->link);
+	wl_event_source_remove(flash->timer);
+	if (flash->toplevel != NULL) {
+		wl_list_remove(&flash->toplevel_destroy.link);
+	}
+	// Destroying the tree destroys every rect stamped into it too (or
+	// is a no-op if flash_iconify never arrived to stamp any).
+	wlr_scene_node_destroy(&flash->tree->node);
+	free(flash);
+}
+
+static void iconify_flash_handle_toplevel_destroy(struct wl_listener *listener, void *data) {
+	(void)data;
+	struct olc_iconify_flash *flash = wl_container_of(listener, flash, toplevel_destroy);
+	wl_list_remove(&flash->toplevel_destroy.link);
+	flash->toplevel = NULL;
+}
+
+static int iconify_flash_handle_timeout(void *data) {
+	struct olc_iconify_flash *flash = data;
+	if (flash->toplevel != NULL) {
+		update_toplevel_visibility(flash->toplevel);
+	}
+	iconify_flash_destroy(flash);
+	return 0;
+}
+
+// Real olvwm's DrawIconToWindowLines (winicon.c) runs to completion
+// *before* UnmapWindow/MapWindow (states.c's iconifyOne/deiconifyOne):
+// the window stays fully visible throughout an iconify flash, hidden
+// only once it finishes, and stays hidden throughout a deiconify flash,
+// shown only once it finishes.
+//
+// A first attempt started the visibility hold's own short timer right
+// here, immediately -- but the round trip this races against (olshell
+// reacting to the state change, laying out its icon tray, and sending
+// flash_iconify back) turned out to routinely take longer than a short
+// timer's duration under real IPC scheduling, so that timer fired and
+// applied the *real* visibility change before flash_iconify had even
+// arrived -- confirmed live as the window changing state well before
+// the lines/icon did, the opposite direction of the original flicker
+// but just as wrong.
+//
+// So this deliberately does *not* touch visibility at all -- it leaves
+// the toplevel in whatever state it already had, and starts only a
+// long, generous safety-net timer that applies the real state as a
+// fallback if flash_iconify genuinely never arrives (decoration_manager
+// unavailable, olshell not running, some other error). The actual
+// override, and the real short timer, both happen once flash_iconify's
+// handler (decoration_manager_handle_flash_iconify) actually runs --
+// see its own comment -- which is the only point that can't lose this
+// race, since it *is* the round trip finishing.
+static void start_toplevel_visibility_flash(struct olc_toplevel *toplevel) {
+	struct olc_server *server = toplevel->server;
+	struct olc_iconify_flash *flash = calloc(1, sizeof(*flash));
+	if (flash == NULL) {
+		update_toplevel_visibility(toplevel); // fall back to immediate, no animation
+		return;
+	}
+	flash->tree = wlr_scene_tree_create(&server->scene->tree);
+	flash->toplevel = toplevel;
+	flash->toplevel_destroy.notify = iconify_flash_handle_toplevel_destroy;
+	wl_signal_add(&toplevel->xdg_toplevel->events.destroy, &flash->toplevel_destroy);
+
+	flash->timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->wl_display), iconify_flash_handle_timeout, flash);
+	wl_event_source_timer_update(flash->timer, ICONIFY_FLASH_SAFETY_MS);
+	wl_list_insert(&server->iconify_flashes, &flash->link);
+}
+
+// Stamps a rough line of small rects from (x0,y0) to (x1,y1) into tree --
+// approximates real olvwm's XOR-drawn segments (winicon.c's
+// DrawIconToWindowLines) without needing a custom wlr_buffer -- simple,
+// reuses an existing wlroots primitive (wlr_scene_rect, otherwise
+// unused in olcore), and more than good enough for something on-screen
+// for ICONIFY_FLASH_DURATION_MS. Unlike real olvwm's 3x XOR-draw-then-
+// erase flashing (an artifact of that technique needing no separate
+// erase step, not a design goal in its own right) this is one
+// continuous show -- indistinguishable at a glance and far simpler than
+// chaining several timers. Also not reproduced: the XGrabServer stall
+// real olvwm wraps this in, which would mean freezing every client for
+// the duration of every window minimize -- a real regression, not
+// something worth preserving.
+static void stamp_flash_segment(struct wlr_scene_tree *tree, int x0, int y0, int x1, int y1) {
+	static const float color[4] = {0.95f, 0.95f, 0.95f, 1.0f};
+	int dx = x1 - x0, dy = y1 - y0;
+	int span = abs(dx) > abs(dy) ? abs(dx) : abs(dy);
+	int steps = span / ICONIFY_FLASH_STEP_PX;
+	if (steps < 1) {
+		steps = 1;
+	}
+	for (int i = 0; i <= steps; i++) {
+		struct wlr_scene_rect *rect = wlr_scene_rect_create(tree, 2, 2, color);
+		wlr_scene_node_set_position(&rect->node, x0 + dx * i / steps, y0 + dy * i / steps);
+	}
+}
+
 static void toplevel_set_minimized(struct olc_toplevel *toplevel, bool minimized) {
 	toplevel->minimized = minimized;
-	update_toplevel_visibility(toplevel);
+	// Deferred (see start_toplevel_visibility_flash's own doc comment)
+	// rather than applied immediately -- the window/icon "zoom lines"
+	// authentic OPEN LOOK briefly shows on this transition (see
+	// flash_iconify's own doc comment) needs the old state to stick
+	// around a little longer than that.
+	start_toplevel_visibility_flash(toplevel);
 	wlr_foreign_toplevel_handle_v1_set_minimized(toplevel->foreign_handle, minimized);
 }
 
@@ -2283,11 +2426,112 @@ static void decoration_manager_handle_destroy(struct wl_client *client, struct w
 	wl_resource_destroy(resource);
 }
 
+// Standalone fallback for decoration_manager_handle_flash_iconify, for
+// the (should-be-unreachable) case where no start_toplevel_visibility_
+// flash entry exists for this toplevel by the time this request
+// arrives -- draws the lines anyway rather than silently dropping them,
+// just without a visibility hold tied to them.
+static struct olc_iconify_flash *create_standalone_iconify_flash(struct olc_server *server) {
+	struct olc_iconify_flash *flash = calloc(1, sizeof(*flash));
+	if (flash == NULL) {
+		return NULL;
+	}
+	flash->tree = wlr_scene_tree_create(&server->scene->tree);
+	flash->timer = wl_event_loop_add_timer(
+		wl_display_get_event_loop(server->wl_display), iconify_flash_handle_timeout, flash);
+	wl_event_source_timer_update(flash->timer, ICONIFY_FLASH_DURATION_MS);
+	wl_list_insert(&server->iconify_flashes, &flash->link);
+	return flash;
+}
+
+static void decoration_manager_handle_flash_iconify(struct wl_client *client,
+		struct wl_resource *manager_resource, struct wl_resource *toplevel_handle_resource,
+		struct wl_resource *icon_output_resource, int32_t icon_x, int32_t icon_y,
+		int32_t icon_width, int32_t icon_height) {
+	(void)client;
+	struct olc_server *server = wl_resource_get_user_data(manager_resource);
+
+	// Silently no-op on a race with either being destroyed between
+	// olshell deciding to flash and this request arriving -- see the
+	// request's own doc comment on why that's not worth a protocol
+	// error for something this purely cosmetic.
+	struct olc_toplevel *toplevel = toplevel_from_foreign_handle_resource(server, toplevel_handle_resource);
+	struct wlr_output *wlr_output = wlr_output_from_resource(icon_output_resource);
+	if (toplevel == NULL || wlr_output == NULL) {
+		return;
+	}
+
+	struct wlr_box output_box;
+	wlr_output_layout_get_box(server->output_layout, wlr_output, &output_box);
+	if (output_box.width <= 0 || output_box.height <= 0) {
+		return;
+	}
+
+	// scene_tree's own position is the toplevel's *content* origin --
+	// get_decoration pushes it down by the header height once a header
+	// exists (see its own comment), so the true frame top is header_height
+	// above that, not scene_tree's own y.
+	int header_height = toplevel->decoration != NULL ? (int)toplevel->decoration->height : 0;
+	struct wlr_box geo = toplevel->xdg_toplevel->base->geometry;
+	int wx0 = toplevel->scene_tree->node.x;
+	int wy0 = toplevel->scene_tree->node.y - header_height;
+	int wx1 = wx0 + geo.width;
+	int wy1 = toplevel->scene_tree->node.y + geo.height;
+
+	int ix0 = output_box.x + icon_x;
+	int iy0 = output_box.y + icon_y;
+	int ix1 = ix0 + icon_width;
+	int iy1 = iy0 + icon_height;
+
+	// Find the entry start_toplevel_visibility_flash already created for
+	// this toplevel the instant its minimized state changed -- this is
+	// the point that actually starts the visible flash (see that
+	// function's own doc comment for why it couldn't happen any
+	// earlier without losing the race against this same round trip).
+	struct olc_iconify_flash *flash = NULL;
+	struct olc_iconify_flash *candidate;
+	wl_list_for_each(candidate, &server->iconify_flashes, link) {
+		if (candidate->toplevel == toplevel) {
+			flash = candidate;
+			break;
+		}
+	}
+	if (flash != NULL) {
+		// Real olvwm's window/icon stays in its pre-transition state
+		// throughout the flash -- toplevel->minimized already reflects
+		// the *new* state (this request only ever arrives after
+		// olshell has already reacted to it), so this is deliberately
+		// the opposite of toplevel_is_visible's normal rule. Re-arm the
+		// safety-net timer down to the real, short flash duration now
+		// that the race it existed for is over.
+		wlr_scene_node_set_enabled(&toplevel->scene_tree->node, toplevel->minimized);
+		wl_event_source_timer_update(flash->timer, ICONIFY_FLASH_DURATION_MS);
+	} else {
+		// Shouldn't normally happen -- start_toplevel_visibility_flash
+		// always creates one the instant minimized state changes. Draw
+		// the lines anyway as a standalone fallback rather than
+		// silently dropping them; visibility's already correct by now
+		// regardless (either the normal, immediate path a first,
+		// simpler design used, or this same safety net having already
+		// fired once for an unrelated reason), so there's nothing to
+		// override here.
+		flash = create_standalone_iconify_flash(server);
+		if (flash == NULL) {
+			return;
+		}
+	}
+	stamp_flash_segment(flash->tree, ix0, iy0, wx0, wy0);
+	stamp_flash_segment(flash->tree, ix0, iy1, wx0, wy1);
+	stamp_flash_segment(flash->tree, ix1, iy0, wx1, wy0);
+	stamp_flash_segment(flash->tree, ix1, iy1, wx1, wy1);
+}
+
 static const struct zopenlook_decoration_manager_v1_interface decoration_manager_impl = {
 	.get_decoration = decoration_manager_handle_get_decoration,
 	.grab_keyboard = decoration_manager_handle_grab_keyboard,
 	.release_keyboard = decoration_manager_handle_release_keyboard,
 	.destroy = decoration_manager_handle_destroy,
+	.flash_iconify = decoration_manager_handle_flash_iconify,
 };
 
 static void decoration_manager_bind(
@@ -2465,12 +2709,13 @@ int main(int argc, char *argv[]) {
 		&server.new_xdg_toplevel_decoration);
 
 	server.decoration_manager_global = wl_global_create(server.wl_display,
-		&zopenlook_decoration_manager_v1_interface, 1, &server, decoration_manager_bind);
+		&zopenlook_decoration_manager_v1_interface, 2, &server, decoration_manager_bind);
 
 	server.session_manager_global = wl_global_create(server.wl_display,
 		&zopenlook_session_manager_v1_interface, 2, &server, session_manager_bind);
 
 	wl_list_init(&server.layer_surfaces);
+	wl_list_init(&server.iconify_flashes);
 	server.layer_shell = wlr_layer_shell_v1_create(server.wl_display, 4);
 	server.new_layer_surface.notify = server_new_layer_surface;
 	wl_signal_add(&server.layer_shell->events.new_surface, &server.new_layer_surface);
