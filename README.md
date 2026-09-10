@@ -14,12 +14,9 @@ against the historical C source and period OpenWindows screenshots
 rather than from memory. `docs/DESIGN.md` is a running log of that work,
 decision by decision.
 
-<!--
-  TODO: add a screenshot of olwc running.
-  Suggested: docs/media/screenshot.png, then reference it here:
-
-  ![olwc running](docs/media/screenshot.png)
--->
+![olwc running: the Workspace menu cascading into an APPMENU-generated
+Programs submenu, a decorated Firefox and GNOME Mines, a terminal, and
+the workspace switcher strip](docs/media/full-desktop.png)
 
 ## What works
 
