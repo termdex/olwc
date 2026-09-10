@@ -309,7 +309,11 @@ with wlroots compositors generally, not just this project.
   color." `ICON_SELECTED_COLOR`, which had aliased
   `DECORATION_FOCUSED_BG_COLOR`, got its own darker value so a
   selected icon stays distinguishable from the (now lighter) plain
-  icon background.
+  icon background. Same for the 3-layer-bevel glyphs' fill layer
+  (pushpin, menu marks, accelerator diamond): it had used
+  `DECORATION_BG_COLOR` as a "distinct mid-tone", which `#CC` no longer
+  is against `MENU_BG_COLOR` or the unfocused header, so it moved to
+  its own `GLYPH_FILL_COLOR` holding the old `#A8`.
 
   The resize-corner glyphs are no longer filled circles. Cross-checking
   `screenshots/sunos551-ow1-scr-01.png`'s Text Editor window at all
@@ -1561,9 +1565,13 @@ with wlroots compositors generally, not just this project.
      pushpin's actual fill, `OLGX_BG2`. Using the same color as the
      background made the fill (and anything it overwrote) read as empty
      space. Fixed by giving the fill a fixed, distinct mid-tone
-     (`DECORATION_BG_COLOR`, already used elsewhere in olshell's chrome)
-     matching real olgx's own fixed-regardless-of-context fill, dropping
-     the `fill_color` parameter entirely.
+     matching real olgx's own fixed-regardless-of-context fill, and
+     dropping the `fill_color` parameter entirely. (That mid-tone was
+     `DECORATION_BG_COLOR` at first; it moved to its own
+     `GLYPH_FILL_COLOR` once the title-bar work lightened
+     `DECORATION_BG_COLOR` to the point it no longer stood off the
+     backgrounds these glyphs sit on -- see the window gadget chrome
+     entry above.)
   2. Real olgx blits these as unscaled, pixel-perfect X11 bitmaps;
      `draw_glyph_bitmap` scales each layer to fit its box, and even the
      slight (~0.93x) shrink involved means some destination pixels sample

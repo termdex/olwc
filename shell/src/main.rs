@@ -319,6 +319,17 @@ const DECORATION_FOCUS_MARGIN_SIDE: i32 = 4;
 const DECORATION_FOCUS_MARGIN_BOTTOM: i32 = 5;
 const DECORATION_BEVEL_LIGHT: (u8, u8, u8) = (0xE8, 0xE8, 0xE8);
 const DECORATION_BEVEL_DARK: (u8, u8, u8) = (0x70, 0x70, 0x70);
+/// The flat mid-tone the 3-layer-bevel glyphs (pushpin, menu marks,
+/// accelerator diamond) paint their middle/fill layer in, before the
+/// dark/light bevel accents go on top -- real olgx's own
+/// fixed-regardless-of-context fill (`OLGX_BG1`-ish). Its own constant
+/// rather than an alias of DECORATION_BG_COLOR: it has to stay a shade
+/// or two off every background these glyphs actually sit on
+/// (MENU_BG_COLOR for menu chrome, the header fill for the sticky
+/// pushpin) or the fill body reads as empty space, and
+/// DECORATION_BG_COLOR is now too light for that once matched to the
+/// title-bar reference.
+const GLYPH_FILL_COLOR: (u8, u8, u8) = (0xA8, 0xA8, 0xA8);
 const DECORATION_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
 // Exactly the height of the focused header's recessed panel
 // (DECORATION_HEIGHT minus the top and bottom margins that carve it
@@ -2172,7 +2183,7 @@ impl Olshell {
                 // for one layer to erode another at -- drawn fill-then-
                 // outline anyway, just to keep the convention consistent
                 // across every multi-layer glyph in this file.
-                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_FILL, DECORATION_BG_COLOR);
+                blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_FILL, GLYPH_FILL_COLOR);
                 blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_TOP, DECORATION_BEVEL_DARK);
                 blit_bitmap(canvas, buf_width, buf_height, scale, diamond_x, diamond_y, DIAMOND_MARK_BOTTOM, DECORATION_BEVEL_LIGHT);
                 draw_text_row_centered(
@@ -4773,7 +4784,7 @@ fn draw_pushpin(
     // matching fill (OLGX_BG1, see draw_button's own doc comment) -- the
     // pin's body always reads as its own solid object, not a blend into
     // whatever surface it sits on, regardless of context.
-    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, middle, DECORATION_BG_COLOR);
+    draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, middle, GLYPH_FILL_COLOR);
     draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, bottom, DECORATION_BEVEL_DARK);
     draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, top, DECORATION_BEVEL_LIGHT);
 }
@@ -4928,7 +4939,7 @@ fn draw_button_glyph(
     // mark's fill only appears when the housing itself isn't in its
     // pressed state.
     if !inverted {
-        draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, mx0, my0, mx1, my1, MENU_MARK_FILL, DECORATION_BG_COLOR);
+        draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, mx0, my0, mx1, my1, MENU_MARK_FILL, GLYPH_FILL_COLOR);
     }
     // Unconditionally dark/light regardless of `inverted` -- see
     // MENU_MARK_TOP's own doc comment for why this doesn't follow the
@@ -4959,7 +4970,7 @@ fn draw_submenu_arrow(
     // Fill drawn first (same erosion-safety lesson as the pushpin fix),
     // then the thin top/bottom bevel lines on top of it.
     if fill_in {
-        draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_FILL, DECORATION_BG_COLOR);
+        draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_FILL, GLYPH_FILL_COLOR);
     }
     draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_TOP, DECORATION_BEVEL_DARK);
     draw_glyph_bitmap(canvas, canvas_width, canvas_height, scale, x0, y0, x1, y1, HORIZ_MENU_MARK_BOTTOM, DECORATION_BEVEL_LIGHT);
