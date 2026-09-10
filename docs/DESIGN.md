@@ -284,6 +284,33 @@ with wlroots compositors generally, not just this project.
   test window both ended up overlapping during an attempt to capture
   one.
 
+  A later pass got the recessed panel's geometry right. The first
+  version made it a full-width horizontal *band*: `fill_rect(0, top,
+  width, bottom, ...)` -- inset top and bottom but spanning edge to
+  edge, touching both side borders, with only top/bottom bevel rows.
+  Re-checking `title-bar-focus-bsd.png` at the pixel level (with
+  ImageMagick, now installed) showed the recess is a sunken *tablet*
+  inset on all four sides: a ~2px light margin between it and the
+  black top border (the first version left none -- its top inset
+  equalled `DECORATION_BORDER_WIDTH` exactly), ~4px on each side, ~5px
+  below, and a bevel frame on all four edges (dark top+left, light
+  bottom+right). Rewritten as an inset `fill_rect` plus four 1px bevel
+  edges; `DECORATION_FOCUS_MARGIN_SIDE` is new, `_TOP` went 3 -> 5,
+  and `DECORATION_HEIGHT` 28 -> 30 to keep the button the same size
+  (`DECORATION_BUTTON_SIZE` is `HEIGHT - MARGIN_TOP - MARGIN_BOTTOM`).
+
+  Same pass corrected the two grays. The measured values had been
+  taken from a compressed SunOS crop and come out too dark:
+  `DECORATION_BG_COLOR` was `#A8`, the recess fill `#80`, a ~40-level
+  step. `title-bar-{focus,unfocus}-bsd.png` (cleaner, and the SunOS
+  screenshot's dominant gray agrees at ~`#C8`) put the base at `#CC`
+  and the recess at `#B7` -- a much subtler ~21-level step, which is
+  what makes it read as "slightly sunk" rather than "a different
+  color." `ICON_SELECTED_COLOR`, which had aliased
+  `DECORATION_FOCUSED_BG_COLOR`, got its own darker value so a
+  selected icon stays distinguishable from the (now lighter) plain
+  icon background.
+
   The resize-corner glyphs are no longer filled circles. Cross-checking
   `screenshots/sunos551-ow1-scr-01.png`'s Text Editor window at all
   four corners (pixel-sampled, not just eyeballed) showed OPEN LOOK's

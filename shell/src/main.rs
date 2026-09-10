@@ -190,10 +190,13 @@ const ICON_CONTENT_INSET: i32 = 5;
 const ICON_BG_COLOR: (u8, u8, u8) = DECORATION_BG_COLOR;
 const ICON_BORDER_COLOR: (u8, u8, u8) = DECORATION_BORDER_COLOR;
 const ICON_TEXT_COLOR: (u8, u8, u8) = WORKSPACE_ACTIVE_TEXT_COLOR;
-// Distinct from ICON_BG_COLOR/MENU_HOVER_COLOR so selected, hovered, and
-// plain icons are all visually distinguishable at once (e.g. hovering a
-// different icon than the one currently selected).
-const ICON_SELECTED_COLOR: (u8, u8, u8) = DECORATION_FOCUSED_BG_COLOR;
+// Its own value rather than an alias of a decoration color: it needs
+// enough contrast against ICON_BG_COLOR (and to stay distinct from
+// MENU_HOVER_COLOR) that selected, hovered, and plain icons are all
+// tellable apart at once -- e.g. hovering a different icon than the one
+// currently selected. The decoration's own focused-panel fill got too
+// light for that once it was matched to the reference.
+const ICON_SELECTED_COLOR: (u8, u8, u8) = (0x88, 0x88, 0x88);
 // SELECT-click on an icon only selects/highlights it, matching authentic
 // OPEN LOOK -- restoring takes a second SELECT-click within this window,
 // the conventional double-click gesture. Timestamps come from the Wayland
@@ -281,52 +284,48 @@ const MENU_PILL_LEFT_INSET: i32 = LOC_CURSOR_INSET + LOC_CURSOR_WIDTH / 2;
 // "Window menu" section -- this is the title bar these constants describe;
 // the window-menu popup that its button is meant to open is follow-up work
 // (see the button-click handler in PointerHandler::pointer_frame below).
-// Was 22; grown to fit the focused header's recessed panel (a light
-// margin, a 1px bevel, the darker recessed fill, another 1px bevel, and
-// a second light margin -- see DECORATION_FOCUS_MARGIN_TOP/_BOTTOM)
-// comfortably around the existing button/title content, rather than
-// filling a flat, uniformly-colored 22px bar the way the previous, too-
-// shallow version did.
-const DECORATION_HEIGHT: u32 = 28;
-// Deliberately a shade darker than the panel's (0xBE,0xBE,0xBE) -- same
-// palette family, but visually distinct chrome, matching the reference's
-// "clean thin border separating it from the content area" cue rather than
-// blending into the desktop panel above it. This is the header's *only*
-// fill color regardless of focus now -- see DECORATION_FOCUSED_BG_COLOR's
-// own doc comment for why.
-const DECORATION_BG_COLOR: (u8, u8, u8) = (0xA8, 0xA8, 0xA8);
+// Sized to hold the focused header's recessed panel comfortably: the
+// black top border, a light margin, a 1px bevel, the recessed fill, a
+// 1px bevel, and a second light margin (see DECORATION_FOCUS_MARGIN_*).
+const DECORATION_HEIGHT: u32 = 30;
+// The header's base fill, focused or not -- the recessed panel a focused
+// window gets is a smaller inset region drawn on top (see
+// DECORATION_FOCUSED_BG_COLOR). Sampled from `title-bar-{focus,unfocus}-
+// bsd.png`: the margins around a focused window's recess are the exact
+// same light 0xCC as the whole of an unfocused header.
+const DECORATION_BG_COLOR: (u8, u8, u8) = (0xCC, 0xCC, 0xCC);
 // The recessed panel sunk into a *focused* header, not a fill color for
 // the header's own full extent -- confirmed by sampling raw pixel values
 // straight through a real focused and unfocused title bar
-// (screenshots/sunos551-ow1-scr-03.png), not just eyeballing a
-// screenshot crop, which was too JPEG/PNG-compressed to show this
-// structure at all. A focused window's header turned out to be the same
-// light DECORATION_BG_COLOR at its own top/bottom margins as an
-// unfocused one, with a smaller, darker panel inset into it via a dark-
-// top/light-bottom bevel pair (DECORATION_BEVEL_DARK/_LIGHT) -- the same
-// "inset = pressed" bevel language used everywhere else in olshell's
-// chrome, just applied to a sub-region rather than a full-header color
-// swap, which was this constant's entire previous job and didn't read as
-// "recessed" at all, just "a different solid color." An unfocused header
-// has no such panel.
-const DECORATION_FOCUSED_BG_COLOR: (u8, u8, u8) = (0x80, 0x80, 0x80);
-/// Light DECORATION_BG_COLOR margin above the focused header's recessed
-/// panel, before its own top bevel line -- asymmetric with the bottom
-/// margin below to match the exact proportions measured from the
-/// screenshot described in DECORATION_FOCUSED_BG_COLOR's own doc
-/// comment (3px top, 5px bottom).
-const DECORATION_FOCUS_MARGIN_TOP: i32 = 3;
+// (`title-bar-focus-bsd.png`, cross-checked against
+// `screenshots/sunos551-ow1-scr-03.png`). A focused window's header is
+// the same light DECORATION_BG_COLOR at its own top/bottom/left/right
+// margins as an unfocused one, with a smaller panel inset into it on all
+// four sides via a dark-top-left / light-bottom-right bevel frame
+// (DECORATION_BEVEL_DARK/_LIGHT) -- the same "inset = pressed" bevel
+// language used everywhere else in olshell's chrome, applied to a
+// sub-region rather than a full-header color swap. The step down from
+// the margin is deliberately small (0xCC -> 0xB7, ~21 levels), matching
+// the reference; an unfocused header has no such panel.
+const DECORATION_FOCUSED_BG_COLOR: (u8, u8, u8) = (0xB7, 0xB7, 0xB7);
+/// Light DECORATION_BG_COLOR margins around the focused header's
+/// recessed panel, outside its own bevel frame: `TOP` is measured from
+/// the black top border (which is DECORATION_BORDER_WIDTH thick),
+/// `SIDE` from the inner edge of each side border, `BOTTOM` from the
+/// header's own bottom edge. Measured from `title-bar-focus-bsd.png`
+/// (~2px top, ~4px sides, ~5px bottom).
+const DECORATION_FOCUS_MARGIN_TOP: i32 = 5;
+const DECORATION_FOCUS_MARGIN_SIDE: i32 = 4;
 const DECORATION_FOCUS_MARGIN_BOTTOM: i32 = 5;
 const DECORATION_BEVEL_LIGHT: (u8, u8, u8) = (0xE8, 0xE8, 0xE8);
 const DECORATION_BEVEL_DARK: (u8, u8, u8) = (0x70, 0x70, 0x70);
 const DECORATION_TEXT_COLOR: (u8, u8, u8) = (0x18, 0x18, 0x18);
-// Flush with the header's own inner content region -- DECORATION_HEIGHT
-// minus the top border strip and bottom margin the focused-state recessed
-// panel already carves out (DECORATION_FOCUS_MARGIN_TOP/_BOTTOM) -- not
-// the full raw header height, which would draw over the black top border
-// and the non-recessed bottom strip. Deliberately keyed to the *focused*
-// margins even for the unfocused header's own simpler bevel treatment,
-// so the button doesn't shift position when focus changes.
+// Exactly the height of the focused header's recessed panel
+// (DECORATION_HEIGHT minus the top and bottom margins that carve it
+// out), so the button sits flush inside the recess rather than
+// overhanging it or floating with slack above and below. Keyed to the
+// *focused* margins even for the unfocused header, so the button
+// doesn't shift position when focus changes.
 const DECORATION_BUTTON_SIZE: i32 =
     DECORATION_HEIGHT as i32 - DECORATION_FOCUS_MARGIN_TOP - DECORATION_FOCUS_MARGIN_BOTTOM;
 const DECORATION_BUTTON_MARGIN: i32 = 4;
@@ -1824,14 +1823,22 @@ impl Olshell {
         // button blends into whichever it's actually drawn over rather
         // than assuming one or the other.
         let content_bg = if focused {
-            let recessed_top = DECORATION_FOCUS_MARGIN_TOP;
-            let recessed_bottom = height - DECORATION_FOCUS_MARGIN_BOTTOM;
-            fill_rect(
-                canvas, buf_width, buf_height, scale, 0, recessed_top, width, recessed_bottom,
-                DECORATION_FOCUSED_BG_COLOR,
-            );
-            paint_row(canvas, buf_width, scale, recessed_top, DECORATION_BEVEL_DARK);
-            paint_row(canvas, buf_width, scale, recessed_bottom - 1, DECORATION_BEVEL_LIGHT);
+            // A sunken panel inset from all four sides of the header --
+            // NOT a full-width band. `title-bar-focus-bsd.png` shows the
+            // recess floating in the lighter DECORATION_BG_COLOR field
+            // with a margin of it on every side (measured into
+            // DECORATION_FOCUS_MARGIN_TOP/_SIDE/_BOTTOM), never touching
+            // the black window borders. Bevel frame: dark on top+left,
+            // light on bottom+right -- the "inset" reading.
+            let rx0 = DECORATION_BORDER_WIDTH + DECORATION_FOCUS_MARGIN_SIDE;
+            let rx1 = width - DECORATION_BORDER_WIDTH - DECORATION_FOCUS_MARGIN_SIDE;
+            let ry0 = DECORATION_FOCUS_MARGIN_TOP;
+            let ry1 = height - DECORATION_FOCUS_MARGIN_BOTTOM;
+            fill_rect(canvas, buf_width, buf_height, scale, rx0, ry0, rx1, ry1, DECORATION_FOCUSED_BG_COLOR);
+            fill_rect(canvas, buf_width, buf_height, scale, rx0, ry0, rx1, ry0 + 1, DECORATION_BEVEL_DARK);
+            fill_rect(canvas, buf_width, buf_height, scale, rx0, ry0, rx0 + 1, ry1, DECORATION_BEVEL_DARK);
+            fill_rect(canvas, buf_width, buf_height, scale, rx0, ry1 - 1, rx1, ry1, DECORATION_BEVEL_LIGHT);
+            fill_rect(canvas, buf_width, buf_height, scale, rx1 - 1, ry0, rx1, ry1, DECORATION_BEVEL_LIGHT);
             DECORATION_FOCUSED_BG_COLOR
         } else {
             // Unchanged from before this pass: a thin raised ridge (light
