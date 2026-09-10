@@ -192,9 +192,10 @@ and in the FreeBSD ports distfiles.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE), which also lists the bundled
-third-party assets (the Luxi Sans fonts, and the provenance of the
-traced OLGlyph chrome).
+MIT — see [`LICENSE`](LICENSE). Bundled and derived-from third-party
+assets (the Luxi Sans fonts; the provenance of the traced OLGlyph
+chrome) are listed in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
 
 OPEN LOOK and OpenWindows were trademarks of Sun Microsystems / AT&T.
 olwc is an independent homage and is not affiliated with, endorsed by,
