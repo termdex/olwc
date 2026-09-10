@@ -121,13 +121,18 @@ impl Menu {
         // environment, so this is the right default even outside testing.
         Menu {
             // Real olwm's own default root menu file (clients/olwm/
-            // openwin-menu in the historical XView/olwm tree) titles it
-            // "Workspace" via a literal `"Workspace" TITLE` line -- this
-            // fallback already matches that file's item structure
-            // (Programs + Exit... below) so the title should too, rather
-            // than the project's own name standing in for it.
+            // openwin-menu in the historical XView/olwm tree) is titled
+            // "Workspace" (`"Workspace" TITLE`) and is, in essence, a
+            // Programs submenu plus "Exit..." -- its actual first line is
+            // `"Programs" DEFAULT INCLUDE openwin-menu-programs`. This
+            // fallback mirrors that shape: a DEFAULT Programs submenu
+            // (APPMENU rather than an INCLUDE of a file olwc doesn't
+            // ship -- see MenuNode::AppMenu and load_default, which
+            // expands it) and Exit..., with a Terminal shortcut and
+            // Reread Menu File kept for the zero-config case.
             title: Some("Workspace".to_string()),
             items: vec![
+                MenuNode::AppMenu { label: "Programs".into() },
                 MenuNode::Item { label: "Terminal".into(), command: "konsole --separate".into() },
                 // Real olwm's own hardcoded default menu (usermenu.c)
                 // pairs Restart WM with this -- Restart WM itself has no
@@ -140,13 +145,23 @@ impl Menu {
                 // MenuNode::Exit's doc comment.
                 MenuNode::Exit { label: "Exit...".into() },
             ],
-            default: None,
+            // Programs, matching the real file's `"Programs" DEFAULT`.
+            default: Some(0),
         }
     }
 
     /// Loads `$OLWC_MENU` if set, else `~/.openwin-menu`, falling back to a
-    /// small built-in default if neither exists or parsing fails.
+    /// small built-in default if neither exists or parsing fails. Every
+    /// path here ends with `expand_appmenus` -- the built-in default has
+    /// an `APPMENU` node of its own (see `default_menu`), not just the
+    /// parsed-from-file case.
     pub fn load_default() -> Menu {
+        let mut menu = Self::load_raw();
+        menu.expand_appmenus();
+        menu
+    }
+
+    fn load_raw() -> Menu {
         let path = std::env::var_os("OLWC_MENU").map(PathBuf::from).or_else(|| {
             std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".openwin-menu"))
         });
@@ -157,13 +172,12 @@ impl Menu {
         };
 
         match Menu::parse_file(&path) {
-            Ok(mut menu) => {
+            Ok(menu) => {
                 log::info!(
                     "root menu: loaded {} top-level item(s) from {}",
                     menu.items.len(),
                     path.display()
                 );
-                menu.expand_appmenus();
                 menu
             }
             Err(e) => {
@@ -429,6 +443,20 @@ mod tests {
     fn handles_escaped_quote_in_label() {
         let menu = Menu::parse(r#""Say \"Hi\"" exec echo"#).unwrap();
         assert_eq!(menu.items[0].label(), "Say \"Hi\"");
+    }
+
+    #[test]
+    fn builtin_default_has_expandable_programs() {
+        let mut menu = Menu::default_menu();
+        // First item, and the menu's DEFAULT -- matching the real
+        // openwin-menu file's `"Programs" DEFAULT ...` first line.
+        assert_eq!(menu.default, Some(0));
+        assert!(matches!(&menu.items[0], MenuNode::AppMenu { label } if label == "Programs"));
+        // expand_appmenus (which load_default always runs) turns it into
+        // a real submenu; index 0 and the DEFAULT stay put.
+        menu.expand_appmenus();
+        assert!(matches!(&menu.items[0], MenuNode::Submenu { label, .. } if label == "Programs"));
+        assert_eq!(menu.default, Some(0));
     }
 
     #[test]

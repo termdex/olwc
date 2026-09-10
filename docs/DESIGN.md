@@ -2161,3 +2161,17 @@ with wlroots compositors generally, not just this project.
   `parses_appmenu`); generating against this dev machine's real
   `.desktop` set produced correctly-grouped, correctly-sorted sections
   with clean commands; nested run loads the menu with no panic.
+
+- Built-in fallback menu: auto-Programs. `Menu::default_menu()` (used
+  only when there's no `.openwin-menu`/`$OLWC_MENU` config) now leads
+  with a `MenuNode::AppMenu { label: "Programs" }`, marked `DEFAULT`,
+  ahead of the Terminal / Reread Menu File / Exit... items it already
+  had. This finishes what that function's own comment had long claimed
+  ("matches that file's item structure (Programs + Exit... below)")
+  but didn't actually do -- real olwm's shipped `openwin-menu` file
+  opens with `"Programs" DEFAULT INCLUDE openwin-menu-programs`, and
+  `APPMENU` is olwc's stand-in for that `INCLUDE` of a file it doesn't
+  ship. `load_default` was refactored so `expand_appmenus` runs on
+  every returned menu, the fallback included, not just the
+  parsed-from-file case; a zero-config olwc session now has a working
+  application menu instead of only a terminal shortcut.
