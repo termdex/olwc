@@ -2275,3 +2275,35 @@ with wlroots compositors generally, not just this project.
   a pixel high. Verified by rendering the pill, the default-button
   ring, and Notice buttons through the real drawing code and measuring
   glyph vs. label pixel centres.
+
+- Two more window/root-menu parity items from a fresh source review
+  against `states.c` / `usermenu.c`:
+
+  - `SEPARATOR` in `.openwin-menu`. A bare word on its own line
+    (usermenu.c's `strcmp(label, "SEPARATOR")`, the one directive with
+    no quoted label) -> `MenuNode::Separator`, a blank, non-selectable
+    gap between item groups. Real olvwm draws *nothing* for it -- half a
+    row of empty space (`separatorButton` is a `NoType` button that
+    menu.c's `DrawMenu` skips; its height is `buttonheight / 2`) -- so
+    `MENU_SEPARATOR_HEIGHT` is `MENU_ROW_HEIGHT / 2` and the row is
+    painted as plain menu background. Because a separator is a
+    half-height row, the root menu's per-row y math is no longer
+    `i * MENU_ROW_HEIGHT`: `menu_row_top` / `menu_rows_height` /
+    `menu_item_at` walk the item list accumulating `menu_row_height`,
+    and every draw / hit-test / keyboard-nav site for the root popup
+    and its submenu chain goes through them. Separators are skipped by
+    `step_selectable` and never returned by `menu_item_at`, so they
+    can't be hovered, clicked, or landed on by keyboard. The window
+    and icon menus are fixed Rust arrays with no separators, so they
+    keep the simple `i * MENU_ROW_HEIGHT`.
+
+  - "Window" title row on the window menu. Real olvwm titles the frame
+    menu "Window" (`usermenu.c`'s `windowTitle = GetText("Window")`,
+    drawn bold through `NORMAL_GINFO`). Unlike the root/Workspace menu
+    it is deliberately *not* pinnable (`CreateMenu(..., False, ...)`
+    vs `getBuiltinMenu`'s `..., True, ...`), so this row carries no
+    pushpin -- just centered bold text. `draw_window_menu` draws it at
+    row 0 and shifts the items down one row; `WindowMenu::item_at`,
+    the popup height, and the Move-to-Workspace submenu's vertical
+    offset all account for the extra row. olwc had the root menu's
+    bold title from an earlier pass but not this one.

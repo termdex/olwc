@@ -211,6 +211,10 @@ const PANEL_DRAG_THRESHOLD: f64 = 4.0;
 
 const MENU_FONT_SIZE: f32 = 15.0;
 const MENU_ROW_HEIGHT: i32 = 26;
+/// A `SEPARATOR` row's height -- half a normal row, drawn blank, exactly
+/// as real olvwm (`buttonheight / 2`, `NoType` button skipped in
+/// `DrawMenu`). See `MenuNode::Separator`.
+const MENU_SEPARATOR_HEIGHT: i32 = MENU_ROW_HEIGHT / 2;
 const MENU_H_PADDING: i32 = 12;
 const MENU_BG_COLOR: (u8, u8, u8) = (0xD8, 0xD8, 0xD0);
 const MENU_HOVER_COLOR: (u8, u8, u8) = (0x8A, 0x9E, 0xB0);
@@ -444,6 +448,13 @@ struct WindowMenuItem {
 // ADJUST-click, which it complements now that submenus exist: this is the
 // discoverable menu path for the same action, grouped next to Stick since
 // both are about a window's relationship to workspaces.
+// Real olvwm titles the frame menu "Window" (usermenu.c's
+// `windowTitle = GetText("Window")`, drawn bold via NORMAL_GINFO by
+// menu.c's DrawMenu). Unlike the root/Workspace menu it is deliberately
+// NOT pinnable (`CreateMenu(..., False, ...)`), so this title row
+// carries no pushpin.
+const WINDOW_MENU_TITLE: &str = "Window";
+
 const WINDOW_MENU_ITEMS: &[WindowMenuItem] = &[
     WindowMenuItem { label: "Close", action: WindowMenuAction::Minimize, disabled: false, accel_key: Some('W') },
     WindowMenuItem { label: "Full Size", action: WindowMenuAction::ToggleMaximize, disabled: false, accel_key: Some('F') },
@@ -835,8 +846,15 @@ struct WindowMenu {
 }
 
 impl WindowMenu {
+    /// Item index under surface-local `y`, or `None` over the "Window"
+    /// title row (see draw_window_menu). Same f64-throughout care as
+    /// MenuPopup::item_at -- a title-row y is negative after the shift
+    /// and integer division would truncate toward zero, not -inf.
     fn item_at(&self, y: f64) -> Option<usize> {
-        let row = (y / MENU_ROW_HEIGHT as f64) as usize;
+        if y < MENU_ROW_HEIGHT as f64 {
+            return None;
+        }
+        let row = ((y - MENU_ROW_HEIGHT as f64) / MENU_ROW_HEIGHT as f64) as usize;
         (row < WINDOW_MENU_ITEMS.len()).then_some(row)
     }
 }
@@ -1050,18 +1068,14 @@ impl MenuPopup {
         x >= x0 && x < x1 && y >= y0 && y < y1
     }
 
-    /// Item index under `y` (surface-local), if any.
+    /// Selectable item index under `y` (surface-local), if any -- `None`
+    /// over the header row or a `Separator`.
     fn item_at(&self, y: f64) -> Option<usize> {
-        // Do the boundary check and division in f64 throughout -- mixing in
-        // i32 here is a trap: integer division truncates toward zero, not
-        // toward -inf, so a header-row y (which makes the numerator
-        // negative) doesn't reliably come out negative after dividing.
         let header_h = (self.header_rows() * MENU_ROW_HEIGHT) as f64;
         if y < header_h {
             return None;
         }
-        let row = ((y - header_h) / MENU_ROW_HEIGHT as f64) as usize;
-        (row < self.items.len()).then_some(row)
+        menu_item_at(&self.items, y - header_h)
     }
 }
 
@@ -1985,7 +1999,7 @@ impl Olshell {
         let max_width = WINDOW_MENU_ITEMS
             .iter()
             .map(|item| label_width(item.label))
-            .chain(["Unstick", "Restore Size"].map(label_width))
+            .chain(["Unstick", "Restore Size", WINDOW_MENU_TITLE].map(label_width))
             .max()
             .unwrap_or(0);
         // Widest accelerator key (see WindowMenuItem::accel_key's doc
@@ -2009,7 +2023,8 @@ impl Olshell {
         // its own doc comment).
         let width =
             (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING * 2 + SUBMENU_ARROW_SIZE + accel_width).max(80) as u32;
-        let height = (WINDOW_MENU_ITEMS.len() as i32 * MENU_ROW_HEIGHT) as u32;
+        // One "Window" title row (see draw_window_menu) plus a row per item.
+        let height = ((WINDOW_MENU_ITEMS.len() as i32 + 1) * MENU_ROW_HEIGHT) as u32;
 
         let (subsurface, surface) = self.subcompositor.create_subsurface(dec_surface.clone(), qh);
         // Real olvwm renders the window menu at wherever the triggering
@@ -2136,8 +2151,16 @@ impl Olshell {
             .get(&wm.toplevel_id)
             .is_some_and(|info| info.states.contains(&0));
 
+        // The "Window" title row -- bold, centered, no pushpin (this
+        // menu isn't pinnable). See WINDOW_MENU_TITLE.
+        draw_text_row_centered(
+            canvas, buf_width, scale, 0, MENU_ROW_HEIGHT,
+            (width - text_width(WINDOW_MENU_TITLE, &self.bold_font, MENU_FONT_SIZE)) / 2,
+            WINDOW_MENU_TITLE, &self.bold_font, MENU_FONT_SIZE, MENU_TITLE_COLOR,
+        );
+
         for (i, item) in WINDOW_MENU_ITEMS.iter().enumerate() {
-            let row_y0 = i as i32 * MENU_ROW_HEIGHT;
+            let row_y0 = (i as i32 + 1) * MENU_ROW_HEIGHT;
             // A sticky window is visible on every workspace regardless of
             // workspace_index, and un-sticking always commits to whatever
             // workspace is active *then* (see toggle_sticky's protocol
@@ -2470,7 +2493,8 @@ impl Olshell {
             .iter()
             .position(|item| matches!(item.action, WindowMenuAction::MoveToWorkspace))
             .expect("Move to Workspace is always in WINDOW_MENU_ITEMS");
-        let row_y = row as i32 * MENU_ROW_HEIGHT;
+        // +1 for the "Window" title row the items sit below (see draw_window_menu).
+        let row_y = (row as i32 + 1) * MENU_ROW_HEIGHT;
 
         let current_workspace = self.toplevels.get(toplevel_id).and_then(|info| info.workspace_index);
 
@@ -2781,9 +2805,10 @@ impl Olshell {
         // Left margin uses MENU_ITEM_TEXT_INSET rather than a second
         // MENU_H_PADDING, matching where item text actually starts.
         let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING + arrow_reserve).max(80) as u32;
-        // Header row (pushpin, always present) + one row per item.
-        let rows = items.len() as i32 + 1;
-        let height = (rows * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
+        // Header row (pushpin, always present) + the item rows, whose
+        // heights vary: a Separator row is half height (see
+        // menu_row_height).
+        let height = (MENU_ROW_HEIGHT + menu_rows_height(&items)).max(MENU_ROW_HEIGHT) as u32;
 
         let surface = self.compositor.create_surface(qh);
         let layer = self.layer_shell.create_layer_surface(
@@ -2853,7 +2878,10 @@ impl Olshell {
             // self.menu at open time) -- an already-open popup keeps
             // what it had. See docs/DESIGN.md's Reread Menu File entry.
             MenuNode::ReloadMenu { .. } => self.menu = Menu::load_default(),
-            MenuNode::Submenu { .. } => {}
+            // Submenu is handled by activate_*_row before it ever
+            // reaches here; Separator rows aren't selectable at all, so
+            // neither is a real leaf action.
+            MenuNode::Submenu { .. } | MenuNode::Separator => {}
             // Replaced by a Submenu in Menu::expand_appmenus before the
             // menu is ever shown -- unreachable at runtime.
             MenuNode::AppMenu { .. } => {}
@@ -2928,7 +2956,8 @@ impl Olshell {
                 let MenuNode::Submenu { items, default, .. } = &popup.items[parent_row] else {
                     return;
                 };
-                let row_top = (popup.header_rows() + parent_row as i32) * MENU_ROW_HEIGHT;
+                let row_top =
+                    popup.header_rows() * MENU_ROW_HEIGHT + menu_row_top(&popup.items, parent_row);
                 (
                     popup.layer.wl_surface().clone(),
                     popup.abs_x,
@@ -2950,7 +2979,7 @@ impl Olshell {
                     parent.abs_x,
                     parent.abs_y,
                     parent.width as i32,
-                    parent_row as i32 * MENU_ROW_HEIGHT,
+                    menu_row_top(&parent.items, parent_row),
                     items.clone(),
                     *default,
                 )
@@ -2966,7 +2995,7 @@ impl Olshell {
         let max_width = items.iter().map(|it| label_width(it.label())).max().unwrap_or(0);
         let arrow_reserve = if has_nested { MENU_H_PADDING + SUBMENU_ARROW_SIZE } else { 0 };
         let width = (max_width + MENU_ITEM_TEXT_INSET + MENU_H_PADDING + arrow_reserve).max(80) as u32;
-        let height = (items.len() as i32 * MENU_ROW_HEIGHT).max(MENU_ROW_HEIGHT) as u32;
+        let height = menu_rows_height(&items).max(MENU_ROW_HEIGHT) as u32;
 
         // Absolute placement: to the parent's right by default, its left
         // if that overflows the output. Vertically top-aligned with the
@@ -3068,7 +3097,10 @@ impl Olshell {
         }
 
         for (i, item) in sub.items.iter().enumerate() {
-            let row_y0 = i as i32 * MENU_ROW_HEIGHT;
+            let row_y0 = menu_row_top(&sub.items, i);
+            if item.is_separator() {
+                continue;
+            }
             if sub.hovered == Some(i) {
                 draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
                 if sub.loc_cursor {
@@ -3158,7 +3190,9 @@ impl Olshell {
         match self.focused_menu() {
             Some(FocusedMenu::Popup(i)) => {
                 let popup = &mut self.popups[i];
-                let next = step_selectable(popup.hovered, popup.items.len(), forward, |_| true);
+                let next = step_selectable(popup.hovered, popup.items.len(), forward, |r| {
+                    !popup.items[r].is_separator()
+                });
                 popup.hovered = next;
                 popup.loc_cursor = next.is_some();
                 draw_popup(&mut self.pool, &self.font, &self.bold_font, popup);
@@ -3166,7 +3200,9 @@ impl Olshell {
             Some(FocusedMenu::PopupSubmenu(i)) => {
                 let depth = self.popups[i].submenu_chain.len() - 1;
                 let sub = &mut self.popups[i].submenu_chain[depth];
-                let next = step_selectable(sub.hovered, sub.items.len(), forward, |_| true);
+                let next = step_selectable(sub.hovered, sub.items.len(), forward, |r| {
+                    !sub.items[r].is_separator()
+                });
                 sub.hovered = next;
                 sub.loc_cursor = next.is_some();
                 self.draw_root_submenu(i, depth);
@@ -3679,6 +3715,42 @@ fn draw_border_strip(pool: &mut SlotPool, surface: &wl_surface::WlSurface, scale
     surface.commit();
 }
 
+/// Advance width of `text` in `font` at `size`, in logical pixels.
+fn text_width(text: &str, font: &fontdue::Font, size: f32) -> i32 {
+    text.chars().map(|c| font.metrics(c, size).advance_width.round() as i32).sum()
+}
+
+/// Height of one root-menu row -- half for a `Separator`, full otherwise.
+fn menu_row_height(node: &MenuNode) -> i32 {
+    if node.is_separator() { MENU_SEPARATOR_HEIGHT } else { MENU_ROW_HEIGHT }
+}
+
+/// Total height of a list of root-menu item rows (Separators included).
+fn menu_rows_height(items: &[MenuNode]) -> i32 {
+    items.iter().map(menu_row_height).sum()
+}
+
+/// Surface-local y of item `i`'s top edge within a row list that starts
+/// at y = 0.
+fn menu_row_top(items: &[MenuNode], i: usize) -> i32 {
+    items[..i].iter().map(menu_row_height).sum()
+}
+
+/// Index of the selectable (non-`Separator`) item at surface-local `y`
+/// within a row list starting at y = 0, or `None` for a gap, a
+/// separator, or past the end.
+fn menu_item_at(items: &[MenuNode], y: f64) -> Option<usize> {
+    let mut top = 0.0;
+    for (i, node) in items.iter().enumerate() {
+        let bottom = top + menu_row_height(node) as f64;
+        if y >= top && y < bottom {
+            return (!node.is_separator()).then_some(i);
+        }
+        top = bottom;
+    }
+    None
+}
+
 fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, bold_font: &fontdue::Font, popup: &MenuPopup) {
     let width = popup.width as i32;
     let height = popup.height as i32;
@@ -3719,10 +3791,14 @@ fn draw_popup(pool: &mut SlotPool, font: &fontdue::Font, bold_font: &fontdue::Fo
         );
     }
     draw_pushpin(canvas, buf_width, buf_height, scale, px0, py0, px1, py1, popup.pinned);
-    let row = popup.header_rows();
+    let header_h = popup.header_rows() * MENU_ROW_HEIGHT;
 
     for (i, item) in popup.items.iter().enumerate() {
-        let row_y0 = (row + i as i32) * MENU_ROW_HEIGHT;
+        let row_y0 = header_h + menu_row_top(&popup.items, i);
+        // A Separator is a blank half-row -- nothing to draw.
+        if item.is_separator() {
+            continue;
+        }
         if popup.hovered == Some(i) {
             draw_pill_highlight(canvas, buf_width, buf_height, scale, MENU_PILL_LEFT_INSET, row_y0, width - MENU_PILL_MARGIN, row_y0 + MENU_ROW_HEIGHT);
             if popup.loc_cursor {
@@ -6232,8 +6308,7 @@ impl PointerHandler for Olshell {
                         continue;
                     }
                     let sub = &mut self.popups[pi].submenu_chain[depth];
-                    let row = (event.position.1 / MENU_ROW_HEIGHT as f64) as usize;
-                    let hovered = (row < sub.items.len()).then_some(row);
+                    let hovered = menu_item_at(&sub.items, event.position.1);
                     // See WindowMenu's matching Motion arm's comment on
                     // why losing loc_cursor alone still counts as a change.
                     let changed = sub.hovered != hovered || sub.loc_cursor;
@@ -6288,8 +6363,7 @@ impl PointerHandler for Olshell {
                         // and dismisses the whole popup, padding does
                         // nothing (the chain stays as it is).
                         let sub = &self.popups[pi].submenu_chain[depth];
-                        let row = (event.position.1 / MENU_ROW_HEIGHT as f64) as usize;
-                        if row < sub.items.len() {
+                        if let Some(row) = menu_item_at(&sub.items, event.position.1) {
                             submenu_selection = Some((pi, depth, row));
                         }
                     } else if let Some(i) = popup_index {
@@ -6459,7 +6533,7 @@ impl KeyboardHandler for Olshell {
                         if matches!(self.popups[i].items.get(row), Some(MenuNode::Submenu { .. })) {
                             self.open_root_submenu(qh, i, 0, row);
                             if let Some(sub) = self.popups[i].submenu_chain.last_mut() {
-                                let first = step_selectable(None, sub.items.len(), true, |_| true);
+                                let first = step_selectable(None, sub.items.len(), true, |r| !sub.items[r].is_separator());
                                 sub.hovered = first;
                                 sub.loc_cursor = first.is_some();
                             }
@@ -6477,7 +6551,7 @@ impl KeyboardHandler for Olshell {
                         ) {
                             self.open_root_submenu(qh, i, depth + 1, row);
                             if let Some(sub) = self.popups[i].submenu_chain.last_mut() {
-                                let first = step_selectable(None, sub.items.len(), true, |_| true);
+                                let first = step_selectable(None, sub.items.len(), true, |r| !sub.items[r].is_separator());
                                 sub.hovered = first;
                                 sub.loc_cursor = first.is_some();
                             }

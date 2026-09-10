@@ -21,6 +21,8 @@
 //                                         DEFAULT, marks it the menu's
 //                                         default item (pre-highlighted on
 //                                         open)
+//   SEPARATOR                         -- bare word, no label: a blank
+//                                         half-height gap between groups
 //
 // Unrecognized directives (PIN, WINMENU, and friends from the original
 // olwm format) are skipped with a warning rather than treated as a parse
@@ -76,6 +78,11 @@ pub enum MenuNode {
     // generate` builds by scanning the filesystem; nothing downstream
     // of `load_default` ever sees this variant.
     AppMenu { label: String },
+    // A `SEPARATOR` line: a blank, non-selectable gap between item
+    // groups. Real olvwm draws nothing for it, just half a row of
+    // empty space (usermenu.c's `separatorButton`, a `NoType` button
+    // that menu.c's `DrawMenu` skips; its height is `buttonheight / 2`).
+    Separator,
 }
 
 impl MenuNode {
@@ -86,7 +93,12 @@ impl MenuNode {
             MenuNode::Exit { label } => label,
             MenuNode::ReloadMenu { label } => label,
             MenuNode::AppMenu { label } => label,
+            MenuNode::Separator => "",
         }
+    }
+
+    pub fn is_separator(&self) -> bool {
+        matches!(self, MenuNode::Separator)
     }
 }
 
@@ -284,6 +296,12 @@ fn parse_items<'a, I: Iterator<Item = &'a str>>(
         if line == "END" || line == "END MENU" {
             return items;
         }
+        // The one directive with no quoted label -- a bare word on its
+        // own line (usermenu.c's `strcmp(label, "SEPARATOR")`).
+        if line == "SEPARATOR" {
+            items.push(MenuNode::Separator);
+            continue;
+        }
         let Some((label, rest)) = parse_label(line) else {
             log::warn!("root menu: skipping unparseable line: {raw_line:?}");
             continue;
@@ -419,6 +437,22 @@ mod tests {
         assert_eq!(menu.items.len(), 1);
         assert_eq!(menu.items[0].label(), "Reread Menu File");
         assert!(matches!(&menu.items[0], MenuNode::ReloadMenu { .. }));
+    }
+
+    #[test]
+    fn parses_separator() {
+        let menu = Menu::parse(
+            r#"
+                "First" exec a
+                SEPARATOR
+                "Second" exec b
+            "#,
+        )
+        .unwrap();
+        assert_eq!(menu.items.len(), 3);
+        assert!(menu.items[1].is_separator());
+        assert_eq!(menu.items[0].label(), "First");
+        assert_eq!(menu.items[2].label(), "Second");
     }
 
     #[test]
