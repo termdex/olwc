@@ -153,8 +153,8 @@ with wlroots compositors generally, not just this project.
   connection, i.e. running app instance -- deliberately not matching by
   `app_id`, which two separately-launched instances of the same app would
   share despite needing to stay independent; only olcore can see the real
-  grouping). `Properties` (shown disabled) logs a placeholder on click
-  too, same as the root menu's non-interactive submenus.
+  grouping). `Properties` (shown disabled) logs a placeholder on click,
+  the one window-menu item still not wired to a real action.
 
   `Stick` (a `toggle_sticky` request) exempts a toplevel from the
   per-workspace hiding the workspace switcher strip below causes.
@@ -471,7 +471,12 @@ with wlroots compositors generally, not just this project.
   neither the coverage-sampling nor the aspect-preserving fixes from
   the pushpin's own pass had anything to correct here.
 - ~~Root menu behavior/config format~~ resolved: olwm-compatible
-  `.openwin-menu`, implemented in `shell/src/menu.rs`.
+  `.openwin-menu`, implemented in `shell/src/menu.rs` -- a lenient
+  subset of the real grammar (`TITLE`, `exec`, `MENU`/`END`, `EXIT`,
+  `REREAD_MENU_FILE`, `INCLUDE`, `DEFAULT`), plus an olwc-specific
+  `APPMENU` keyword for a `.desktop`-populated Programs submenu. Nested
+  submenus are fully interactive (click-to-open, keyboard nav); see the
+  Programs-menu entries in the log below for the whole arc.
 - ~~Multi-monitor behavior for the workspace strip (per-monitor
   workspaces vs. shared)~~ resolved: per-monitor, following i3/Sway's
   convention (each output cycles its own independent sequence) rather
@@ -649,7 +654,10 @@ with wlroots compositors generally, not just this project.
   `docs/OPENLOOK-REFERENCE.md`) is exactly a `Programs` submenu and
   `"Exit..."`, an `EXIT` directive. olshell's `.openwin-menu` parser
   (`shell/src/menu.rs`) now recognizes it (`MenuNode::Exit`), and the
-  built-in default menu includes it alongside Terminal/Refresh. In X11,
+  built-in default menu includes it -- alongside Terminal, Reread Menu
+  File, and (since the Programs-menu work logged below) a `Programs`
+  submenu of its own, so the fallback now genuinely matches that file's
+  `Programs` + `"Exit..."` shape. In X11,
   Exit terminated olwm itself, which (as the session's leader) normally
   returned control to a display manager; the Wayland-native equivalent is
   terminating olcore's own `wl_display` -- already the dev-only
