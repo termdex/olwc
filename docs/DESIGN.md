@@ -643,7 +643,8 @@ with wlroots compositors generally, not just this project.
   menu section, for one example of the kind of divergence a theme
   might span). Nothing to build now, but worth keeping olshell's
   decoration/panel/menu rendering code factored so style constants
-  (colors, spacing, shapes) stay centralized and swappable rather than
+  (colors, spacing, shapes, and the embedded font pair -- see the UI
+  font entry below) stay centralized and swappable rather than
   scattered through drawing logic, so a future theme layer doesn't
   need a rewrite to slot in.
 - Root menu "Exit..." item: authentic, not a modern addition -- confirmed
@@ -828,8 +829,8 @@ with wlroots compositors generally, not just this project.
 
   The actual scaling work turned out to be entirely confined to a handful
   of shared low-level pixel-writing primitives (`fill_rect`,
-  `draw_text_row_centered`/`draw_bold_text_row_centered`,
-  `draw_glyph_bitmap`, `paint_row`, plus the free-standing
+  `draw_text_row_centered`, `draw_glyph_bitmap`, `paint_row`, plus the
+  free-standing
   `draw_corner_handle`/`draw_footer`/`draw_border_strip`), each of which
   now takes a `scale: i32` and multiplies its own logical coordinate
   arguments internally before touching the canvas -- every `draw_*`
