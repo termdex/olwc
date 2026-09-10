@@ -176,6 +176,20 @@ with wlroots compositors generally, not just this project.
   alternate labels are reserved in the popup's width calculation
   unconditionally, since width is fixed before either state is known.
 
+  Adding that label toggle surfaced that `Full Size` had never actually
+  resized anything: `toplevel_set_maximized` only called
+  `wlr_xdg_toplevel_set_maximized` (which carries no size) and flipped
+  the foreign-toplevel flag, so the label toggled but the window sat
+  still. `toplevel_set_maximized` now does the geometry too -- saves
+  the pre-maximize scene-tree position and content size into
+  `olc_toplevel::saved_geo`, moves the window to the top-left of its
+  output's `usable_area` (below the header decoration, which is a child
+  of the same scene tree and follows for free), and
+  `wlr_xdg_toplevel_set_size`s the content to fill that area; unmaximize
+  restores from `saved_geo`. The client's own `xdg_toplevel.
+  set_maximized` request routes through the same path now instead of
+  just acking an empty configure.
+
   ~~No keyboard focus on the window menu yet, so only click-elsewhere
   closes it, not Escape~~ resolved: unlike the root menu, a plain
   subsurface has no wlr-layer-shell Exclusive-interactivity equivalent to

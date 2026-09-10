@@ -248,6 +248,11 @@ struct olc_toplevel {
 	// normal per-workspace visibility rather than needing to remember or
 	// restore anything.
 	bool sticky;
+	// Scene-tree position and content geometry saved by
+	// toplevel_set_maximized the moment a window is maximized, so
+	// unmaximize can restore it. Only meaningful while
+	// xdg_toplevel->current.maximized.
+	struct wlr_box saved_geo;
 
 	// openlook-decoration: at most one header decoration, requested by
 	// olshell. NULL until olshell asks for one; see get_decoration.
@@ -604,10 +609,48 @@ static void toplevel_set_minimized(struct olc_toplevel *toplevel, bool minimized
 	wlr_foreign_toplevel_handle_v1_set_minimized(toplevel->foreign_handle, minimized);
 }
 
-// Shared by the wlr-foreign-toplevel-management request_maximize signal
-// and the Super+F keyboard accelerator below, same reasoning as
-// toplevel_set_minimized.
+// Shared by the wlr-foreign-toplevel-management request_maximize signal,
+// the client's own xdg_toplevel.set_maximized request, and the Super+F
+// keyboard accelerator below.
+//
+// wlr_xdg_toplevel_set_maximized alone only tells the client "you are
+// maximized" -- it carries no size, so a client (Konsole included) that
+// waits for a real configure just stays where it is. olcore also has to
+// do the geometry: resize the content to the output's usable area (less
+// the header decoration) and move the window's scene tree to the
+// top-left of that area, saving the pre-maximize geometry so unmaximize
+// can put it back. The header is a child of the same scene tree (see
+// get_decoration), so it follows the move for free.
 static void toplevel_set_maximized(struct olc_toplevel *toplevel, bool maximized) {
+	// Every current caller runs post-map, but the client's set_maximized
+	// request can fire during the initial commit, before either is set.
+	if (toplevel->foreign_handle == NULL || toplevel->output == NULL) {
+		return;
+	}
+
+	int header_height =
+		toplevel->decoration != NULL ? (int)toplevel->decoration->height : 0;
+
+	if (maximized) {
+		struct wlr_box geo = toplevel->xdg_toplevel->base->geometry;
+		toplevel->saved_geo = (struct wlr_box){
+			.x = toplevel->scene_tree->node.x,
+			.y = toplevel->scene_tree->node.y,
+			.width = geo.width,
+			.height = geo.height,
+		};
+		struct wlr_box area = toplevel->output->usable_area;
+		wlr_scene_node_set_position(&toplevel->scene_tree->node,
+			area.x, area.y + header_height);
+		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+			area.width, area.height - header_height);
+	} else {
+		wlr_scene_node_set_position(&toplevel->scene_tree->node,
+			toplevel->saved_geo.x, toplevel->saved_geo.y);
+		wlr_xdg_toplevel_set_size(toplevel->xdg_toplevel,
+			toplevel->saved_geo.width, toplevel->saved_geo.height);
+	}
+
 	wlr_xdg_toplevel_set_maximized(toplevel->xdg_toplevel, maximized);
 	wlr_foreign_toplevel_handle_v1_set_maximized(toplevel->foreign_handle, maximized);
 }
@@ -1828,9 +1871,20 @@ static void xdg_toplevel_request_resize(struct wl_listener *listener, void *data
 
 static void xdg_toplevel_request_maximize(struct wl_listener *listener, void *data) {
 	struct olc_toplevel *toplevel = wl_container_of(listener, toplevel, request_maximize);
-	if (toplevel->xdg_toplevel->base->initialized) {
-		wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+	if (!toplevel->xdg_toplevel->base->initialized) {
+		return;
 	}
+	if (toplevel->foreign_handle == NULL) {
+		// Pre-map: no output/geometry to work with yet. Ack with an
+		// empty configure as this always did; a later explicit maximize
+		// (menu, accelerator, or the client asking again post-map) does
+		// the real geometry.
+		wlr_xdg_surface_schedule_configure(toplevel->xdg_toplevel->base);
+		return;
+	}
+	// The client asked to (un)maximize itself -- honor it with the same
+	// real geometry change the window menu's Full Size does.
+	toplevel_set_maximized(toplevel, toplevel->xdg_toplevel->requested.maximized);
 }
 
 static void xdg_toplevel_request_fullscreen(struct wl_listener *listener, void *data) {
